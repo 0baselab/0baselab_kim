@@ -23,3 +23,8 @@ system/
 # 개인 설정
 .claude/settings.local.json
 config/settings.env
+
+# 빌드 산출물
+build/
+dist/
+*.spec

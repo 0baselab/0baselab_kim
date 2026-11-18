@@ -1,0 +1,78 @@
+# 버전 태그(v*)를 붙이면 Windows exe를 빌드해 GitHub Releases에 zip으로 올린다 (명세서 2.5).
+# 빌드에만 쓰고 데이터 수집에는 쓰지 않는다. API 키·GitHub Secrets를 쓰지 않는다.
+name: build-windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}  # Actions 화면의 "Run workflow" 버튼으로 시험 빌드 (Releases에는 올리지 않음)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: 테스트 (실제 API 호출 없음)
+        run: python -m pytest -q
+
+      - name: 버전 결정
+        id: ver
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") }
+          else { $v = "0.0.0-dev-${{ github.run_number }}" }
+          "__version__ = `"$v`"" | Out-File -Encoding utf8 collector/version.py
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: PyInstaller 빌드 (--onedir)
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --console `
+            --name 주식데이터수집기 `
+            --collect-data tzdata `
+            run_collector.py
+
+      - name: 실행 확인 (--version)
+        run: |
+          $out = & "dist/주식데이터수집기/주식데이터수집기.exe" --version
+          Write-Output $out
+          if ($out -ne "${{ steps.ver.outputs.version }}") { throw "버전 불일치: $out" }
+
+      - name: zip 만들기
+        id: zip
+        run: |
+          $name = "주식데이터수집기_v${{ steps.ver.outputs.version }}.zip"
+          Copy-Item README.md "dist/주식데이터수집기/README.md"
+          Compress-Archive -Path "dist/주식데이터수집기" -DestinationPath $name
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: zip에 secret/·settings.env가 없는지 검사
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("${{ steps.zip.outputs.name }}")
+          $bad = $zip.Entries | Where-Object { $_.FullName -match '(^|/|\\)secret(/|\\)' -or $_.FullName -match 'settings\.env$' -or $_.FullName -match 'keys\.env$' }
+          $zip.Dispose()
+          if ($bad) { $bad | ForEach-Object { $_.FullName }; throw "배포본에 넣으면 안 되는 파일이 있습니다." }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: ${{ steps.zip.outputs.name }}
+
+      - name: Releases에 올리기
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.zip.outputs.name }}
