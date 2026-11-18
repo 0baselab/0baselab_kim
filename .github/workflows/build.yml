@@ -1,8 +1,9 @@
 # 릴리즈 자동화 (명세서 2.5)
-# - PR: Windows에서 테스트 + version.py 버전이 이미 릴리즈된 번호인지 검사
+# - PR: Windows에서 테스트·빌드 성공 여부와, version.py 버전이 이미 릴리즈된 번호인지만 검사 (파일은 올리지 않음)
 # - main에 병합(push): version.py 버전의 태그가 없을 때만 빌드 → 태그·Release 생성 → zip 첨부
 #   이미 있는 버전이면 아무것도 하지 않는다.
 # - 수동 실행(Run workflow): 시험 빌드만 (Release 없음)
+# - 빌드 결과물은 Actions 저장소(artifact)에 올리지 않는다 (무료 저장 한도 문제). zip은 Release에만 첨부한다.
 # 빌드에만 쓰고 데이터 수집에는 쓰지 않는다. API 키·GitHub Secrets를 쓰지 않는다.
 name: build-windows
 
@@ -93,12 +94,6 @@ jobs:
           $bad = $zip.Entries | Where-Object { $_.FullName -match '(^|/|\\)secret(/|\\)' -or $_.FullName -match 'settings\.env$' -or $_.FullName -match 'keys\.env$' }
           $zip.Dispose()
           if ($bad) { $bad | ForEach-Object { $_.FullName }; throw "배포본에 넣으면 안 되는 파일이 있습니다." }
-
-      - uses: actions/upload-artifact@v4
-        if: steps.zip.outputs.name != '' && github.event_name != 'pull_request'
-        with:
-          name: windows-build
-          path: ${{ steps.zip.outputs.name }}
 
       - name: 태그·Release 생성, zip 첨부 (main 병합 + 새 버전일 때만)
         if: github.event_name == 'push' && steps.ver.outputs.exists == 'false'
