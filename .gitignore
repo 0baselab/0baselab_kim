@@ -1,0 +1,25 @@
+# 비밀 정보
+secret/
+*.env
+!*.env.example
+
+# 가상환경·캐시
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 데이터 (DATA_DIR를 프로젝트 안으로 잡았을 때 대비)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+raw/
+logs/
+backup/
+briefing/
+dart_export/
+system/
+
+# 개인 설정
+.claude/settings.local.json
+config/settings.env
