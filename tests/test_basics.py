@@ -9,7 +9,9 @@ from collector.verify.common import num
 
 def test_data_dir_override_and_linux_fallback(tmp_path, monkeypatch):
     assert paths.data_dir({"DATA_DIR": str(tmp_path / "d")}) == tmp_path / "d"
+    # Path.home()은 Linux·macOS에서 HOME, Windows에서 USERPROFILE을 본다.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert paths.data_dir({}, platform="linux") == tmp_path / "Desktop" / "주식데이터수집"
 
 
