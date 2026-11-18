@@ -22,7 +22,7 @@ def test_onedrive_detect():
 
 def test_settings_created_and_new_keys_appended_without_overwrite(tmp_path):
     s = load_settings(tmp_path)
-    assert s["KIS_CALLS_PER_SEC"] == "15"
+    assert s["KIS_CALLS_PER_SEC"] == "10"
     assert s["KRX_INDEX_KOSPI_URL"].endswith("/idx/kospi_dd_trd")
     p = settings_path(tmp_path)
     p.write_text("KIS_CALLS_PER_SEC=7\n", encoding="utf-8")
@@ -57,7 +57,7 @@ def test_num_never_zero_fills():
     assert num("-5") == -5
 
 
-def test_rate_limiter_waits():
+def test_rate_limiter_spaces_calls_evenly():
     t = [0.0]
     slept = []
 
@@ -65,9 +65,31 @@ def test_rate_limiter_waits():
         slept.append(s)
         t[0] += s
 
-    rl = RateLimiter(3, clock=lambda: t[0], sleep=sleep)
+    rl = RateLimiter(10, clock=lambda: t[0], sleep=sleep)
     for _ in range(3):
         rl.wait()
-    assert not slept
+    assert len(slept) == 2 and all(abs(x - 0.1) < 1e-9 for x in slept)
+    rl.set_rate(5)
     rl.wait()
-    assert slept and abs(slept[0] - 1.0) < 1e-9
+    assert abs(slept[-1] - 0.2) < 1e-9
+
+
+def test_settings_migrates_old_default_only(tmp_path):
+    p = settings_path(tmp_path)
+    p.parent.mkdir(parents=True)
+    p.write_text("KIS_CALLS_PER_SEC=15\n", encoding="utf-8")
+    assert load_settings(tmp_path)["KIS_CALLS_PER_SEC"] == "10"
+    p.write_text("KIS_CALLS_PER_SEC=7\n", encoding="utf-8")
+    assert load_settings(tmp_path)["KIS_CALLS_PER_SEC"] == "7"
+
+
+def test_investor_window():
+    from datetime import datetime
+    from collector.kis import investor_window_ok
+    from collector.timeutil import KST
+    d = lambda h, m: datetime(2026, 11, 18, h, m, tzinfo=KST)
+    assert not investor_window_ok(d(0, 0))
+    assert not investor_window_ok(d(15, 39))
+    assert investor_window_ok(d(15, 40))
+    assert investor_window_ok(d(20, 30))
+    assert investor_window_ok(d(23, 59))

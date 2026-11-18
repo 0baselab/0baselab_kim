@@ -14,31 +14,39 @@ RETRY_WAITS = (1, 2, 4)
 
 
 class RateLimiter:
-    """최근 1초 안의 호출 수를 per_sec 이하로 유지한다."""
+    """호출 간격을 1/per_sec초 이상으로 고르게 벌린다.
+
+    한 번에 몰아서 보내지 않는다. 실측(0.1.1)에서 초당 6건으로도 EGW00201이 났는데,
+    1초 창 안에서 몰아 보내는 방식이었기 때문에 순간 속도는 더 높았을 수 있다.
+    """
 
     def __init__(self, per_sec: float, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
-        self.per_sec = max(1, int(per_sec))
         self.clock = clock
         self.sleep = sleep
+        self.set_rate(per_sec)
+        self._last: float | None = None
         self._stamps: deque[float] = deque()
 
-    def _trim(self, now: float) -> None:
-        while self._stamps and now - self._stamps[0] >= 1.0:
-            self._stamps.popleft()
+    def set_rate(self, per_sec: float) -> None:
+        self.per_sec = max(0.5, float(per_sec))
+        self.interval = 1.0 / self.per_sec
 
     def wait(self) -> None:
         now = self.clock()
-        self._trim(now)
-        if len(self._stamps) >= self.per_sec:
-            self.sleep(1.0 - (now - self._stamps[0]))
+        if self._last is not None and now - self._last < self.interval:
+            self.sleep(self.interval - (now - self._last))
             now = self.clock()
-            self._trim(now)
+        self._last = now
         self._stamps.append(now)
+        while self._stamps and now - self._stamps[0] >= 1.0:
+            self._stamps.popleft()
 
     def recent_rate(self) -> int:
         """직전 1초 동안 보낸 호출 수."""
-        self._trim(self.clock())
+        now = self.clock()
+        while self._stamps and now - self._stamps[0] >= 1.0:
+            self._stamps.popleft()
         return len(self._stamps)
 
 

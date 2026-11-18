@@ -13,7 +13,7 @@ from dotenv import dotenv_values
 DEFAULTS: list[tuple[str, str, str]] = [
     ("DATA_DIR", "", "데이터 폴더. 비우면 바탕화면/주식데이터수집"),
     ("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443", "KIS 실전 도메인 (KIS 문서)"),
-    ("KIS_CALLS_PER_SEC", "15", "KIS 초당 호출 수"),
+    ("KIS_CALLS_PER_SEC", "10", "KIS 초당 호출 수. 한도 초과(EGW00201)가 나면 실행 중 자동으로 반씩 줄임"),
     ("KRX_BASE_URL", "https://data-dbg.krx.co.kr/svc/apis", "KRX Open API 기본 주소"),
     ("KRX_INDEX_KOSPI_URL", "https://data-dbg.krx.co.kr/svc/apis/idx/kospi_dd_trd",
      "KOSPI 시리즈 일별시세정보 요청 URL (사용자가 KRX 사이트에서 확인). 비우면 '설정 필요'로 건너뜀"),
@@ -25,6 +25,13 @@ DEFAULTS: list[tuple[str, str, str]] = [
     ("VERIFY_STOCKS", "005930,000660,005380,247540,196170",
      "실측 검증 종목 (코스피 3: 삼성전자·SK하이닉스·현대차 / 코스닥 2: 에코프로비엠·알테오젠)"),
     ("VERIFY_DART_STOCKS", "005930,000660,247540", "DART 재무 검증 종목 (코스피 2, 코스닥 1)"),
+]
+
+
+# 예전 기본값을 그대로 쓰고 있을 때만 새 기본값으로 바꾼다. 사용자가 바꾼 값은 건드리지 않는다.
+# (키, 예전 기본값, 새 기본값, 바꾼 버전)
+MIGRATIONS: list[tuple[str, str, str, str]] = [
+    ("KIS_CALLS_PER_SEC", "15", "10", "0.1.2"),
 ]
 
 
@@ -44,4 +51,19 @@ def load_settings(install: Path) -> dict[str, str]:
             for key, value, desc in missing:
                 f.write(f"# {desc}\n{key}={value}\n")
         existing = dotenv_values(path)
+    migrate(path, existing)
     return {k: (v or "") for k, v in existing.items()}
+
+
+def migrate(path: Path, values: dict) -> list[str]:
+    """예전 기본값 -> 새 기본값. 바꾼 항목 설명 목록을 돌려준다."""
+    changed = []
+    text = path.read_text(encoding="utf-8")
+    for key, old, new, ver in MIGRATIONS:
+        if (values.get(key) or "").strip() == old:
+            text = text.replace(f"{key}={old}\n", f"{key}={new}\n", 1)
+            values[key] = new
+            changed.append(f"{key}: {old} -> {new} ({ver} 기본값 변경)")
+    if changed:
+        path.write_text(text, encoding="utf-8")
+    return changed

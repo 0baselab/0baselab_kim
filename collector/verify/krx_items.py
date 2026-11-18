@@ -34,8 +34,9 @@ def fallback_ref_date(ctx: Ctx) -> str | None:
 
 
 def item6_today(ctx: Ctx) -> Item:
-    it = Item("6", "KRX 당일 데이터: 몇 시부터 당일 값이 나오는지")
+    it = Item("6", "KRX 당일 데이터: 몇 시부터 당일 값이 나오는지 (직전 거래일과 함께)")
     fetched = ctx.now.strftime("%H:%M:%S")
+    prev = ctx.ref_date
     counts = {}
     for market, path in TRADE_PATHS.items():
         body = ctx.krx.get(path, ctx.today)
@@ -43,13 +44,22 @@ def item6_today(ctx: Ctx) -> Item:
         r = rows(body)
         ctx.krx_trade[(ctx.today, market)] = r
         counts[market] = len(r)
+    prev_counts = {}
+    if prev:
+        load_trade(ctx, prev)
+        prev_counts = {m: len(ctx.krx_trade.get((prev, m), [])) for m in TRADE_PATHS}
     snap = ctx.dirs["snapshots"] / f"krx_today_{ctx.today}.jsonl"
     with snap.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"fetched_at": fetched, "counts": counts}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"fetched_at": fetched, "counts": counts, "prev_date": prev,
+                            "prev_counts": prev_counts}, ensure_ascii=False) + "\n")
     history = [json.loads(x) for x in snap.read_text(encoding="utf-8").splitlines() if x.strip()]
-    it.add(f"- 오늘({ctx.today}) basDd로 조회. 오늘 실행 기록 파일: system/verify/snapshots/{snap.name}", "")
-    it.add(*md_table(["실행 시각", "코스피 행 수", "코스닥 행 수"],
-                     [[h["fetched_at"], h["counts"].get("KOSPI"), h["counts"].get("KOSDAQ")] for h in history]))
+    it.add(f"- 오늘({ctx.today})과 직전 거래일({prev or '정하지 못함'})을 basDd로 조회.",
+           "- 직전 거래일은 KIS 수급 응답 또는 KRX에 실제 값이 있는 가장 최근 날입니다 (평일로 가정하지 않음).",
+           f"- 오늘 실행 기록 파일: system/verify/snapshots/{snap.name}", "")
+    it.add(*md_table(["실행 시각", "오늘 코스피", "오늘 코스닥", "직전 거래일", "직전 코스피", "직전 코스닥"],
+                     [[h["fetched_at"], h["counts"].get("KOSPI"), h["counts"].get("KOSDAQ"),
+                       h.get("prev_date") or "NULL", (h.get("prev_counts") or {}).get("KOSPI", "NULL"),
+                       (h.get("prev_counts") or {}).get("KOSDAQ", "NULL")] for h in history]))
     return it
 
 
