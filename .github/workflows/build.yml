@@ -1,14 +1,24 @@
-# 버전 태그(v*)를 붙이면 Windows exe를 빌드해 GitHub Releases에 zip으로 올린다 (명세서 2.5).
+# 릴리즈 자동화 (명세서 2.5)
+# - PR: Windows에서 테스트 + version.py 버전이 이미 릴리즈된 번호인지 검사
+# - main에 병합(push): version.py 버전의 태그가 없을 때만 빌드 → 태그·Release 생성 → zip 첨부
+#   이미 있는 버전이면 아무것도 하지 않는다.
+# - 수동 실행(Run workflow): 시험 빌드만 (Release 없음)
 # 빌드에만 쓰고 데이터 수집에는 쓰지 않는다. API 키·GitHub Secrets를 쓰지 않는다.
 name: build-windows
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    tags: ["v*"]
-  workflow_dispatch: {}  # Actions 화면의 "Run workflow" 버튼으로 시험 빌드 (Releases에는 올리지 않음)
+    branches: [main]
+  workflow_dispatch: {}
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -23,21 +33,36 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: 버전 읽기, 이미 릴리즈된 버전인지 확인
+        id: ver
+        run: |
+          $v = python -c "import collector.version as m; print(m.__version__)"
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "version.py 버전 형식 오류: $v" }
+          $tag = "v$v"
+          $exists = git ls-remote --tags origin "refs/tags/$tag"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          if ($exists) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          Write-Output "version.py = $v, 태그 존재 = $([bool]$exists)"
+
+      - name: PR 검사 - 버전을 올렸는지
+        if: github.event_name == 'pull_request' && steps.ver.outputs.exists == 'true'
+        run: throw "${{ steps.ver.outputs.tag }}는 이미 릴리즈된 버전입니다. collector/version.py의 버전을 올려주세요."
+
+      - name: main 병합인데 이미 있는 버전 - 아무것도 하지 않음
+        if: github.event_name == 'push' && steps.ver.outputs.exists == 'true'
+        run: Write-Output "${{ steps.ver.outputs.tag }}가 이미 있어 릴리즈를 건너뜁니다."
+
       - name: 의존성 설치
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: python -m pip install -r requirements-dev.txt
 
       - name: 테스트 (실제 API 호출 없음)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: python -m pytest -q
 
-      - name: 버전 결정
-        id: ver
-        run: |
-          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") }
-          else { $v = "0.0.0-dev-${{ github.run_number }}" }
-          "__version__ = `"$v`"" | Out-File -Encoding utf8 collector/version.py
-          "version=$v" >> $env:GITHUB_OUTPUT
-
       - name: PyInstaller 빌드 (--onedir)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: |
           python -m PyInstaller --noconfirm --clean --onedir --console `
             --name 주식데이터수집기 `
@@ -45,6 +70,7 @@ jobs:
             run_collector.py
 
       - name: 실행 확인 (--version)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: |
           $out = & "dist/주식데이터수집기/주식데이터수집기.exe" --version
           Write-Output $out
@@ -52,13 +78,15 @@ jobs:
 
       - name: zip 만들기
         id: zip
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: |
-          $name = "주식데이터수집기_v${{ steps.ver.outputs.version }}.zip"
+          $name = "주식데이터수집기_${{ steps.ver.outputs.tag }}.zip"
           Copy-Item README.md "dist/주식데이터수집기/README.md"
           Compress-Archive -Path "dist/주식데이터수집기" -DestinationPath $name
           "name=$name" >> $env:GITHUB_OUTPUT
 
       - name: zip에 secret/·settings.env가 없는지 검사
+        if: steps.zip.outputs.name != ''
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead("${{ steps.zip.outputs.name }}")
@@ -67,12 +95,17 @@ jobs:
           if ($bad) { $bad | ForEach-Object { $_.FullName }; throw "배포본에 넣으면 안 되는 파일이 있습니다." }
 
       - uses: actions/upload-artifact@v4
+        if: steps.zip.outputs.name != '' && github.event_name != 'pull_request'
         with:
           name: windows-build
           path: ${{ steps.zip.outputs.name }}
 
-      - name: Releases에 올리기
-        if: github.ref_type == 'tag'
+      - name: 태그·Release 생성, zip 첨부 (main 병합 + 새 버전일 때만)
+        if: github.event_name == 'push' && steps.ver.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
           files: ${{ steps.zip.outputs.name }}

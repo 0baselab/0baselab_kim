@@ -11,7 +11,7 @@ KIS API 필드·URL·TR ID는 `docs/kis_api_reference.xlsx`(KIS 공식 문서 �
 
 ## 환경 (명세서 2.5)
 - 개발은 웹 버전 Claude Code(Linux)에서, 실행은 사용자의 Windows 10/11 PC에서 exe로 한다. Python 3.12.
-- 배포: 버전 태그(`v*`)를 붙이면 GitHub Actions(windows-latest)가 PyInstaller `--onedir`로 빌드해 GitHub Releases에 zip으로 올린다. 이 워크플로는 1단계에서 만든다. Actions는 빌드에만 쓰고 데이터 수집에는 쓰지 않는다.
+- 배포: main에 병합되면 GitHub Actions(windows-latest)가 `collector/version.py`의 버전으로 태그가 없을 때만 PyInstaller `--onedir`로 빌드하고, 태그·Release를 만들어 zip을 올린다. 이 워크플로는 1단계에서 만든다. Actions는 빌드에만 쓰고 데이터 수집에는 쓰지 않는다.
 - zip에는 `secret/`, `config/settings.env`를 넣지 않는다(업데이트 때 사용자 설정 유지).
 - 바탕화면 경로, 한글 경로처럼 Windows에서만 일어나는 동작은 OS별로 분리하고, Linux에서는 대체 동작으로 테스트한다. 최종 확인은 사용자가 PC에서 exe로 한다. 각 단계 끝에 PC에서 확인할 항목을 목록으로 알려준다.
 - 경로는 `pathlib`만 사용. 경로 문자열을 하드코딩하지 않는다.
@@ -33,7 +33,7 @@ KIS API 필드·URL·TR ID는 `docs/kis_api_reference.xlsx`(KIS 공식 문서 �
 - 브리핑 패키지에는 판단(강세·약세·점수·추천)을 넣지 않는다. 계산값만.
 - 평일을 거래일로 간주하지 않는다. 거래일 달력 테이블만 사용.
 - main 브랜치에 직접 push하지 않는다. 강제 push(-f, --force, --force-with-lease)를 하지 않는다. 모든 변경은 작업 브랜치 → PR로만 올린다.
-- 버전 태그와 Release는 사용자만 만든다. git tag 생성과 태그 push를 하지 않는다. 배포가 필요하면 다음 버전 번호를 제안만 한다.
+- 태그와 Release는 Actions만 만든다. Claude Code는 git tag와 태그 push를 하지 않고, PR마다 version.py의 버전을 올린다.
 - 호출 한도: KIS 초당 15건, KIS 휴장일조회 하루 1회, DART 하루 18,000건(설정값).
 
 ## 실제 API 호출

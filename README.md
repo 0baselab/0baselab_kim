@@ -5,7 +5,7 @@
 
 ## 1. 설치
 
-1. GitHub 저장소의 **Releases**에서 `주식데이터수집기_v0.1.0.zip`을 받습니다.
+1. GitHub 저장소의 **Releases**에서 가장 최신 버전의 `주식데이터수집기_v{버전}.zip`을 받습니다.
 2. zip을 `C:\`에 풉니다. `C:\주식데이터수집기\주식데이터수집기.exe`가 생깁니다.
    - 바탕화면이나 OneDrive 폴더 안에는 설치하지 마세요. 설치 폴더에 API 키 파일이 생깁니다.
 3. `주식데이터수집기.exe`를 더블클릭합니다.
@@ -77,4 +77,5 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
 
 - 실제 API를 부르는 테스트는 `tests/live/`에 두고 `pytest -m live`로만 실행합니다.
-- 빌드: `v*` 태그를 push하면 `.github/workflows/build.yml`이 Windows exe를 만들어 Releases에 올립니다.
+- 릴리즈: PR마다 `collector/version.py`의 버전을 올립니다. main에 병합되면 `.github/workflows/build.yml`이 그 버전의 태그가 없을 때만 Windows exe를 빌드하고 태그·Release를 만들어 zip을 올립니다. 이미 있는 버전이면 아무것도 하지 않습니다.
+- PR에서는 같은 워크플로가 Windows 테스트·빌드를 돌리고, 이미 릴리즈된 버전 번호면 실패로 알려줍니다.
