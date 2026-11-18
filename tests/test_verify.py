@@ -47,7 +47,7 @@ def test_full_run_writes_report_without_secrets(env):
     assert "코스피 200" in text
     assert "SPAC(소속부없음)" in text
     assert "status 013" not in text  # 013이면 OFS로 다시 조회
-    assert "15:30" in text
+    assert "20:30" in text
     # DB를 만들지 않음
     assert not list(env[1]["root"].rglob("*.sqlite"))
 
@@ -93,4 +93,37 @@ def test_disallowed_tr_id_blocked(tmp_path):
 
 
 def test_only_query_tr_ids_allowed():
-    assert kis_mod.ALLOWED_TR_IDS == {"FHPTJ04160001", "CTCA0903R", "CTPF1002R"}
+    assert kis_mod.ALLOWED_TR_IDS == {"FHPTJ04160001", "CTCA0903R", "CTPF1002R", "FHPUP02120000"}
+
+
+def test_before_1540_skips_investor_items(env):
+    server = FakeServer()
+    text = run(env, server, now=NOW.replace(hour=15, minute=30)).read_text(encoding="utf-8")
+    assert server.investor_calls == 0
+    assert "OPSQ2001" in text
+    assert "15:40~23:59" in text
+
+
+def test_item6_records_previous_trading_day(env):
+    text = run(env, FakeServer()).read_text(encoding="utf-8")
+    assert "| 16:00:00 | 0 | 0 | 20261117 | 1 | 1 |" in text
+
+
+def test_rate_limit_halves_speed(env):
+    server = FakeServer()
+    server.stockinfo_rate_limits = 2
+    text = run(env, server).read_text(encoding="utf-8")
+    assert "발생 횟수: **2**" in text
+    assert "| 1,000.00 | 500.00 |" in text and "| 500.00 | 250.00 |" in text
+
+
+def test_items_10_11_compare_next_day(env):
+    server = FakeServer()
+    run(env, server, now=NOW.replace(hour=20, minute=30))  # 18일 밤 기록
+    server.krx_empty_day = "20261119"
+    nxt = NOW.replace(day=19, hour=20, minute=30)
+    text = run(env, server, now=nxt).read_text(encoding="utf-8")
+    # 10번: 18일 KIS 기록 vs KRX 18일 값 (가짜 서버는 같은 값 -> 차이 0)
+    assert "| 20261118 | 005930 | 20:30:00 | 1,000 | 1,000 | 0 |" in text
+    # 11번: 18일 KIS 지수 vs KRX 지수 행
+    assert "| 20261118 | 코스피 | 2500.0 | IDX_NM=코스피; CLSPRC_IDX=2500 |" in text

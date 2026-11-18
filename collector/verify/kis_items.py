@@ -228,3 +228,135 @@ def item8_scty(ctx: Ctx) -> Item:
                      o.get("stck_kind_cd"), o.get("mket_id_cd"), o.get("reits_kind_cd"), o.get("admn_item_yn")])
     it.add(*md_table(["구분", "종목", "이름", "scty_grp_id_cd", "stck_kind_cd", "mket_id_cd", "reits_kind_cd", "admn_item_yn"], rows))
     return it
+
+
+# ---------------------------------------------------------------------------
+# 10. KIS 당일 거래량·대금 기록 -> 다음 날 KRX와 비교 (애프터마켓 포함 여부)
+# ---------------------------------------------------------------------------
+DAILY_VALUES_FILE = "kis_daily_values.jsonl"
+COMPARE_MAX_DATES = 5
+
+
+def _load_jsonl(path):
+    if not path.exists():
+        return []
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def item10_after_market(ctx: Ctx, window_ok: bool) -> Item:
+    it = Item("10", "KIS 당일 acml_vol·acml_tr_pbmn vs 다음 날 KRX ACC_TRDVOL·ACC_TRDVAL (애프터마켓 포함 여부)")
+    path = ctx.dirs["snapshots"] / DAILY_VALUES_FILE
+    fetched = ctx.now.strftime("%Y-%m-%d %H:%M:%S")
+    if window_ok and ctx.kis_first:
+        n = 0
+        with path.open("a", encoding="utf-8") as f:
+            for code in ctx.stocks:
+                row = next((r for r in ctx.kis_first.get(code, []) if r.get("stck_bsop_date") == ctx.today), None)
+                if row:
+                    n += 1
+                    f.write(json.dumps({"date": ctx.today, "code": code, "recorded_at": fetched,
+                                        "acml_vol": row.get("acml_vol"), "acml_tr_pbmn": row.get("acml_tr_pbmn"),
+                                        "stck_clpr": row.get("stck_clpr")}, ensure_ascii=False) + "\n")
+        it.add(f"- 이번 실행에서 당일({ctx.today}) 값 {n}/{len(ctx.stocks)}종목 기록 → system/verify/snapshots/{DAILY_VALUES_FILE}")
+    else:
+        it.add("- 이번 실행은 KIS 수급 조회 가능 시각(15:40~23:59)이 아니어서 당일 값을 기록하지 않았습니다.")
+    # 날짜·종목별로 가장 늦게 기록한 값
+    latest: dict[tuple[str, str], dict] = {}
+    for rec in _load_jsonl(path):
+        latest[(rec["date"], rec["code"])] = rec
+    past_dates = sorted({d for d, _ in latest if d < ctx.today}, reverse=True)[:COMPARE_MAX_DATES]
+    if not past_dates:
+        it.add("- 비교할 지난 기록이 아직 없습니다. 오늘 20:30쯤 실행해 기록하고, 다음 날 다시 실행하면 비교됩니다.")
+        return it
+    if not ctx.krx:
+        it.status = SKIPPED
+        it.add("- KRX 키가 없어 비교를 건너뜀")
+        return it
+    from .krx_items import load_trade
+    rows = []
+    for d in past_dates:
+        load_trade(ctx, d)
+        for code in ctx.stocks:
+            rec = latest.get((d, code))
+            if not rec:
+                continue
+            found = _krx_row(ctx, d, code)
+            krx = found[1] if found else {}
+            kv, kp = num(rec.get("acml_vol")), num(rec.get("acml_tr_pbmn"))
+            xv, xp = num(krx.get("ACC_TRDVOL")), num(krx.get("ACC_TRDVAL"))
+            rows.append([d, code, rec["recorded_at"][11:], fmt(kv), fmt(xv),
+                         fmt(None if kv is None or xv is None else kv - xv), fmt(kp), fmt(xp),
+                         fmt(ratio(xp, kp), 4)])
+    it.add("", "거래량 차이 = KIS − KRX. 0이면 같은 범위, 0이 아니면 한쪽에 애프터마켓 등 다른 거래가 섞였을 가능성. "
+           "대금 비율(KRX÷KIS)은 단위 확인용입니다 (1이면 원, 1,000,000 근처면 KIS가 백만 원).", "")
+    it.add(*md_table(["날짜", "종목", "KIS 기록 시각", "KIS acml_vol", "KRX ACC_TRDVOL", "거래량 차이",
+                      "KIS acml_tr_pbmn", "KRX ACC_TRDVAL", "대금 KRX÷KIS"], rows))
+    return it
+
+
+# ---------------------------------------------------------------------------
+# 11. KIS 업종 일자별지수(FHPUP02120000) 코스피 0001·코스닥 1001 -> 다음 날 KRX 지수와 비교
+# ---------------------------------------------------------------------------
+INDEX_VALUES_FILE = "kis_index_values.jsonl"
+KIS_INDEXES = {"0001": "코스피", "1001": "코스닥"}
+INDEX_FIELDS = ["bstp_nmix_prpr", "bstp_nmix_oprc", "bstp_nmix_hgpr", "bstp_nmix_lwpr", "acml_vol", "acml_tr_pbmn"]
+KRX_INDEX_SETTING = {"0001": "KRX_INDEX_KOSPI_URL", "1001": "KRX_INDEX_KOSDAQ_URL"}
+
+
+def item11_index(ctx: Ctx) -> Item:
+    from ..kis import INDEX_DAILY, index_daily_params
+    from ..krx import rows as krx_rows
+
+    it = Item("11", "KIS 업종 일자별지수(FHPUP02120000): 코스피(0001)·코스닥(1001) 당일 값 vs 다음 날 KRX 지수")
+    path = ctx.dirs["snapshots"] / INDEX_VALUES_FILE
+    fetched = ctx.now.strftime("%Y-%m-%d %H:%M:%S")
+    rows_now = []
+    with path.open("a", encoding="utf-8") as f:
+        for code, name in KIS_INDEXES.items():
+            body = ctx.kis.get(INDEX_DAILY, index_daily_params(code, ctx.today)).body
+            ctx.save_raw(f"kis_index_{code}_{ctx.today}", body)
+            if not is_ok(body):
+                rows_now.append([code, name, "실패", f"{body.get('msg_cd')} {body.get('msg1')}"] + [""] * 4)
+                continue
+            out2 = body.get("output2") or []
+            dates = [r.get("stck_bsop_date") for r in out2 if r.get("stck_bsop_date")]
+            today_row = next((r for r in out2 if r.get("stck_bsop_date") == ctx.today), None)
+            if today_row:
+                f.write(json.dumps({"date": ctx.today, "index": code, "recorded_at": fetched,
+                                    **{k: today_row.get(k) for k in INDEX_FIELDS}}, ensure_ascii=False) + "\n")
+            r = today_row or {}
+            rows_now.append([code, name, f"{len(dates)}일치 ({min(dates) if dates else 'NULL'}~{max(dates) if dates else 'NULL'})",
+                             "있음" if today_row else "없음", r.get("bstp_nmix_prpr", ""), r.get("bstp_nmix_hgpr", ""),
+                             r.get("bstp_nmix_lwpr", ""), r.get("acml_tr_pbmn", "")])
+    it.add(f"- 요청 값: FID_PERIOD_DIV_CODE=D, FID_COND_MRKT_DIV_CODE=U, FID_INPUT_DATE_1={ctx.today} (kis_api_reference.xlsx)", "")
+    it.add(*md_table(["업종코드", "이름", "응답 일수(범위)", "당일 행", "종가(현재가)", "고가", "저가", "acml_tr_pbmn"], rows_now))
+
+    latest: dict[tuple[str, str], dict] = {}
+    for rec in _load_jsonl(path):
+        latest[(rec["date"], rec["index"])] = rec
+    past = sorted({d for d, _ in latest if d < ctx.today}, reverse=True)[:COMPARE_MAX_DATES]
+    if not past:
+        it.add("", "- 비교할 지난 기록이 아직 없습니다. 다음 날 다시 실행하면 KRX 지수와 비교됩니다.")
+        return it
+    if not ctx.krx:
+        it.add("", "- KRX 키가 없어 비교를 건너뜀")
+        return it
+    it.add("", "**지난 기록 vs KRX 지수** (KRX 필드명은 실측 전이라 이름이 정확히 일치하는 행의 전체 필드를 보여줍니다)", "")
+    cmp_rows = []
+    for d in past:
+        for code, name in KIS_INDEXES.items():
+            rec = latest.get((d, code))
+            if not rec:
+                continue
+            url = (ctx.settings.get(KRX_INDEX_SETTING[code]) or "").strip()
+            if not url:
+                cmp_rows.append([d, name, rec.get("bstp_nmix_prpr"), "설정 필요 (KRX 지수 URL 비어 있음)"])
+                continue
+            body = ctx.krx.get_url(url, d)
+            ctx.save_raw(f"krx_index_{code}_{d}", body)
+            match = [r for r in krx_rows(body) if str(r.get("IDX_NM", "")).strip() == name]
+            krx_txt = "; ".join(f"{k}={v}" for k, v in match[0].items()) if match else \
+                f"IDX_NM='{name}' 행 없음 (행 {len(krx_rows(body))}개)"
+            cmp_rows.append([d, name, rec.get("bstp_nmix_prpr"), krx_txt])
+    it.add(*md_table(["날짜", "지수", "KIS 종가(bstp_nmix_prpr)", "KRX 같은 날 행"], cmp_rows))
+    return it

@@ -20,29 +20,31 @@ from ..secrets import redact, sensitive_values
 from ..timeutil import stamp
 from ..version import __version__
 from . import dart_items, kis_items, krx_items
-from .common import FAILED, SKIPPED, Ctx, Item, md_table
+from .common import FAILED, SKIPPED, Ctx, Item, fmt, md_table
 
 log = logging.getLogger("collector")
 
-RERUN_TIMES = ["15:30", "15:45", "16:30", "18:00"]
+RERUN_TIMES = ["15:45", "16:30", "18:00", "20:30"]
 
 CHECKLIST = [
     ("1", "KIS 종목별 투자자매매동향: 1회 호출 일수, 연속 조회 깊이"),
     ("2", "KIS 금액 필드 단위"),
     ("3", "KIS 수급 당일 값 변동 (여러 시각 반복 실행)"),
-    ("4", "KIS 실제 초당 한도 → 한도 시험은 하지 않고, 실행 중 EGW00201 발생 기록으로 대체"),
+    ("4", "KIS 실제 초당 한도 → 시험 없이 EGW00201 발생 기록, 발생 시 속도 자동 반감"),
     ("5", "KRX 지수 시리즈 경로·지수 이름"),
     ("6", "KRX 당일 데이터 제공 시각 (여러 시각 반복 실행)"),
     ("7", "KRX 스팩·리츠·우선주 필드 값"),
     ("8", "KIS scty_grp_id_cd (스팩이 ST인지)"),
     ("9", "DART thstrm_amount 의미"),
     ("H", "(추가) KIS 휴장일조회 응답 일수"),
+    ("10", "(추가) KIS 당일 거래량·대금 vs 다음 날 KRX (애프터마켓 포함 여부)"),
+    ("11", "(추가) KIS 업종지수 당일 값 vs 다음 날 KRX 지수"),
 ]
 
 
-def _run(items: list[Item], no: str, title: str, fn: Callable[[], Item], needs) -> None:
-    if needs is None:
-        items.append(Item(no, title, SKIPPED, ["- 필요한 키가 없어 건너뜀"]))
+def _run(items: list[Item], no: str, title: str, fn: Callable[[], Item], needs, reason=None) -> None:
+    if not needs:
+        items.append(Item(no, title, SKIPPED, [f"- {reason or '필요한 키가 없어 건너뜀'}"]))
         return
     try:
         items.append(fn())
@@ -74,35 +76,44 @@ def run_verify(*, now: datetime, settings: dict, keys: dict, dirs: dict[str, Pat
 
     items: list[Item] = []
     auth_error = None
-    steps = [
-        ("H", "KIS 휴장일조회", lambda: kis_items.item_holiday(ctx), kis),
-        ("1", "KIS 수급 조회 일수", lambda: kis_items.item1_depth(ctx), kis),
-        ("6", "KRX 당일 데이터", lambda: krx_items.item6_today(ctx), krx),
+    window_ok = kis_mod.investor_window_ok(now)
+    window_reason = (f"실행 시각 {now.strftime('%H:%M')}은 KIS 종목별 투자자매매동향 조회 가능 시각(15:40~23:59)이 아님. "
+                     "00:00~15:40에는 OPSQ2001 TIME LIMIT 오류로 과거 데이터까지 조회 불가 (0.1.1 실측)")
+    kis_inv = kis if window_ok else None
+    # (번호, 제목, 함수, 필요한 클라이언트, 건너뛸 때 이유)
+    before = [
+        ("H", "KIS 휴장일조회", lambda: kis_items.item_holiday(ctx), kis, None),
+        ("1", "KIS 수급 조회 일수", lambda: kis_items.item1_depth(ctx), kis_inv, window_reason),
     ]
-    later = [
-        ("2", "KIS 금액 단위", lambda: kis_items.item2_units(ctx), kis and krx),
-        ("3", "KIS 당일 값 변동", lambda: kis_items.item3_today(ctx), kis),
-        ("5", "KRX 지수 시리즈", lambda: krx_items.item5_index(ctx), krx),
-        ("7", "KRX 기본정보 필드", lambda: krx_items.item7_fields(ctx), krx),
-        ("8", "KIS 증권그룹 코드", lambda: kis_items.item8_scty(ctx), kis),
-        ("9", "DART 재무 필드", lambda: dart_items.item9_dart(ctx), dart),
+    after = [
+        ("6", "KRX 당일 데이터", lambda: krx_items.item6_today(ctx), krx, None),
+        ("2", "KIS 금액 단위", lambda: kis_items.item2_units(ctx), kis_inv and krx, window_reason),
+        ("3", "KIS 당일 값 변동", lambda: kis_items.item3_today(ctx), kis_inv, window_reason),
+        ("10", "KIS 당일 거래량·대금 vs KRX", lambda: kis_items.item10_after_market(ctx, window_ok), kis, None),
+        ("11", "KIS 업종지수 vs KRX 지수", lambda: kis_items.item11_index(ctx), kis, None),
+        ("5", "KRX 지수 시리즈", lambda: krx_items.item5_index(ctx), krx, None),
+        ("7", "KRX 기본정보 필드", lambda: krx_items.item7_fields(ctx), krx, None),
+        ("8", "KIS 증권그룹 코드", lambda: kis_items.item8_scty(ctx), kis, None),
+        ("9", "DART 재무 필드", lambda: dart_items.item9_dart(ctx), dart, None),
     ]
     try:
-        for i, (no, title, fn, needs) in enumerate(steps + later):
-            if i == len(steps):
-                kis_items.decide_ref_date(ctx)
-                if not ctx.ref_date and krx:
-                    try:
-                        ctx.ref_date = krx_items.fallback_ref_date(ctx)
-                    except Exception as exc:
-                        log.error("기준일 찾기 실패: %s", exc)
-                if ctx.ref_date and krx:
-                    try:
-                        krx_items.load_trade(ctx, ctx.ref_date)
-                    except Exception as exc:
-                        log.error("KRX 기준일 매매정보 실패: %s", exc)
+        for no, title, fn, needs, reason in before:
             out(f"  [{no}] {title} ...")
-            _run(items, no, title, fn, needs)
+            _run(items, no, title, fn, needs, reason)
+        kis_items.decide_ref_date(ctx)
+        if not ctx.ref_date and krx:
+            try:
+                ctx.ref_date = krx_items.fallback_ref_date(ctx)
+            except Exception as exc:
+                log.error("기준일 찾기 실패: %s", exc)
+        if ctx.ref_date and krx:
+            try:
+                krx_items.load_trade(ctx, ctx.ref_date)
+            except Exception as exc:
+                log.error("KRX 기준일 매매정보 실패: %s", exc)
+        for no, title, fn, needs, reason in after:
+            out(f"  [{no}] {title} ...")
+            _run(items, no, title, fn, needs, reason)
     except KisAuthError as exc:  # 인증 실패만 즉시 중단 (명세서 11.2)
         auth_error = str(exc)
         out(f"중단: {auth_error}")
@@ -153,17 +164,20 @@ def build_report(ctx: Ctx, items: list[Item], auth_error, kis_api, krx_api, dart
                   [[no, title, by_no[no].status if no in by_no else ("기록됨" if no == "4" else "실행 안 됨")]
                    for no, title in CHECKLIST])
     L += ["", "## 4. KIS 호출 한도 (EGW00201) 발생 기록", "",
-          f"- 설정 속도: 초당 {ctx.settings.get('KIS_CALLS_PER_SEC')}건. 한도 시험은 하지 않았습니다."]
+          f"- 시작 속도: 초당 {ctx.settings.get('KIS_CALLS_PER_SEC')}건 (호출 간격을 고르게 벌림). 한도 시험은 하지 않았습니다.",
+          "- 한도 초과가 나면 속도를 반으로 줄이고 1초 쉰 뒤 재시도합니다. 줄인 속도는 이번 실행 끝까지 유지합니다.",
+          f"- 실행이 끝났을 때 속도: 초당 {fmt(ctx.kis.api.limiter.per_sec, 2) if ctx.kis else 'NULL'}건"]
     events = ctx.kis.rate_limit_events if ctx.kis else []
     L.append(f"- 발생 횟수: **{len(events)}**")
     if events:
-        L += [""] + md_table(["시각", "TR ID", "직전 1초 호출 수"], [[e.at, e.tr_id, e.recent_rate] for e in events])
-    for no in ["H", "1", "2", "3", "5", "6", "7", "8", "9"]:
+        L += [""] + md_table(["시각", "TR ID", "직전 1초 호출 수", "설정 속도", "줄인 속도"], [[e.at, e.tr_id, e.recent_rate, fmt(e.rate_before, 2), fmt(e.rate_after, 2)] for e in events])
+    for no in ["H", "1", "2", "3", "10", "11", "5", "6", "7", "8", "9"]:
         if no in by_no:
             it = by_no[no]
             L += ["", f"## {it.no}. {it.title}", "", f"상태: **{it.status}**", ""] + it.lines
     L += ["", "## 다시 실행할 시각 (3·6번 항목)", "",
           f"장이 열린 날 {', '.join(RERUN_TIMES)} 무렵에 각각 다시 실행하세요. "
-          "15:30은 KIS 문서상 당일 조회가 열리기 전(15:40) 시각입니다. 같은 날의 결과는 snapshots/ 기록에 쌓여 "
+          "15:40 이전에는 KIS 수급 항목이 자동으로 건너뛰어집니다. 10·11번은 장이 열린 날 밤(20:30쯤)에 기록하고 "
+          "다음 날 한 번 더 실행해야 비교됩니다. 같은 날의 결과는 snapshots/ 기록에 쌓여 "
           "마지막 보고서에 모두 표시됩니다. 휴장일조회는 같은 날 캐시를 쓰므로 다시 호출하지 않습니다."]
     return redact("\n".join(L)) + "\n"

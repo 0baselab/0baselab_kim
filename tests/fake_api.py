@@ -23,6 +23,9 @@ def kis_row(day, code):
 class FakeServer:
     def __init__(self, rate_limit_once=False, kis_token_fail=False, index_rows=True):
         self.calls = []
+        self.krx_empty_day = TODAY
+        self.stockinfo_rate_limits = 0
+        self.investor_calls = 0
         self.rate_limit_once = rate_limit_once
         self.kis_token_fail = kis_token_fail
         self.index_rows = index_rows
@@ -47,6 +50,7 @@ class FakeServer:
                 {"bass_dt": "20261119", "wday_dvsn_cd": "05", "bzdy_yn": "Y", "tr_day_yn": "Y", "opnd_yn": "Y", "sttl_day_yn": "Y"}]})
         if p.endswith("investor-trade-by-stock-daily"):
             assert q["FID_COND_MRKT_DIV_CODE"] == "J"
+            self.investor_calls += 1
             if self.rate_limit_once:
                 self.rate_limit_once = False
                 return httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."})
@@ -56,7 +60,18 @@ class FakeServer:
             return httpx.Response(200, headers={"tr_cont": cont},
                                   json={"rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok", "output1": {},
                                         "output2": [kis_row(x, q["FID_INPUT_ISCD"]) for x in days]})
+        if p.endswith("inquire-index-daily-price"):
+            assert q["FID_COND_MRKT_DIV_CODE"] == "U" and q["FID_PERIOD_DIV_CODE"] == "D"
+            d = q["FID_INPUT_DATE_1"]
+            base = 2500.0 if q["FID_INPUT_ISCD"] == "0001" else 800.0
+            return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output1": {},
+                "output2": [{"stck_bsop_date": x, "bstp_nmix_prpr": str(base), "bstp_nmix_hgpr": str(base + 1),
+                             "bstp_nmix_lwpr": str(base - 1), "acml_vol": "1", "acml_tr_pbmn": "2"}
+                            for x in DAYS if x <= d][:3]})
         if p.endswith("search-stock-info"):
+            if self.stockinfo_rate_limits:
+                self.stockinfo_rate_limits -= 1
+                return httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."})
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output": {
                 "scty_grp_id_cd": "ST", "stck_kind_cd": "101", "mket_id_cd": "STK", "prdt_abrv_name": "x"}})
         if "/sto/" in p:
@@ -67,7 +82,7 @@ class FakeServer:
                     {"ISU_SRT_CD": "005930", "ISU_ABBRV": "삼성전자", "SECUGRP_NM": "주권", "SECT_TP_NM": "", "KIND_STKCERT_TP_NM": "보통주"},
                     {"ISU_SRT_CD": "123450", "ISU_ABBRV": "가나스팩1호", "SECUGRP_NM": "주권", "SECT_TP_NM": "SPAC(소속부없음)", "KIND_STKCERT_TP_NM": "보통주"},
                     {"ISU_SRT_CD": "005935", "ISU_ABBRV": "삼성전자우", "SECUGRP_NM": "주권", "SECT_TP_NM": "", "KIND_STKCERT_TP_NM": "구형우선주"}]})
-            if q["basDd"] == TODAY:
+            if q["basDd"] == self.krx_empty_day:
                 return httpx.Response(200, json={"OutBlock_1": []})
             return httpx.Response(200, json={"OutBlock_1": [
                 {"ISU_CD": c, "ISU_NM": n, "ACC_TRDVOL": "1000", "ACC_TRDVAL": "500000000000"}

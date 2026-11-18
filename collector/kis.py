@@ -20,9 +20,10 @@ TOKEN_PATH = "/oauth2/tokenP"
 INVESTOR_BY_STOCK = ("FHPTJ04160001", "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily")
 HOLIDAY = ("CTCA0903R", "/uapi/domestic-stock/v1/quotations/chk-holiday")
 STOCK_INFO = ("CTPF1002R", "/uapi/domestic-stock/v1/quotations/search-stock-info")
+INDEX_DAILY = ("FHPUP02120000", "/uapi/domestic-stock/v1/quotations/inquire-index-daily-price")  # 국내업종 일자별지수
 
 # 시세·조회 API만 허용 (CLAUDE.md 절대 규칙)
-ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0]}
+ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0], INDEX_DAILY[0]}
 
 RATE_LIMIT_CODE = "EGW00201"
 RATE_LIMIT_RETRIES = 3
@@ -37,6 +38,8 @@ class RateLimitEvent:
     at: str
     tr_id: str
     recent_rate: int  # 직전 1초 호출 수
+    rate_before: float  # 설정 속도(초당)
+    rate_after: float  # 반으로 줄인 속도(초당)
 
 
 @dataclass
@@ -109,7 +112,6 @@ class KisClient:
         tr_id, path = api
         if tr_id not in ALLOWED_TR_IDS:
             raise ValueError(f"허용되지 않은 TR ID: {tr_id}")
-        wait = 1.0
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             headers = {
                 "content-type": "application/json; charset=utf-8",
@@ -127,12 +129,14 @@ class KisClient:
             except ValueError:
                 raise ApiError(f"KIS {tr_id} 응답이 JSON이 아님 (HTTP {resp.status_code})")
             if body.get("msg_cd") == RATE_LIMIT_CODE:
-                # 실측: 몇 번, 어느 속도에서 나왔는지 기록 (명세서 12.2, 사용자 요청)
+                # 한도 초과: 속도를 반으로 줄이고 1초 쉰 뒤 재시도. 줄인 속도는 이번 실행 끝까지 유지.
+                old = self.api.limiter.per_sec
+                self.api.limiter.set_rate(old / 2)
                 self.rate_limit_events.append(RateLimitEvent(
-                    at=self.now().strftime("%H:%M:%S"), tr_id=tr_id, recent_rate=rate_before))
+                    at=self.now().strftime("%H:%M:%S"), tr_id=tr_id, recent_rate=rate_before,
+                    rate_before=old, rate_after=self.api.limiter.per_sec))
                 if attempt < RATE_LIMIT_RETRIES:
-                    self.api.sleep(wait)
-                    wait *= 2
+                    self.api.sleep(1.0)
                     continue
             if resp.status_code in (401, 403):
                 raise KisAuthError(f"KIS 인증 실패 (HTTP {resp.status_code}, {body.get('msg1', '')})")
@@ -149,6 +153,22 @@ def investor_params(code: str, date: str) -> dict:
         "FID_ORG_ADJ_PRC": "0",
         "FID_ETC_CLS_CODE": "1",
     }
+
+
+def index_daily_params(index_code: str, date: str) -> dict:
+    """국내업종 일자별지수 요청 값 (kis_api_reference.xlsx: 시장구분 U, 코스피 0001, 코스닥 1001, D 일별)."""
+    return {
+        "FID_PERIOD_DIV_CODE": "D",
+        "FID_COND_MRKT_DIV_CODE": "U",
+        "FID_INPUT_ISCD": index_code,
+        "FID_INPUT_DATE_1": date,
+    }
+
+
+def investor_window_ok(now) -> bool:
+    """종목별 투자자매매동향은 00:00~15:40에 OPSQ2001 TIME LIMIT (0.1.1 실측). 15:40~23:59만 조회."""
+    hm = now.hour * 60 + now.minute
+    return 15 * 60 + 40 <= hm <= 23 * 60 + 59
 
 
 def holiday_params(date: str) -> dict:
