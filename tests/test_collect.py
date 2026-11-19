@@ -196,7 +196,7 @@ def test_lock(tmp_path):
 
 def test_db_version_guard(tmp_path):
     con = db.connect(tmp_path / "m.sqlite")
-    assert db.init_db(con) == 2
+    assert db.init_db(con) == db.SCHEMA_VERSION
     con.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
     with pytest.raises(db.DbError):
         db.init_db(con)
@@ -367,5 +367,5 @@ def test_db_upgrade_from_v1(tmp_path):
     con = db.connect(tmp_path / "m.sqlite")
     con.executescript(db.SCHEMA_V1)
     con.execute("INSERT INTO meta VALUES('schema_version','1')")
-    assert db.init_db(con) == 2
+    assert db.init_db(con) == db.SCHEMA_VERSION
     con.execute("SELECT * FROM market_investor_daily")

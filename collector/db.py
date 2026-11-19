@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS market_investor_daily (
     index_close REAL, detail_json TEXT, is_provisional INTEGER NOT NULL DEFAULT 0,
     source TEXT, fetched_at TEXT, raw_file TEXT,
     PRIMARY KEY (date, market));
+""",
+    3: """
+CREATE TABLE IF NOT EXISTS theme_versions (
+    version INTEGER PRIMARY KEY, loaded_at TEXT NOT NULL, file_hash TEXT NOT NULL, row_count INTEGER NOT NULL,
+    history_file TEXT);
+CREATE TABLE IF NOT EXISTS theme_membership (
+    version INTEGER NOT NULL, theme TEXT NOT NULL, code TEXT NOT NULL,
+    added_date TEXT, basis TEXT, note TEXT,
+    PRIMARY KEY (version, theme, code));
+CREATE TABLE IF NOT EXISTS briefing_unclassified (
+    date TEXT NOT NULL, code TEXT NOT NULL, list_name TEXT NOT NULL, generated_at TEXT NOT NULL,
+    PRIMARY KEY (date, code, list_name));
 """,
 }
 

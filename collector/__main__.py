@@ -14,7 +14,7 @@ from .version import __version__
 MENU = [
     ("1", "당일 수집", "daily"),
     ("2", "기간 수집", "range"),
-    ("3", "브리핑 패키지 생성", None),
+    ("3", "브리핑 패키지 생성", "briefing"),
     ("4", "DART 수집", None),
     ("5", "DART 구글 시트용 내보내기", None),
     ("6", "상태 점검", "status"),
@@ -61,6 +61,59 @@ def cmd_collect(args) -> int:
         res = run_collect(app, mode, start_d, end_d, force=args.force, confirm=confirm)
         print("\n".join(["", "=== 실행 요약 ==="] + res.lines + [f"로그: {app.log_path}"]))
         return 0 if not res.stopped else 2
+    finally:
+        app.close()
+
+
+def cmd_briefing(args) -> int:
+    from .app import start
+    from .briefing import BriefingError, build, default_date
+    from .briefing_writer import record_unclassified, write
+    from .lock import AlreadyRunning
+
+    try:
+        app = start()
+    except AlreadyRunning as exc:
+        print(exc)
+        return 1
+    try:
+        day = getattr(args, "date", None) or default_date(app.con)
+        if not getattr(args, "date", None) and args.command == "briefing" and not args.yes:
+            try:
+                typed = input(f"기준일 (YYYYMMDD, 엔터 = {day}): ").strip()
+            except EOFError:
+                typed = ""
+            day = typed or day
+        if not day or not _valid_date(day):
+            print("기준일이 없거나 형식이 틀렸습니다. 먼저 수집을 실행하세요.")
+            return 1
+        now = app.now()
+        try:
+            top_n = int(app.settings.get("UNCLASSIFIED_TOP_N") or 50)
+            pkg = build(app.con, day, app.dirs["themes"], now, top_n=top_n)
+        except BriefingError as exc:
+            print(f"브리핑 패키지를 만들지 않았습니다: {exc}")
+            return 1
+        paths = write(pkg, app.dirs["briefing"], now, with_json=getattr(args, "json", False))
+        record_unclassified(app.con, pkg)
+        print(f"기준일 {day}, 대상 종목 {len(pkg.stocks)}개, 테마 버전 {pkg.theme_version or '없음'}")
+        print(f"잠정값: 시세 {pkg.provisional['price']}종목, 수급 {pkg.provisional['investor']}종목")
+        for p in paths:
+            print(f"저장: {p}")
+        return 0
+    finally:
+        app.close()
+
+
+def cmd_unclassified(args) -> int:
+    from .app import start
+    from .briefing_writer import export_unclassified_repeats
+
+    app = start()
+    try:
+        p = export_unclassified_repeats(app.con, app.dirs["briefing"], app.now(), getattr(args, "days", None) or 20)
+        print(f"저장: {p}")
+        return 0
     finally:
         app.close()
 
@@ -118,7 +171,8 @@ def cmd_verify(args=None) -> int:
     return 0
 
 
-COMMANDS = {"daily": cmd_collect, "range": cmd_collect, "status": cmd_status, "verify": cmd_verify}
+COMMANDS = {"daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
+            "unclassified": cmd_unclassified, "verify": cmd_verify}
 
 
 def menu() -> int:
@@ -133,16 +187,21 @@ def menu() -> int:
     if not cmd:
         print("아직 준비되지 않았거나 없는 번호입니다.")
         return 1
-    return COMMANDS[cmd](argparse.Namespace(command=cmd, date_from=None, date_to=None, force=False, yes=False))
+    return COMMANDS[cmd](argparse.Namespace(command=cmd, date_from=None, date_to=None, force=False, yes=False,
+                                               date=None, json=False, days=None))
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(prog="주식데이터수집기")
     parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
-                        help="daily(당일 수집) / range(기간 수집) / status(상태 점검) / verify(실측 검증)")
+                        help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
+                             "unclassified(미분류 반복 등장 CSV) / verify(실측 검증)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
+    parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")
+    parser.add_argument("--json", action="store_true", help="브리핑을 JSON으로도 저장")
+    parser.add_argument("--days", type=int, help="미분류 반복 등장 집계 거래일 수 (기본 20)")
     parser.add_argument("--force", action="store_true", help="이미 성공한 단위도 다시 받기")
     parser.add_argument("--yes", action="store_true", help="확인 질문을 모두 '예'로 처리")
     parser.add_argument("--version", action="version", version=__version__)
