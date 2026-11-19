@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -130,6 +130,9 @@ CREATE TABLE IF NOT EXISTS dart_fs_quarter (
     revenue_cum_krw INTEGER, op_income_cum_krw INTEGER, net_income_cum_krw INTEGER, ocf_cum_krw INTEGER,
     rcept_no TEXT, rcept_dt TEXT, calc_note TEXT, updated_at TEXT,
     PRIMARY KEY (corp_code, fiscal_year, quarter, fs_div));
+""",
+    6: """
+ALTER TABLE price_daily ADD COLUMN cmpprevdd_prc REAL;
 """,
 }
 

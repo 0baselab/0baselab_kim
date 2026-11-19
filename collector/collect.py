@@ -60,7 +60,7 @@ def update_calendar(app: App, res: RunResult, need: int) -> None:
 def krx_targets(app: App, mode: str, start: str | None = None, end: str | None = None) -> list[str]:
     today = app.now().strftime("%Y%m%d")
     if mode == "daily":
-        days = cal.last_open_days(app.con, today, _int(app.settings, "KRX_RETENTION_DAYS", 250))
+        days = cal.last_open_days(app.con, today, _int(app.settings, "KRX_RETENTION_DAYS", 260))
     else:
         days = [d for d in cal.open_days(app.con, start, end) if d < today]
     return sorted(days, reverse=True)  # 최근 날짜부터
@@ -75,8 +75,11 @@ def run_collect(app: App, mode: str = "daily", start: str | None = None, end: st
     app.con.execute("INSERT OR REPLACE INTO run_log(run_id, mode, version, started_at) VALUES(?,?,?,?)",
                     (run_id, mode, __version__, t0.isoformat(timespec="seconds")))
     res.add(f"주식데이터수집기 {__version__} / {'당일' if mode == 'daily' else '기간'} 수집 ({t0.strftime('%Y-%m-%d %H:%M')})")
-    retention = max(_int(app.settings, "KRX_RETENTION_DAYS", 250), _int(app.settings, "KIS_RETENTION_DAYS", 120))
+    retention = max(_int(app.settings, "KRX_RETENTION_DAYS", 260), _int(app.settings, "KIS_RETENTION_DAYS", 120))
     try:
+        n = krx_collect.backfill_cmpprevdd(app.con, app.root)
+        if n:
+            res.add(f"기준가 조정 판정용 전일대비 값 {n}건을 저장된 원본에서 채웠습니다 (1회).")
         update_calendar(app, res, retention)
         days = krx_targets(app, mode, start, end)
         if not days:

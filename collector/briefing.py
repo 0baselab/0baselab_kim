@@ -3,7 +3,7 @@
 - 판단 없음: 수익률·합계·배수만. 순위·점수·강세/약세 없음.
 - n일 합계·평균은 n거래일 자료가 모두 있을 때만. 빠지면 빈 칸 + missing_note.
 - 기준일 이후 자료는 쓰지 않는다.
-- 기업행동 의심(상장주식수 변경) 종목은 수집 단계에서 받은 수정주가로 수익률·이격을 계산한다 (8.4).
+- 기업행동 의심(기준가 조정) 종목은 수집 단계에서 받은 수정주가로 수익률·이격을 계산한다 (8.4).
   수정주가가 없으면 그 창을 비우고 이유를 적는다.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from datetime import datetime
 from . import trading_calendar as cal
 from . import themes as themes_mod
 
-RULE_VERSION = "2"
+RULE_VERSION = "3"
 RET_WINDOWS = (5, 20, 60, 120, 250)
 GAP_WINDOWS = (5, 20, 60, 120)
 SUM_WINDOWS = (1, 5, 20)
@@ -103,6 +103,8 @@ def build(con, day: str, themes_dir, now: datetime, top_n: int = 50) -> Package:
     for r in con.execute("SELECT * FROM adj_price_daily WHERE date BETWEEN ? AND ?", (days[0], day)):
         adj.setdefault(r["code"], {})[r["date"]] = r
         adj_as_of[r["code"]] = r["as_of"]
+    from .krx_collect import base_price_adjust_days
+    adjusted = base_price_adjust_days(con, days[0], day, codes)
     master = {r[0] for r in con.execute("SELECT code FROM stock_master")}
     th = themes_mod.load(con, themes_dir, now, master, set(codes))
 
@@ -110,7 +112,7 @@ def build(con, day: str, themes_dir, now: datetime, top_n: int = 50) -> Package:
                   universe_date=udate, provisional={})
     for code in codes:
         pkg.stocks.append(_stock_row(code, urows[code], prices.get(code, {}), inv.get(code, {}), days, pos, day,
-                                     th.members.get(code, []), adj.get(code), adj_as_of.get(code)))
+                                     th.members.get(code, []), adj.get(code), adj_as_of.get(code), adjusted.get(code)))
 
     pkg.market = _market_rows(con, day, days, pkg.stocks)
     pkg.index_series = _index_rows(con, day, days)
@@ -134,7 +136,7 @@ def _window(days, pos, day, n, include_today=True):
     return days[i - n:i] if i - n >= 0 else None
 
 
-def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None) -> dict:
+def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None, adjust_days=None) -> dict:
     missing: dict[str, set] = {}
     today = P.get(day)
     close = today["close"] if today else None
@@ -147,10 +149,9 @@ def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None) ->
     }
     if today is None:
         missing.setdefault("price", set()).add(day)
-    # 기업행동 의심: 창 안에서 상장주식수가 바뀐 날
-    shares = [(d, P[d]["listed_shares"]) for d in days if d in P and P[d]["listed_shares"] is not None]
-    changes = [shares[k][0] for k in range(1, len(shares)) if shares[k][1] != shares[k - 1][1]]
-    row["corp_action_suspect"] = 1 if changes and changes[-1] == day else 0  # 전일 대비 변경 (8.4-1)
+    # 기업행동 의심: 창 안에서 기준가가 조정된 날 (KRX 종가 − 전일대비 ≠ 직전 거래일 종가)
+    changes = adjust_days or []
+    row["corp_action_suspect"] = 1 if changes and changes[-1] == day else 0
     corp_note = []
     # 수정주가: 마지막 변경일 기준으로 받은 것이 있으면 수익률·이격·250일 범위 계산에만 쓴다 (8.4-2)
     use_adj = bool(changes and A and as_of == changes[-1])
@@ -159,7 +160,7 @@ def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None) ->
             r = A.get(d)
             return r["close"] if r else None
         calc_close = cl(day)
-        corp_note.append(f"수익률·이격·250일 범위는 수정주가 사용 (상장주식수 변경 {changes[-1]})")
+        corp_note.append(f"수익률·이격·250일 범위는 수정주가 사용 (기준가 조정 {changes[-1]})")
         if calc_close is None:
             corp_note.append("수정주가에 기준일 값 없음 -> 수익률·이격 비움")
         kind = "adj"
@@ -189,7 +190,7 @@ def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None) ->
         hit = blocked(days[pos[day] - n:pos[day] + 1])
         if hit:
             row[key] = None
-            corp_note.append(f"{n}일 수익률 비움(상장주식수 변경 {hit[-1]})")
+            corp_note.append(f"{n}일 수익률 비움(기준가 조정 {hit[-1]})")
         elif cl(base_day) is None:
             row[key] = None
             note_missing([base_day])
@@ -215,7 +216,7 @@ def _stock_row(code, u, P, I, days, pos, day, theme_list, A=None, as_of=None) ->
                 note_missing(win)
         elif blocked(win):
             row[key] = None
-            corp_note.append(f"{n}일 이격 비움(상장주식수 변경)")
+            corp_note.append(f"{n}일 이격 비움(기준가 조정)")
         else:
             row[key] = _pct(calc_close, sum(vals) / n)
     row["volume_sh"] = today["volume_sh"] if today else None
@@ -412,7 +413,7 @@ def _status_rows(con, day, days, th, pkg):
             add("빈 값", f"{m['index_name']} 지수", "기준일 지수 없음")
     for s in pkg.stocks:
         if s["corp_action_suspect"]:
-            add("기업행동 의심", f"{s['code']} {s['name']}", s["missing_note"] or "상장주식수 변경")
+            add("기업행동 의심", f"{s['code']} {s['name']}", s["missing_note"] or "기준가 조정")
     for line, orig, fixed in th.fixes:
         add("자동 보정", f"테마 CSV {line}줄", f"종목코드 {orig} -> {fixed}")
     for line, desc, problem in th.problems:
@@ -441,7 +442,7 @@ def _info(pkg, ready_reason, n, th):
         ("n일 수익률", "(기준일 종가 ÷ n거래일 전 종가 − 1) × 100. 거래일은 달력 테이블 기준"),
         ("n일 합계·평균", "n거래일 자료가 모두 있을 때만. 빠지면 빈 칸 + missing_note"),
         ("직전 n일 평균", "기준일 제외 앞의 n거래일 (value_x_ma5/20, volume_x_ma20)"),
-        ("기업행동 의심", "상장주식수가 바뀐 종목은 KIS 수정주가(FHKST03010100)로 수익률·이격·250일 범위를 계산. "
+        ("기업행동 의심", "기준가가 조정된 날(KRX 종가 − 전일대비 ≠ 직전 거래일 종가)이 있는 종목은 KIS 수정주가(FHKST03010100)로 수익률·이격·250일 범위를 계산. "
                           "원본 가격(close)은 그대로. 수정주가가 없으면 해당 창을 비우고 이유를 적음"),
         ("5_미분류", "판단이 아닌 목록: 테마 밖 종목 중 value_x_ma20 상위와 외국인+기관 순매수/시총 상위 합집합"),
     ] + [(f"단위 {k}", v) for k, v in UNITS]

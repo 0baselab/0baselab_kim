@@ -155,6 +155,7 @@ def _save_trade(con, day, market, rows, ts, raw, stats: KrxStats) -> None:
             "change_rate_pct": to_float(r.get("FLUC_RT")),
             "volume_sh": to_int(r.get("ACC_TRDVOL")), "value_krw": to_int(r.get("ACC_TRDVAL")),
             "mktcap_krw": to_int(r.get("MKTCAP")), "listed_shares": to_int(r.get("LIST_SHRS")),
+            "cmpprevdd_prc": to_float(r.get("CMPPREVDD_PRC")),
         }
         old = con.execute("SELECT * FROM price_daily WHERE date=? AND code=?", (day, code)).fetchone()
         if old is not None and old["is_provisional"]:
@@ -166,10 +167,10 @@ def _save_trade(con, day, market, rows, ts, raw, stats: KrxStats) -> None:
             stats.replaced_provisional += 1
         con.execute(
             "INSERT OR REPLACE INTO price_daily(date, code, market, open, high, low, close, change_rate_pct,"
-            " volume_sh, value_krw, mktcap_krw, listed_shares, is_provisional, source, fetched_at, raw_file)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,'KRX',?,?)",
+            " volume_sh, value_krw, mktcap_krw, listed_shares, cmpprevdd_prc, is_provisional, source, fetched_at, raw_file)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,'KRX',?,?)",
             (day, code, market, new["open"], new["high"], new["low"], new["close"], new["change_rate_pct"],
-             new["volume_sh"], new["value_krw"], new["mktcap_krw"], new["listed_shares"], ts, raw))
+             new["volume_sh"], new["value_krw"], new["mktcap_krw"], new["listed_shares"], new["cmpprevdd_prc"], ts, raw))
 
 
 def _save_base(con, day, market, rows, ts, raw, stats: KrxStats) -> None:
@@ -223,3 +224,60 @@ def _save_index(con, day, market, rows, ts, raw) -> None:
             (day, market, name, r.get("IDX_CLSS"), to_float(r.get("OPNPRC_IDX")), to_float(r.get("HGPRC_IDX")),
              to_float(r.get("LWPRC_IDX")), to_float(r.get("CLSPRC_IDX")), to_float(r.get("FLUC_RT")),
              to_int(r.get("ACC_TRDVOL")), to_int(r.get("ACC_TRDVAL")), to_int(r.get("MKTCAP")), ts, raw))
+
+
+def backfill_cmpprevdd(con, root) -> int:
+    """0.6.0 이전에 받은 KRX 행의 CMPPREVDD_PRC를 저장해 둔 원본(raw)에서 채운다. 한 번만 실행."""
+    import gzip
+    import json
+
+    if con.execute("SELECT value FROM meta WHERE key='backfill_cmpprevdd'").fetchone():
+        return 0
+    files = [r[0] for r in con.execute(
+        "SELECT DISTINCT raw_file FROM price_daily WHERE source='KRX' AND cmpprevdd_prc IS NULL AND raw_file IS NOT NULL")]
+    n = 0
+    for rel in files:
+        path = root.joinpath(*rel.split("/"))
+        if not path.exists():
+            continue
+        try:
+            body = json.loads(gzip.open(path, "rb").read().decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        day = str((body.get(ROWS_KEY) or [{}])[0].get("BAS_DD") or "")
+        with db.Tx(con):
+            for r in body.get(ROWS_KEY) or []:
+                v = to_float(r.get("CMPPREVDD_PRC"))
+                if v is None:
+                    continue
+                cur = con.execute("UPDATE price_daily SET cmpprevdd_prc=? WHERE raw_file=? AND code=?",
+                                  (v, rel, str(r.get("ISU_CD") or "").strip()))
+                n += cur.rowcount
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('backfill_cmpprevdd', ?)", (str(n),))
+    return n
+
+
+def base_price_adjust_days(con, start: str, end: str, codes=None) -> dict[str, list[str]]:
+    """기준가가 조정된 날: KRX 종가 − CMPPREVDD_PRC ≠ 직전 거래일 KRX 종가 (액면분할·병합·무상증자 등).
+    상장주식수 변화(CB 전환·자사주 소각·스톡옵션)는 쓰지 않는다. 판단할 값이 없으면 판정하지 않는다."""
+    days = [r[0] for r in con.execute(
+        "SELECT date FROM trading_calendar WHERE is_open=1 AND date BETWEEN ? AND ? ORDER BY date", (start, end))]
+    prev_of = {days[i]: days[i - 1] for i in range(1, len(days))}
+    out: dict[str, list[str]] = {}
+    closes: dict[tuple[str, str], float] = {}
+    rows = con.execute("SELECT code, date, close, cmpprevdd_prc FROM price_daily WHERE source='KRX' AND is_provisional=0"
+                       " AND date BETWEEN ? AND ? ORDER BY code, date", (start, end)).fetchall()
+    for r in rows:
+        if r["close"] is not None:
+            closes[(r["code"], r["date"])] = r["close"]
+    keep = set(codes) if codes is not None else None
+    for r in rows:
+        if keep is not None and r["code"] not in keep:
+            continue
+        pd = prev_of.get(r["date"])
+        prev_close = closes.get((r["code"], pd)) if pd else None
+        if r["close"] is None or r["cmpprevdd_prc"] is None or prev_close is None:
+            continue
+        if abs((r["close"] - r["cmpprevdd_prc"]) - prev_close) > 0.5:
+            out.setdefault(r["code"], []).append(r["date"])
+    return out

@@ -370,36 +370,26 @@ def _save_market(con, d, market, r, today, ts, raw) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 수정주가 재조회 (명세서 8.4): 상장주식수가 바뀐 종목만. 원본 price_daily는 건드리지 않는다.
+# 수정주가 재조회 (명세서 8.4): 기준가가 조정된 종목만 (0.6.1 실측 반영). 원본 price_daily는 건드리지 않는다.
 # ---------------------------------------------------------------------------
 ADJ_WINDOW = 251  # 250일 수익률에 필요한 거래일 수
 ADJ_CHUNK = 100   # 1회 최대 100건 (KIS 문서)
 
 
-def latest_share_changes(con, day: str, codes: list[str] | None = None) -> dict[str, str]:
-    """day까지 최근 ADJ_WINDOW 거래일 안에서 상장주식수가 마지막으로 바뀐 날 (종목별)."""
+def latest_adjust_days(con, day: str, codes: list[str] | None = None) -> dict[str, str]:
+    """day까지 최근 ADJ_WINDOW 거래일 안에서 기준가가 조정된 마지막 날 (종목별)."""
+    from .krx_collect import base_price_adjust_days
     days = sorted(r[0] for r in con.execute(
         "SELECT date FROM trading_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT ?", (day, ADJ_WINDOW)))
     if not days:
         return {}
-    out: dict[str, str] = {}
-    prev: dict[str, int] = {}
-    for r in con.execute("SELECT code, date, listed_shares FROM price_daily WHERE date BETWEEN ? AND ?"
-                         " AND listed_shares IS NOT NULL ORDER BY code, date", (days[0], days[-1])):
-        c = r["code"]
-        if c in prev and prev[c] != r["listed_shares"]:
-            out[c] = r["date"]
-        prev[c] = r["listed_shares"]
-    if codes is not None:
-        keep = set(codes)
-        out = {c: d for c, d in out.items() if c in keep}
-    return out
+    return {c: ds[-1] for c, ds in base_price_adjust_days(con, days[0], days[-1], codes).items()}
 
 
 def collect_adjusted(con, kis: KisClient, root, codes: list[str], now_fn) -> tuple[int, int, int]:
     """기업행동 의심 종목의 수정주가 250거래일. (받음, 실패, 이미 받음) 개수."""
     today = now_fn().strftime("%Y%m%d")
-    changes = latest_share_changes(con, today, codes)
+    changes = latest_adjust_days(con, today, codes)
     days = sorted(r[0] for r in con.execute(
         "SELECT date FROM trading_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT ?", (today, ADJ_WINDOW)))
     ok = fail = skip = 0

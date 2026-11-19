@@ -55,7 +55,8 @@ class FakeMarket:
         self.investor_calls = 0
         self.admin_codes = {"222220"}
         self.market_calls = 0
-        self.share_change: dict[str, str] = {}  # code -> 상장주식수가 2000으로 바뀌는 날
+        self.split_day: dict[str, str] = {}  # code -> 기준가가 조정된 날 (KRX CMPPREVDD_PRC로 표현)
+        self.share_change: dict[str, str] = {}  # code -> 상장주식수만 2000으로 바뀌는 날 (기준가 조정 없음)
         self.adj_fail = False
         self.adj_calls = 0
         self.market_days = 1  # 1회 응답 일수 (실제 값은 첫 실행으로 확인)
@@ -104,7 +105,7 @@ class FakeMarket:
             assert q["FID_ORG_ADJ_PRC"] == "0" and q["FID_COND_MRKT_DIV_CODE"] == "J"
             if self.adj_fail:
                 return httpx.Response(200, json={"rt_cd": "1", "msg_cd": "ERR", "msg1": "fail"})
-            ch = self.share_change.get(q["FID_INPUT_ISCD"], "99999999")
+            ch = self.split_day.get(q["FID_INPUT_ISCD"], "99999999")
             days = [s for s in OPEN if q["FID_INPUT_DATE_1"] <= s <= q["FID_INPUT_DATE_2"]]
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output1": {}, "output2": [
                 {"stck_bsop_date": s, "stck_clpr": "500" if s < ch else "1000", "stck_oprc": "1", "stck_hgpr": "1",
@@ -135,6 +136,7 @@ class FakeMarket:
                 rows = [{"ISU_CD": c, "ISU_NM": n, "TDD_CLSPRC": "1,000", "FLUC_RT": "-", "TDD_OPNPRC": "990",
                          "TDD_HGPRC": "1,010", "TDD_LWPRC": "980", "ACC_TRDVOL": "500", "ACC_TRDVAL": "500000",
                          "MKTCAP": "1000000",
+                         "CMPPREVDD_PRC": "500" if d == self.split_day.get(c) else "0",
                          "LIST_SHRS": "2000" if d >= self.share_change.get(c, "99999999") else "1000"}
                         for c, n, l, *_ in BASE[mk] if l <= d]
             return httpx.Response(200, json={"OutBlock_1": rows})
