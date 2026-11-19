@@ -223,7 +223,11 @@ def cmd_verify(args=None) -> int:
     return 0
 
 
-COMMANDS = {"daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
+def cmd_menu(args) -> int:
+    return menu()
+
+
+COMMANDS = {"menu": cmd_menu, "daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
             "unclassified": cmd_unclassified, "dart": cmd_dart, "dart-export": cmd_dart_export, "verify": cmd_verify}
 
 
@@ -259,11 +263,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
     try:
-        code = COMMANDS[args.command](args) if args.command else menu()
+        if args.command:
+            code = COMMANDS[args.command](args)
+        else:  # 인자 없이 실행(더블클릭) -> GUI. 터미널 메뉴는 `menu` 명령으로
+            from .gui import run_gui
+            return run_gui()
     except KeyboardInterrupt:
         print("\n사용자가 중단했습니다.")
         code = 130
-    if getattr(sys, "frozen", False) and not argv:
+    if getattr(sys, "frozen", False) and args.command == "menu":
         try:
             input("\n엔터를 누르면 창이 닫힙니다.")
         except EOFError:

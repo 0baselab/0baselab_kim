@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -133,6 +133,12 @@ CREATE TABLE IF NOT EXISTS dart_fs_quarter (
 """,
     6: """
 ALTER TABLE price_daily ADD COLUMN cmpprevdd_prc REAL;
+""",
+    7: """
+ALTER TABLE collect_log ADD COLUMN off_hours INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE run_log ADD COLUMN target TEXT;
+ALTER TABLE run_log ADD COLUMN kinds TEXT;
+ALTER TABLE run_log ADD COLUMN off_hours INTEGER NOT NULL DEFAULT 0;
 """,
 }
 

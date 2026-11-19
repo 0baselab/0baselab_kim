@@ -29,6 +29,7 @@ DEFAULTS: list[tuple[str, str, str]] = [
     ("LOG_KEEP_DAYS", "90", "로그 보관 일수"),
     ("BACKUP_KEEP", "7", "DB 스냅샷 보관 개수"),
     ("UNCLASSIFIED_TOP_N", "50", "브리핑 5_미분류: 각 기준별 상위 종목 수"),
+    ("GUI_FONT_SCALE", "1.0", "화면 글자 크기 배율 (예: 1.2 = 크게)"),
     ("VERIFY_STOCKS", "005930,000660,005380,247540,196170",
      "실측 검증 종목 (코스피 3: 삼성전자·SK하이닉스·현대차 / 코스닥 2: 에코프로비엠·알테오젠)"),
     ("VERIFY_DART_STOCKS", "005930,000660,247540", "DART 재무 검증 종목 (코스피 2, 코스닥 1)"),
@@ -75,3 +76,17 @@ def migrate(path: Path, values: dict) -> list[str]:
     if changed:
         path.write_text(text, encoding="utf-8")
     return changed
+
+
+def set_setting(install: Path, key: str, value: str) -> None:
+    """설정 한 줄만 바꾼다 (주석·다른 값 유지)."""
+    path = settings_path(install)
+    load_settings(install)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for i, ln in enumerate(lines):
+        if ln.split("=", 1)[0].strip() == key:
+            lines[i] = f"{key}={value}"
+            break
+    else:
+        lines.append(f"{key}={value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
