@@ -22,6 +22,7 @@ DEFAULTS: list[tuple[str, str, str]] = [
     ("KRX_CALLS_PER_SEC", "2", "KRX 초당 호출 수"),
     ("DART_BASE_URL", "https://opendart.fss.or.kr/api", "Open DART 기본 주소"),
     ("DART_DAILY_LIMIT", "18000", "DART 하루 호출 한도"),
+    ("DART_CALLS_PER_SEC", "5", "DART 초당 호출 수"),
     ("KRX_RETENTION_DAYS", "250", "KRX 시세·지수 보관(수집) 거래일 수"),
     ("KIS_RETENTION_DAYS", "120", "KIS 수급 보관(수집) 거래일 수"),
     ("KIS_STOCKINFO_REFRESH_DAYS", "7", "KIS 주식기본조회 전 종목 재조회 주기(일)"),
