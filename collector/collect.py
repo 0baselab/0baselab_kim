@@ -212,6 +212,8 @@ def _run_kis(app, res, confirm, out) -> None:
     if st.stopped:
         res.add("KIS 수급 " + st.stopped)
         return
+    for line in kis_collect.collect_market_investor(app.con, kis, app.root, targets, app.now):
+        res.add(line)
     info = kis_collect.stockinfo_targets(app.con, codes, app.now(), _int(app.settings, "KIS_STOCKINFO_REFRESH_DAYS", 7))
     if info:
         ok, fail = kis_collect.collect_stockinfo(app.con, kis, app.root, info, app.now)

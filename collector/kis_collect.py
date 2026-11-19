@@ -15,8 +15,9 @@ from typing import Callable
 
 from . import db
 from . import trading_calendar as cal
-from .kis import (INDEX_DAILY, INVESTOR_BY_STOCK, STOCK_INFO, KisClient, index_daily_params, investor_params,
-                  investor_window_ok, is_ok, stock_info_params)
+from .kis import (INDEX_DAILY, INVESTOR_BY_STOCK, MARKET_INVESTOR, STOCK_INFO, KisClient, index_daily_params,
+                  investor_params, investor_window_ok, is_ok, market_investor_params, stock_info_params)
+from .http import ApiError
 from .krx_collect import to_float, to_int
 from .rawstore import save_raw
 
@@ -215,7 +216,10 @@ def collect_index_today(con, kis: KisClient, root, now: datetime) -> list[str]:
     ts = now.isoformat(timespec="seconds")
     out = []
     for code, (series, name) in KIS_INDEXES.items():
-        body = kis.get(INDEX_DAILY, index_daily_params(code, today)).body
+        try:
+            body = kis.get(INDEX_DAILY, index_daily_params(code, today)).body
+        except ApiError as exc:
+            body = {"rt_cd": "1", "msg_cd": "ERROR", "msg1": str(exc)[:200]}
         raw = save_raw(root, "kis", f"index_{code}", today, body, now)
         row = next((r for r in (body.get("output2") or []) if r.get("stck_bsop_date") == today), None) if is_ok(body) else None
         with db.Tx(con):
@@ -280,3 +284,82 @@ def apply_flags(con, day: str) -> None:
     """stock_master의 관리종목·거래정지 표시를 해당 날짜 universe_daily에 반영."""
     con.execute("UPDATE universe_daily SET is_admin=(SELECT is_admin FROM stock_master s WHERE s.code=universe_daily.code),"
                 " is_halted=(SELECT is_halted FROM stock_master s WHERE s.code=universe_daily.code) WHERE date=?", (day,))
+
+
+# ---------------------------------------------------------------------------
+# 시장별 투자자매매동향 (FHPTJ04040000). 단위는 KIS 문서에 없어 _unconfirmed 컬럼에 저장.
+# ---------------------------------------------------------------------------
+MARKETS = {"KOSPI": ("0001", "KSP"), "KOSDAQ": ("1001", "KSQ")}
+MKT_COLS = {
+    "frgn_net_qty_unconfirmed": "frgn_ntby_qty", "orgn_net_qty_unconfirmed": "orgn_ntby_qty",
+    "prsn_net_qty_unconfirmed": "prsn_ntby_qty", "frgn_net_amt_unconfirmed": "frgn_ntby_tr_pbmn",
+    "orgn_net_amt_unconfirmed": "orgn_ntby_tr_pbmn", "prsn_net_amt_unconfirmed": "prsn_ntby_tr_pbmn",
+}
+
+
+def collect_market_investor(con, kis: KisClient, root, targets: list[str], now_fn) -> list[str]:
+    today = now_fn().strftime("%Y%m%d")
+    out = []
+    for market, (idx, mcode) in MARKETS.items():
+        ds = f"market_investor_{market}"
+        done = {r[0] for r in con.execute("SELECT unit_key FROM collect_log WHERE source='KIS' AND dataset=?"
+                                          " AND status IN ('success','holiday')", (ds,))}
+        need = sorted((d for d in targets if d not in done), reverse=True)
+        calls = saved = 0
+        first_rows = None
+        for d in need:
+            if db.get_status(con, "KIS", ds, d) == "success":
+                continue  # 앞선 응답에 이미 들어와 확정됨
+            if not investor_window_ok(now_fn()):
+                out.append(f"시장별 수급 {market}: 조회 가능 시각을 벗어나 멈춤")
+                break
+            now = now_fn()
+            ts = now.isoformat(timespec="seconds")
+            try:
+                body = kis.get(MARKET_INVESTOR, market_investor_params(idx, mcode, d)).body
+            except ApiError as exc:
+                body = {"rt_cd": "1", "msg_cd": "ERROR", "msg1": str(exc)[:200]}
+            calls += 1
+            raw = save_raw(root, "kis", f"market_investor_{market}", d, body, now)
+            if not is_ok(body):
+                with db.Tx(con):
+                    db.set_status(con, "KIS", ds, d, "failed", ts, f"{body.get('msg_cd')} {body.get('msg1')}", raw)
+                if body.get("msg_cd") == TIME_LIMIT_CODE:
+                    out.append(f"시장별 수급 {market}: {TIME_LIMIT_CODE}로 멈춤")
+                    break
+                continue
+            rows = [r for r in (body.get("output") or []) if r.get("stck_bsop_date")]
+            if first_rows is None:
+                first_rows = len(rows)
+            with db.Tx(con):
+                got = set()
+                for r in rows:
+                    rd = r["stck_bsop_date"]
+                    if rd not in targets and rd != d:
+                        continue
+                    got.add(rd)
+                    _save_market(con, rd, market, r, today, ts, raw)
+                    if db.get_status(con, "KIS", ds, rd) != "success" or rd == today:
+                        db.set_status(con, "KIS", ds, rd, "provisional" if rd == today else "success", ts, None, raw)
+                    saved += 1
+                if d not in got:
+                    db.set_status(con, "KIS", ds, d, "empty", ts, None, raw)
+        if need:
+            out.append(f"시장별 수급 {market}: 호출 {calls}회, 저장 {saved}행 (1회 응답 일수 {first_rows if first_rows is not None else '-'})")
+    return out
+
+
+def _save_market(con, d, market, r, today, ts, raw) -> None:
+    new = {c: to_int(r.get(src)) for c, src in MKT_COLS.items()}
+    old = con.execute("SELECT * FROM market_investor_daily WHERE date=? AND market=?", (d, market)).fetchone()
+    if old is not None:
+        for c in MKT_COLS:
+            if old[c] != new[c]:
+                db.record_change(con, "market_investor_daily", f"{d}|{market}", c, old[c], new[c], ts,
+                                 "잠정 -> 재조회" if old["is_provisional"] else "재조회 값 변경")
+    con.execute(
+        "INSERT OR REPLACE INTO market_investor_daily(date, market, frgn_net_qty_unconfirmed, orgn_net_qty_unconfirmed,"
+        " prsn_net_qty_unconfirmed, frgn_net_amt_unconfirmed, orgn_net_amt_unconfirmed, prsn_net_amt_unconfirmed,"
+        " index_close, detail_json, is_provisional, source, fetched_at, raw_file) VALUES(?,?,?,?,?,?,?,?,?,?,?,'KIS',?,?)",
+        (d, market, *[new[c] for c in MKT_COLS], to_float(r.get("bstp_nmix_prpr")), json.dumps(r, ensure_ascii=False),
+         1 if d == today else 0, ts, raw))

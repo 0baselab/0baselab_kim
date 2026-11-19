@@ -27,6 +27,7 @@ DEFAULTS: list[tuple[str, str, str]] = [
     ("KIS_STOCKINFO_REFRESH_DAYS", "7", "KIS 주식기본조회 전 종목 재조회 주기(일)"),
     ("LOG_KEEP_DAYS", "90", "로그 보관 일수"),
     ("BACKUP_KEEP", "7", "DB 스냅샷 보관 개수"),
+    ("UNCLASSIFIED_TOP_N", "50", "브리핑 5_미분류: 각 기준별 상위 종목 수"),
     ("VERIFY_STOCKS", "005930,000660,005380,247540,196170",
      "실측 검증 종목 (코스피 3: 삼성전자·SK하이닉스·현대차 / 코스닥 2: 에코프로비엠·알테오젠)"),
     ("VERIFY_DART_STOCKS", "005930,000660,247540", "DART 재무 검증 종목 (코스피 2, 코스닥 1)"),

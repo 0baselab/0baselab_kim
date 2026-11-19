@@ -54,6 +54,8 @@ class FakeMarket:
         self.kis_time_limit = False
         self.investor_calls = 0
         self.admin_codes = {"222220"}
+        self.market_calls = 0
+        self.market_days = 1  # 1회 응답 일수 (실제 값은 첫 실행으로 확인)
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         p, q = req.url.path, dict(req.url.params)
@@ -83,6 +85,17 @@ class FakeMarket:
                      "frgn_ntby_qty": str(10 + self.inv_bump.get(s, 0)), "orgn_ntby_qty": "-5", "prsn_ntby_qty": "-5",
                      "frgn_ntby_tr_pbmn": "12", "orgn_ntby_tr_pbmn": "-3", "prsn_ntby_tr_pbmn": "-9"} for s in days]
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok", "output1": {}, "output2": rows})
+        if p.endswith("inquire-investor-daily-by-market"):
+            self.market_calls += 1
+            assert (q["FID_COND_MRKT_DIV_CODE"], q["FID_INPUT_DATE_1"]) == ("U", q["FID_INPUT_DATE_2"])
+            assert (q["FID_INPUT_ISCD"], q["FID_INPUT_ISCD_1"]) in (("0001", "KSP"), ("1001", "KSQ"))
+            assert q["FID_INPUT_ISCD_2"] == q["FID_INPUT_ISCD"]
+            d = q["FID_INPUT_DATE_1"]
+            days = [s for s in reversed(OPEN) if s <= d][: self.market_days]
+            return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output": [
+                {"stck_bsop_date": s, "bstp_nmix_prpr": "2500", "frgn_ntby_qty": "-100", "orgn_ntby_qty": "50",
+                 "prsn_ntby_qty": "50", "frgn_ntby_tr_pbmn": "-2000", "orgn_ntby_tr_pbmn": "1000",
+                 "prsn_ntby_tr_pbmn": "1000"} for s in days]})
         if p.endswith("search-stock-info"):
             code = q["PDNO"]
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output": {

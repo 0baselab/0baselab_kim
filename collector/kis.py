@@ -20,10 +20,11 @@ TOKEN_PATH = "/oauth2/tokenP"
 INVESTOR_BY_STOCK = ("FHPTJ04160001", "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily")
 HOLIDAY = ("CTCA0903R", "/uapi/domestic-stock/v1/quotations/chk-holiday")
 STOCK_INFO = ("CTPF1002R", "/uapi/domestic-stock/v1/quotations/search-stock-info")
+MARKET_INVESTOR = ("FHPTJ04040000", "/uapi/domestic-stock/v1/quotations/inquire-investor-daily-by-market")
 INDEX_DAILY = ("FHPUP02120000", "/uapi/domestic-stock/v1/quotations/inquire-index-daily-price")  # 국내업종 일자별지수
 
 # 시세·조회 API만 허용 (CLAUDE.md 절대 규칙)
-ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0], INDEX_DAILY[0]}
+ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0], INDEX_DAILY[0], MARKET_INVESTOR[0]}
 
 RATE_LIMIT_CODE = "EGW00201"
 RATE_LIMIT_RETRIES = 3
@@ -162,6 +163,18 @@ def index_daily_params(index_code: str, date: str) -> dict:
         "FID_COND_MRKT_DIV_CODE": "U",
         "FID_INPUT_ISCD": index_code,
         "FID_INPUT_DATE_1": date,
+    }
+
+
+def market_investor_params(index_code: str, market_code: str, date: str) -> dict:
+    """시장별 투자자매매동향 (kis_api_reference.xlsx 요청 예시: U, 0001, KSP). 날짜2와 하위코드는 문서대로 같은 값."""
+    return {
+        "FID_COND_MRKT_DIV_CODE": "U",
+        "FID_INPUT_ISCD": index_code,
+        "FID_INPUT_DATE_1": date,
+        "FID_INPUT_ISCD_1": market_code,
+        "FID_INPUT_DATE_2": date,
+        "FID_INPUT_ISCD_2": index_code,
     }
 
 

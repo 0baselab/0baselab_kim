@@ -120,7 +120,7 @@ def test_empty_streak_counts(install):
     for minute in (31, 32, 33):
         collect(install, m, now=NOW.replace(minute=minute))
     con = reopen(install)
-    assert con.execute("SELECT MIN(empty_streak) FROM collect_log WHERE unit_key='20261118'").fetchone()[0] == 3
+    assert con.execute("SELECT MIN(empty_streak) FROM collect_log WHERE source='KRX' AND unit_key='20261118'").fetchone()[0] == 3
     a = start(install, m, NOW.replace(minute=40))
     try:
         assert any("재확인 필요 (빈 결과 3회 연속): 6건" in l for l in report(a))
@@ -196,7 +196,7 @@ def test_lock(tmp_path):
 
 def test_db_version_guard(tmp_path):
     con = db.connect(tmp_path / "m.sqlite")
-    assert db.init_db(con) == 1
+    assert db.init_db(con) == db.SCHEMA_VERSION
     con.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
     with pytest.raises(db.DbError):
         db.init_db(con)
@@ -338,3 +338,34 @@ def test_stockinfo_refresh_every_7_days(install):
     assert n() == first  # 7일 안에는 재조회 안 함
     collect(install, m, now=datetime(2026, 11, 27, 20, 30, tzinfo=KST))
     assert n() == first + 4
+
+
+def test_market_investor(install):
+    kis_settings(install)
+    m = FakeMarket()
+    collect(install, m)
+    con = reopen(install)
+    assert m.market_calls == 2 * 40  # 1회 1일치라면 시장당 보관 거래일 수만큼
+    r = con.execute("SELECT * FROM market_investor_daily WHERE date='20261119' AND market='KOSDAQ'").fetchone()
+    assert (r["is_provisional"], r["frgn_net_amt_unconfirmed"], r["index_close"]) == (1, -2000, 2500.0)
+    assert db.get_status(con, "KIS", "market_investor_KOSPI", "20261119") == "provisional"
+    m.market_calls = 0
+    collect(install, m, now=datetime(2026, 11, 20, 20, 30, tzinfo=KST))
+    assert m.market_calls == 2 * 2  # 어제 잠정 + 오늘
+    assert db.get_status(con, "KIS", "market_investor_KOSPI", "20261119") == "success"
+
+
+def test_market_investor_multi_day_response(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.market_days = 30
+    collect(install, m)
+    assert m.market_calls == 2 * 2  # 30일치씩 오면 시장당 2회로 40일 채움
+
+
+def test_db_upgrade_from_v1(tmp_path):
+    con = db.connect(tmp_path / "m.sqlite")
+    con.executescript(db.SCHEMA_V1)
+    con.execute("INSERT INTO meta VALUES('schema_version','1')")
+    assert db.init_db(con) == db.SCHEMA_VERSION
+    con.execute("SELECT * FROM market_investor_daily")
