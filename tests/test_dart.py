@@ -93,3 +93,42 @@ def test_export_csv_with_ttm(con, tmp_path):
     assert eco[0]["fs_div"] == "OFS"
     frows = list(csv.DictReader(fil.open(encoding="utf-8-sig")))
     assert {"code", "name", "rcept_dt", "report_nm", "rcept_no"} == set(frows[0])
+
+
+def test_budget_stop_still_computes_quarters(con, tmp_path):
+    f = FakeDart()
+    # corpCode 1 + list 호출들 + 재무 몇 건 뒤 한도
+    st = run(con, f.client(), tmp_path, lambda: NOW, 20, TARGETS)
+    assert st.stopped and st.fs_ok >= 1
+    n_q = con.execute("SELECT COUNT(*) FROM dart_fs_quarter").fetchone()[0]
+    assert n_q >= 1 and st.quarters == n_q
+
+
+def test_previously_fetched_but_uncomputed_are_computed(con, tmp_path):
+    run(con, FakeDart().client(), tmp_path, lambda: NOW, 18000, TARGETS)
+    con.execute("DELETE FROM dart_fs_quarter")  # 0.7.0 이전처럼 계산이 빠진 상태
+    f = FakeDart()
+    st = run(con, f.client(), tmp_path, lambda: NOW.replace(day=23), 0, TARGETS)  # 한도 0: 호출 없이 바로 멈춤
+    assert f.calls == 0 and st.stopped
+    assert con.execute("SELECT COUNT(*) FROM dart_fs_quarter").fetchone()[0] == st.quarters > 0
+
+
+def test_corrections_fetched_once_per_period(con, tmp_path, monkeypatch):
+    from . import fake_dart
+    extra = [("00126380", "005930", "[기재정정]분기보고서 (2025.09)", "20251201000001", "20251201"),
+             ("00126380", "005930", "[기재정정]분기보고서 (2025.09)", "20251215000001", "20251215")]
+    monkeypatch.setattr(fake_dart, "FILINGS", fake_dart.FILINGS + extra)
+    f = FakeDart()
+    st = run(con, f.client(), tmp_path, lambda: NOW, 18000, TARGETS)
+    assert f.fs_calls == 6  # 삼성 4기간 + 에코프로 2(CFS 013 -> OFS). 3분기 3건은 한 번만
+    assert st.fs_dedup == 2
+    for no in ("20251114000001", "20251201000001", "20251215000001"):
+        assert db.get_status(con, "DART", "fs", no) == "success"
+    # 새 정정 공시가 생기면 그 기간만 다시 받는다
+    monkeypatch.setattr(fake_dart, "FILINGS", fake_dart.FILINGS +
+                        [("00126380", "005930", "[기재정정]분기보고서 (2025.09)", "20251220000001", "20251220")])
+    con.execute("DELETE FROM meta WHERE key='dart_list_until'")  # 목록을 다시 받게
+    f2 = FakeDart()
+    run(con, f2.client(), tmp_path, lambda: NOW.replace(day=29), 18000, TARGETS)
+    assert f2.fs_calls == 1
+    assert db.get_status(con, "DART", "fs", "20251220000001") == "success"

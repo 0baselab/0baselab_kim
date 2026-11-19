@@ -145,7 +145,7 @@ def cmd_dart(args) -> int:
         limit = int(app.settings.get("DART_DAILY_LIMIT") or 18000)
         st = run(app.con, dart, app.root, app.now, limit, targets, progress=print)
         lines = [f"DART: 호출 {st.calls}회, 새 공시 {st.filings}건(정기보고서 {st.periodic_new}),",
-                 f"  재무 받음 {st.fs_ok}, 자료 없음 {st.fs_nodata}, 실패 {st.fs_failed}, 분기 계산 {st.quarters}행,",
+                 f"  재무 받음 {st.fs_ok}(정정본 중복 생략 {st.fs_dedup}), 자료 없음 {st.fs_nodata}, 실패 {st.fs_failed}, 분기 계산 {st.quarters}행,",
                  f"  12월 결산이 아니어서 건너뜀 {st.skipped_fy}건, 남은 정기보고서 {st.remaining}건"]
         if st.stopped:
             lines.append("  " + st.stopped)
