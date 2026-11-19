@@ -43,6 +43,7 @@ class DartStats:
     fs_ok: int = 0
     fs_nodata: int = 0
     fs_failed: int = 0
+    fs_dedup: int = 0  # 같은 기간 정정본이라 따로 부르지 않은 접수번호 수
     skipped_fy: int = 0
     quarters: int = 0
     remaining: int = 0
@@ -89,12 +90,16 @@ def run(con, dart: DartClient, root, now_fn: Callable[[], datetime], limit: int,
     now = now_fn()
     today = now.strftime("%Y%m%d")
     budget = Budget(con, today, limit)
+    touched: set[tuple[str, str]] = set()
     try:
         _update_corps(con, dart, root, now, budget, st)
         _update_filings(con, dart, root, now_fn, budget, st, target_codes, progress)
-        _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress)
+        _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched)
     except (DartBudgetExhausted, DartLimitError) as exc:
         st.stopped = str(exc)
+    finally:
+        # 한도로 멈춰도 그날 받은 것과, 예전에 받아 두고 계산되지 않은 것을 모두 분기 계산한다
+        st.quarters += recompute_pending(con, touched, now_fn().isoformat(timespec="seconds"))
     st.remaining = con.execute(
         "SELECT COUNT(*) FROM dart_filings f WHERE is_periodic=1 AND reprt_code IS NOT NULL AND stock_code IN "
         f"({','.join('?' * len(target_codes)) or 'NULL'}) AND NOT EXISTS (SELECT 1 FROM collect_log c WHERE c.source='DART'"
@@ -177,9 +182,12 @@ def _save_filing(con, r, ty, ts, raw, st) -> None:
             st.periodic_new += 1
 
 
-def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress) -> None:
+def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched: set) -> None:
     rows = con.execute("SELECT * FROM dart_filings WHERE is_periodic=1 ORDER BY rcept_dt DESC, rcept_no DESC").fetchall()
-    todo = []
+    # fnlttSinglAcntAll은 (회사, 연도, 보고서 코드)만 받으므로 같은 기간의 정정본은 응답이 같다.
+    # 아직 안 받은 접수번호가 있는 기간만 한 번 부르고, 그 기간의 미수집 접수번호를 모두 같은 결과로 기록한다.
+    # 마지막으로 받은 뒤 새 정정 공시가 생기면 그 접수번호가 미수집이므로 기간 전체를 다시 받는다.
+    groups: dict[tuple, list] = {}
     for f in rows:
         if f["stock_code"] not in target_codes:
             continue
@@ -188,9 +196,10 @@ def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progres
             continue
         if db.get_status(con, "DART", "fs", f["rcept_no"]) in ("success", "empty"):
             continue
-        todo.append(f)
-    touched = set()
-    for i, f in enumerate(todo, 1):
+        groups.setdefault((f["corp_code"], f["fiscal_year"], f["reprt_code"]), []).append(f)
+    todo = sorted(groups.values(), key=lambda g: (g[0]["rcept_dt"] or "", g[0]["rcept_no"]), reverse=True)
+    for i, group in enumerate(todo, 1):
+        f = group[0]  # 접수일이 가장 늦은 공시 (rows가 접수일 내림차순)
         if i % 100 == 0:
             progress(f"  DART 재무 {i}/{len(todo)}")
         got = None
@@ -209,7 +218,8 @@ def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progres
         ts = now.isoformat(timespec="seconds")
         if got is None:
             with db.Tx(con):
-                db.set_status(con, "DART", "fs", f["rcept_no"], "empty", ts, "CFS·OFS 모두 013")
+                for g in group:
+                    db.set_status(con, "DART", "fs", g["rcept_no"], "empty", ts, "CFS·OFS 모두 013")
             st.fs_nodata += 1
             continue
         fs_div, body = got
@@ -217,7 +227,9 @@ def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progres
                        body, now)
         if body.get("status") != STATUS_OK:
             with db.Tx(con):
-                db.set_status(con, "DART", "fs", f["rcept_no"], "failed", ts, f"{body.get('status')} {body.get('message')}", raw)
+                for g in group:
+                    db.set_status(con, "DART", "fs", g["rcept_no"], "failed", ts,
+                                  f"{body.get('status')} {body.get('message')}", raw)
             st.fs_failed += 1
             continue
         # 응답의 rcept_no가 목록과 다를 수 있다(같은 기간의 최신 정정본). 응답 기준으로 저장한다.
@@ -235,11 +247,28 @@ def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progres
             new_val = f"{f['rcept_dt'] or ''}|{rn}"
             if cur is None or new_val >= cur[0]:
                 con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (src_key, new_val))
-            db.set_status(con, "DART", "fs", f["rcept_no"], "success", ts, None, raw)
+            for g in group:
+                db.set_status(con, "DART", "fs", g["rcept_no"], "success", ts, None, raw)
         st.fs_ok += 1
+        st.fs_dedup += len(group) - 1
         touched.add((f["corp_code"], f["fiscal_year"]))
+
+
+def missing_quarter_pairs(con) -> set[tuple[str, str]]:
+    """재무 원문은 받아 두었는데(dart_fs_src) 분기 계산(dart_fs_quarter)이 없는 (회사, 연도)."""
+    have = {(r[0], r[1]) for r in con.execute("SELECT DISTINCT corp_code, fiscal_year FROM dart_fs_quarter")}
+    out = set()
+    for (key,) in con.execute("SELECT key FROM meta WHERE key LIKE 'dart_fs_src|%'"):
+        _, corp, year, *_ = key.split("|")
+        if (corp, year) not in have:
+            out.add((corp, year))
+    return out
+
+
+def recompute_pending(con, touched: set, ts: str) -> int:
     from .dart_quarter import recompute
-    ts = now_fn().isoformat(timespec="seconds")
-    for corp, year in sorted(touched):
+    n = 0
+    for corp, year in sorted(touched | missing_quarter_pairs(con)):
         with db.Tx(con):
-            st.quarters += recompute(con, corp, year, ts)
+            n += recompute(con, corp, year, ts)
+    return n
