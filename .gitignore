@@ -28,3 +28,5 @@ config/settings.env
 build/
 dist/
 *.spec
+
+!packaging/*.spec
