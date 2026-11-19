@@ -55,6 +55,9 @@ class FakeMarket:
         self.investor_calls = 0
         self.admin_codes = {"222220"}
         self.market_calls = 0
+        self.share_change: dict[str, str] = {}  # code -> 상장주식수가 2000으로 바뀌는 날
+        self.adj_fail = False
+        self.adj_calls = 0
         self.market_days = 1  # 1회 응답 일수 (실제 값은 첫 실행으로 확인)
 
     def handler(self, req: httpx.Request) -> httpx.Response:
@@ -96,6 +99,16 @@ class FakeMarket:
                 {"stck_bsop_date": s, "bstp_nmix_prpr": "2500", "frgn_ntby_qty": "-100", "orgn_ntby_qty": "50",
                  "prsn_ntby_qty": "50", "frgn_ntby_tr_pbmn": "-2000", "orgn_ntby_tr_pbmn": "1000",
                  "prsn_ntby_tr_pbmn": "1000"} for s in days]})
+        if p.endswith("inquire-daily-itemchartprice"):
+            self.adj_calls += 1
+            assert q["FID_ORG_ADJ_PRC"] == "0" and q["FID_COND_MRKT_DIV_CODE"] == "J"
+            if self.adj_fail:
+                return httpx.Response(200, json={"rt_cd": "1", "msg_cd": "ERR", "msg1": "fail"})
+            ch = self.share_change.get(q["FID_INPUT_ISCD"], "99999999")
+            days = [s for s in OPEN if q["FID_INPUT_DATE_1"] <= s <= q["FID_INPUT_DATE_2"]]
+            return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output1": {}, "output2": [
+                {"stck_bsop_date": s, "stck_clpr": "500" if s < ch else "1000", "stck_oprc": "1", "stck_hgpr": "1",
+                 "stck_lwpr": "1"} for s in reversed(days)][:100]})
         if p.endswith("search-stock-info"):
             code = q["PDNO"]
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output": {
@@ -121,7 +134,9 @@ class FakeMarket:
             else:
                 rows = [{"ISU_CD": c, "ISU_NM": n, "TDD_CLSPRC": "1,000", "FLUC_RT": "-", "TDD_OPNPRC": "990",
                          "TDD_HGPRC": "1,010", "TDD_LWPRC": "980", "ACC_TRDVOL": "500", "ACC_TRDVAL": "500000",
-                         "MKTCAP": "1000000", "LIST_SHRS": "1000"} for c, n, l, *_ in BASE[mk] if l <= d]
+                         "MKTCAP": "1000000",
+                         "LIST_SHRS": "2000" if d >= self.share_change.get(c, "99999999") else "1000"}
+                        for c, n, l, *_ in BASE[mk] if l <= d]
             return httpx.Response(200, json={"OutBlock_1": rows})
         return httpx.Response(404)
 

@@ -24,6 +24,12 @@ class ThemeLoad:
     members: dict[str, list[str]] = field(default_factory=dict)  # code -> [theme]
     themes: dict[str, list[str]] = field(default_factory=dict)  # theme -> [code]
     problems: list[tuple[int, str, str]] = field(default_factory=list)  # (줄 번호, 내용, 문제)
+    fixes: list[tuple[int, str, str]] = field(default_factory=list)  # (줄 번호, 원래 코드, 보정 코드)
+
+
+def fix_code(c: str) -> str:
+    """엑셀이 지운 앞자리 0 복원: 숫자만 있고 6자리보다 짧으면 0을 채운다."""
+    return c.zfill(6) if c.isdigit() and len(c) < 6 else c
 
 
 def _read_text(path: Path) -> str:
@@ -60,7 +66,7 @@ def load(con, themes_dir: Path, now: datetime, master_codes: set[str], universe_
                     (out.version, now.isoformat(timespec="seconds"), digest, len(rows), hist.name))
         seen_db = set()
         for r in rows:
-            t, c = (r.get("theme") or "").strip(), (r.get("code") or "").strip()
+            t, c = (r.get("theme") or "").strip(), fix_code((r.get("code") or "").strip())
             if t and CODE_RE.match(c) and (t, c) not in seen_db:
                 seen_db.add((t, c))
                 con.execute("INSERT INTO theme_membership VALUES(?,?,?,?,?,?)",
@@ -69,14 +75,17 @@ def load(con, themes_dir: Path, now: datetime, master_codes: set[str], universe_
         con.execute("COMMIT")
     seen = set()
     for i, r in enumerate(rows, start=2):  # 1줄은 머리글
-        t, c = (r.get("theme") or "").strip(), (r.get("code") or "").strip()
+        t, orig = (r.get("theme") or "").strip(), (r.get("code") or "").strip()
+        c = fix_code(orig)
+        if c != orig:
+            out.fixes.append((i, orig, c))
         desc = f"{t},{c}"
         blank = [k for k in REQUIRED if not (r.get(k) or "").strip()]
         if blank:
             out.problems.append((i, desc, "빈 필수 칸: " + ", ".join(blank)))
             continue
         if not CODE_RE.match(c):
-            out.problems.append((i, desc, "종목코드 형식 오류 (영문 대문자·숫자 6자리. 엑셀이 앞의 0을 지웠는지 확인)"))
+            out.problems.append((i, desc, "종목코드 형식 오류 (영문 대문자·숫자 6자리)"))
             continue
         if (t, c) in seen:
             out.problems.append((i, desc, "같은 (theme, code) 중복"))

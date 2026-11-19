@@ -214,6 +214,9 @@ def _run_kis(app, res, confirm, out) -> None:
         return
     for line in kis_collect.collect_market_investor(app.con, kis, app.root, targets, app.now):
         res.add(line)
+    a_ok, a_fail, a_skip = kis_collect.collect_adjusted(app.con, kis, app.root, codes, app.now)
+    if a_ok or a_fail or a_skip:
+        res.add(f"KIS 수정주가(상장주식수 변경 종목): {a_ok}개 받음, 실패 {a_fail}, 이미 받음 {a_skip}")
     info = kis_collect.stockinfo_targets(app.con, codes, app.now(), _int(app.settings, "KIS_STOCKINFO_REFRESH_DAYS", 7))
     if info:
         ok, fail = kis_collect.collect_stockinfo(app.con, kis, app.root, info, app.now)

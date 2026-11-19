@@ -21,10 +21,11 @@ INVESTOR_BY_STOCK = ("FHPTJ04160001", "/uapi/domestic-stock/v1/quotations/invest
 HOLIDAY = ("CTCA0903R", "/uapi/domestic-stock/v1/quotations/chk-holiday")
 STOCK_INFO = ("CTPF1002R", "/uapi/domestic-stock/v1/quotations/search-stock-info")
 MARKET_INVESTOR = ("FHPTJ04040000", "/uapi/domestic-stock/v1/quotations/inquire-investor-daily-by-market")
+ADJ_PRICE = ("FHKST03010100", "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice")  # 국내주식기간별시세
 INDEX_DAILY = ("FHPUP02120000", "/uapi/domestic-stock/v1/quotations/inquire-index-daily-price")  # 국내업종 일자별지수
 
 # 시세·조회 API만 허용 (CLAUDE.md 절대 규칙)
-ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0], INDEX_DAILY[0], MARKET_INVESTOR[0]}
+ALLOWED_TR_IDS = {INVESTOR_BY_STOCK[0], HOLIDAY[0], STOCK_INFO[0], INDEX_DAILY[0], MARKET_INVESTOR[0], ADJ_PRICE[0]}
 
 RATE_LIMIT_CODE = "EGW00201"
 RATE_LIMIT_RETRIES = 3
@@ -175,6 +176,18 @@ def market_investor_params(index_code: str, market_code: str, date: str) -> dict
         "FID_INPUT_ISCD_1": market_code,
         "FID_INPUT_DATE_2": date,
         "FID_INPUT_ISCD_2": index_code,
+    }
+
+
+def adj_price_params(code: str, start: str, end: str) -> dict:
+    """국내주식기간별시세 (kis_api_reference.xlsx). 이 API는 FID_ORG_ADJ_PRC 0 = 수정주가 (수급 API와 반대). 최대 100건."""
+    return {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": code,
+        "FID_INPUT_DATE_1": start,
+        "FID_INPUT_DATE_2": end,
+        "FID_PERIOD_DIV_CODE": "D",
+        "FID_ORG_ADJ_PRC": "0",
     }
 
 
