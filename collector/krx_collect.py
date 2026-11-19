@@ -245,13 +245,17 @@ def backfill_cmpprevdd(con, root) -> int:
         except (OSError, ValueError):
             continue
         day = str((body.get(ROWS_KEY) or [{}])[0].get("BAS_DD") or "")
+        if not day:  # 원본에 BAS_DD가 없으면 이 원본으로 저장한 행의 날짜를 쓴다 (파일당 1회 조회)
+            row = con.execute("SELECT date FROM price_daily WHERE raw_file=? LIMIT 1", (rel,)).fetchone()
+            day = row[0] if row else ""
         with db.Tx(con):
             for r in body.get(ROWS_KEY) or []:
                 v = to_float(r.get("CMPPREVDD_PRC"))
                 if v is None:
                     continue
-                cur = con.execute("UPDATE price_daily SET cmpprevdd_prc=? WHERE raw_file=? AND code=?",
-                                  (v, rel, str(r.get("ISU_CD") or "").strip()))
+                # 기본키(date, code)로 찾는다. raw_file로 찾으면 색인이 없어 행마다 표 전체를 훑어 매우 느리다.
+                cur = con.execute("UPDATE price_daily SET cmpprevdd_prc=? WHERE date=? AND code=? AND raw_file=?",
+                                  (v, day, str(r.get("ISU_CD") or "").strip(), rel))
                 n += cur.rowcount
     con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('backfill_cmpprevdd', ?)", (str(n),))
     return n
