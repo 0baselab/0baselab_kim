@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -80,6 +80,19 @@ CREATE TABLE IF NOT EXISTS run_log (
     calls INTEGER, errors INTEGER, summary TEXT);
 """
 
+# 버전별 업그레이드 (이전 버전 DB에 순서대로 적용)
+UPGRADES = {
+    2: """
+CREATE TABLE IF NOT EXISTS market_investor_daily (
+    date TEXT NOT NULL, market TEXT NOT NULL,
+    frgn_net_qty_unconfirmed INTEGER, orgn_net_qty_unconfirmed INTEGER, prsn_net_qty_unconfirmed INTEGER,
+    frgn_net_amt_unconfirmed INTEGER, orgn_net_amt_unconfirmed INTEGER, prsn_net_amt_unconfirmed INTEGER,
+    index_close REAL, detail_json TEXT, is_provisional INTEGER NOT NULL DEFAULT 0,
+    source TEXT, fetched_at TEXT, raw_file TEXT,
+    PRIMARY KEY (date, market));
+""",
+}
+
 STATUSES = ("success", "provisional", "empty", "failed", "holiday", "not_listed")
 
 
@@ -102,7 +115,9 @@ def init_db(con: sqlite3.Connection) -> int:
     current = int(row["value"]) if row else 0
     if current > SCHEMA_VERSION:
         raise DbError(f"DB 스키마 버전({current})이 프로그램({SCHEMA_VERSION})보다 높습니다. 새 버전 프로그램을 설치하세요.")
-    # 이후 버전 업그레이드는 여기에 단계별로 추가한다.
+    for v in sorted(UPGRADES):
+        if v > current:
+            con.executescript(UPGRADES[v])
     con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
     ok = con.execute("PRAGMA integrity_check").fetchone()[0]
     if ok != "ok":

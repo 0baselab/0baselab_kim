@@ -33,6 +33,9 @@ def report(app: App) -> list[str]:
                            " AND status='provisional'").fetchone()[0]
     kis_codes = con.execute("SELECT COUNT(DISTINCT code) FROM investor_daily").fetchone()[0]
     L.append(f"KIS 수급: 종목 {kis_codes}개, 마지막 확정일 {kis_last or '-'}, 잠정(당일) {kis_prov}건")
+    for mk in ("KOSPI", "KOSDAQ"):
+        last = con.execute("SELECT MAX(date) FROM market_investor_daily WHERE market=?", (mk,)).fetchone()[0]
+        L.append(f"KIS 시장별 수급 {mk}: 마지막 {last or '-'}")
     admin = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_admin=1").fetchone()[0]
     halted = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_halted=1").fetchone()[0]
     L.append(f"KIS 주식기본조회: 관리종목 {admin}개, 거래정지 {halted}개")
