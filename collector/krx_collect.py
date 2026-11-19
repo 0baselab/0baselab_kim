@@ -258,15 +258,18 @@ def backfill_cmpprevdd(con, root) -> int:
 
 
 def base_price_adjust_days(con, start: str, end: str, codes=None) -> dict[str, list[str]]:
-    """기준가가 조정된 날: KRX 종가 − CMPPREVDD_PRC ≠ 직전 거래일 KRX 종가 (액면분할·병합·무상증자 등).
-    상장주식수 변화(CB 전환·자사주 소각·스톡옵션)는 쓰지 않는다. 판단할 값이 없으면 판정하지 않는다."""
+    """기준가가 조정된 날 (액면분할·병합·무상증자 등). 상장주식수 변화는 쓰지 않는다.
+    - KRX 확정 행: TDD_CLSPRC − CMPPREVDD_PRC ≠ 직전 거래일 종가
+    - KIS 잠정 행(당일): stck_clpr − prdy_vrss ≠ 직전 거래일 종가. prdy_vrss의 부호 표기가 확인되지 않아
+      종가 ± |prdy_vrss| 둘 다 직전 종가와 다를 때만 조정으로 본다.
+    판단할 값이 없으면 판정하지 않는다."""
     days = [r[0] for r in con.execute(
         "SELECT date FROM trading_calendar WHERE is_open=1 AND date BETWEEN ? AND ? ORDER BY date", (start, end))]
     prev_of = {days[i]: days[i - 1] for i in range(1, len(days))}
     out: dict[str, list[str]] = {}
     closes: dict[tuple[str, str], float] = {}
-    rows = con.execute("SELECT code, date, close, cmpprevdd_prc FROM price_daily WHERE source='KRX' AND is_provisional=0"
-                       " AND date BETWEEN ? AND ? ORDER BY code, date", (start, end)).fetchall()
+    rows = con.execute("SELECT code, date, close, cmpprevdd_prc, source, is_provisional FROM price_daily"
+                       " WHERE date BETWEEN ? AND ? ORDER BY code, date", (start, end)).fetchall()
     for r in rows:
         if r["close"] is not None:
             closes[(r["code"], r["date"])] = r["close"]
@@ -278,6 +281,11 @@ def base_price_adjust_days(con, start: str, end: str, codes=None) -> dict[str, l
         prev_close = closes.get((r["code"], pd)) if pd else None
         if r["close"] is None or r["cmpprevdd_prc"] is None or prev_close is None:
             continue
-        if abs((r["close"] - r["cmpprevdd_prc"]) - prev_close) > 0.5:
+        if r["source"] == "KRX" and not r["is_provisional"]:
+            adjusted = abs((r["close"] - r["cmpprevdd_prc"]) - prev_close) > 0.5
+        else:
+            v = abs(r["cmpprevdd_prc"])
+            adjusted = abs(r["close"] - v - prev_close) > 0.5 and abs(r["close"] + v - prev_close) > 0.5
+        if adjusted:
             out.setdefault(r["code"], []).append(r["date"])
     return out
