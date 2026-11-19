@@ -79,8 +79,9 @@ def test_settings_migrates_old_default_only(tmp_path):
     p.parent.mkdir(parents=True)
     p.write_text("KIS_CALLS_PER_SEC=15\n", encoding="utf-8")
     assert load_settings(tmp_path)["KIS_CALLS_PER_SEC"] == "10"
-    p.write_text("KIS_CALLS_PER_SEC=7\n", encoding="utf-8")
-    assert load_settings(tmp_path)["KIS_CALLS_PER_SEC"] == "7"
+    p.write_text("KIS_CALLS_PER_SEC=7\nKRX_RETENTION_DAYS=250\n", encoding="utf-8")
+    s = load_settings(tmp_path)
+    assert s["KIS_CALLS_PER_SEC"] == "7" and s["KRX_RETENTION_DAYS"] == "260"
 
 
 def test_investor_window():

@@ -14,7 +14,7 @@ def report(app: App) -> list[str]:
          "키: " + ", ".join(f"{k}={mask(app.keys.get(k))}" for k in KEY_NAMES)]
     lo, hi, n = cal.coverage(con)
     L.append(f"거래일 달력: {lo or '-'} ~ {hi or '-'} (거래일 {n}일)")
-    retention = int(app.settings.get("KRX_RETENTION_DAYS") or 250)
+    retention = int(app.settings.get("KRX_RETENTION_DAYS") or 260)
     targets = cal.last_open_days(con, today, retention)
     L.append(f"KRX 보관 대상 거래일: {len(targets)}일 ({targets[0] if targets else '-'} ~ {targets[-1] if targets else '-'})")
     L.append("")

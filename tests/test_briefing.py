@@ -112,11 +112,11 @@ def test_themes_versions_and_problems(filled):
 
 def test_corp_action_blanks_returns(filled):
     con = reopen(filled)
-    con.execute("UPDATE price_daily SET listed_shares=2000 WHERE code='005930' AND date='20261118'")
+    con.execute("UPDATE price_daily SET cmpprevdd_prc=500 WHERE code='005930' AND date='20261118'")
     pkg = build(con, "20261118", themes_dir(filled), NOW)
     s = stock(pkg, "005930")
     assert s["corp_action_suspect"] == 1 and s["ret_5d_pct"] is None
-    assert "상장주식수 변경 20261118" in s["missing_note"]
+    assert "기준가 조정 20261118" in s["missing_note"]
     assert any(r["kind"] == "기업행동 의심" for r in pkg.status)
 
 
@@ -137,7 +137,7 @@ def test_write_xlsx_json_and_unclassified(filled):
 def test_adjusted_price_used_for_corp_action(install):
     kis_settings(install)
     m = FakeMarket()
-    m.share_change = {"005930": "20261113"}
+    m.split_day = {"005930": "20261113"}
     collect(install, m)
     con = reopen(install)
     assert m.adj_calls >= 1
@@ -159,11 +159,37 @@ def test_adjusted_price_used_for_corp_action(install):
 def test_adjusted_price_failure_blanks(install):
     kis_settings(install)
     m = FakeMarket()
-    m.share_change = {"005930": "20261113"}
+    m.split_day = {"005930": "20261113"}
     m.adj_fail = True
     collect(install, m)
     con = reopen(install)
     pkg = build(con, "20261118", themes_dir(install), NOW)
     s = stock(pkg, "005930")
     assert s["ret_5d_pct"] is None
-    assert "수정주가 없음" in s["missing_note"] and "상장주식수 변경 20261113" in s["missing_note"]
+    assert "수정주가 없음" in s["missing_note"] and "기준가 조정 20261113" in s["missing_note"]
+
+
+def test_listed_shares_change_alone_is_not_corp_action(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.share_change = {"005930": "20261113"}  # CB 전환·자사주 소각 등
+    collect(install, m)
+    assert m.adj_calls == 0
+    con = reopen(install)
+    s = stock(build(con, "20261118", themes_dir(install), NOW), "005930")
+    assert s["corp_action_suspect"] == 0 and s["ret_5d_pct"] == 0.0
+
+
+def test_backfill_cmpprevdd_from_raw(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.split_day = {"005930": "20261113"}
+    collect(install, m)
+    con = reopen(install)
+    con.execute("UPDATE price_daily SET cmpprevdd_prc=NULL")
+    con.execute("DELETE FROM meta WHERE key='backfill_cmpprevdd'")
+    con.close()
+    a, res = collect(install, m, now=NOW.replace(minute=55))
+    assert any("원본에서 채웠습니다" in l for l in res.lines)
+    con = reopen(install)
+    assert con.execute("SELECT cmpprevdd_prc FROM price_daily WHERE code='005930' AND date='20261113'").fetchone()[0] == 500
