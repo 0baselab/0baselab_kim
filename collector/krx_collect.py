@@ -210,6 +210,12 @@ def _save_index(con, day, market, rows, ts, raw) -> None:
         name = str(r.get("IDX_NM") or "").strip()
         if not name:
             continue
+        old = con.execute("SELECT close, is_provisional, source FROM index_daily WHERE date=? AND series=? AND index_name=?",
+                          (day, market, name)).fetchone()
+        new_close = to_float(r.get("CLSPRC_IDX"))
+        if old is not None and old["is_provisional"] and old["close"] != new_close:
+            db.record_change(con, "index_daily", f"{day}|{market}|{name}", "close", old["close"], new_close, ts,
+                             f"{old['source']} 잠정 -> KRX 확정")
         con.execute(
             "INSERT OR REPLACE INTO index_daily(date, series, index_name, index_class, open, high, low, close,"
             " change_rate_pct, volume_unconfirmed, value_unconfirmed, mktcap_unconfirmed, is_provisional,"

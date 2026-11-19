@@ -27,6 +27,15 @@ def report(app: App) -> list[str]:
         missing = [d for d in targets if d not in ok]
         L.append(f"  {ds:14s} 마지막 {last or '-'}  빠짐 {len(missing)}일" +
                  (f" (최근: {', '.join(sorted(missing, reverse=True)[:5])})" if missing else ""))
+    kis_last = con.execute("SELECT MAX(substr(unit_key, 8)) FROM collect_log WHERE source='KIS' AND dataset='investor'"
+                           " AND status='success'").fetchone()[0]
+    kis_prov = con.execute("SELECT COUNT(*) FROM collect_log WHERE source='KIS' AND dataset='investor'"
+                           " AND status='provisional'").fetchone()[0]
+    kis_codes = con.execute("SELECT COUNT(DISTINCT code) FROM investor_daily").fetchone()[0]
+    L.append(f"KIS 수급: 종목 {kis_codes}개, 마지막 확정일 {kis_last or '-'}, 잠정(당일) {kis_prov}건")
+    admin = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_admin=1").fetchone()[0]
+    halted = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_halted=1").fetchone()[0]
+    L.append(f"KIS 주식기본조회: 관리종목 {admin}개, 거래정지 {halted}개")
     L.append("")
     recheck = con.execute("SELECT source, dataset, unit_key, empty_streak FROM collect_log WHERE status='empty'"
                           " AND empty_streak >= 3 ORDER BY unit_key DESC LIMIT 20").fetchall()

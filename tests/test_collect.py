@@ -62,7 +62,7 @@ def test_initial_daily_load(install):
     n_ok = con.execute("SELECT COUNT(*) FROM collect_log WHERE source='KRX' AND status='success'").fetchone()[0]
     assert n_ok == 30 * 6
     assert con.execute("SELECT COUNT(*) FROM collect_log WHERE source='KRX' AND unit_key='20261119'").fetchone()[0] == 0
-    assert con.execute("SELECT MIN(date) FROM price_daily").fetchone()[0] == targets[0]
+    assert con.execute("SELECT MIN(date) FROM price_daily WHERE source='KRX'").fetchone()[0] == targets[0]
     # 영문 섞인 종목코드는 저장, 형식 오류는 건너뜀
     assert con.execute("SELECT COUNT(*) FROM price_daily WHERE code='0041B0'").fetchone()[0] > 0
     assert con.execute("SELECT COUNT(*) FROM price_daily WHERE code='BAD'").fetchone()[0] == 0
@@ -98,7 +98,7 @@ def test_rerun_skips_success_and_daily_calls(install):
     collect(install, m2, now=NOW.replace(minute=45))
     assert not any("/sto/" in c or "/idx/" in c for c in m2.calls)
     assert not any("chk-holiday" in c for c in m2.calls)
-    assert not any("index-daily" in c for c in m2.calls)
+    assert sum("index-daily" in c for c in m2.calls) == 2  # 당일 지수만 (달력은 하루 1회라 재호출 없음)
 
 
 def test_empty_is_not_success_and_retried(install):
@@ -214,3 +214,127 @@ def test_backup_and_log_cleanup(tmp_path):
     (logs / "run_20261118-100000.log").write_text("x")
     assert maintenance.cleanup_logs(logs, NOW, 90) == 1
     assert [p.name for p in logs.iterdir()] == ["run_20261118-100000.log"]
+
+
+# ----------------------------- KIS (0.3.0) -----------------------------
+
+def kis_settings(install, extra=""):
+    p = install / "config" / "settings.env"
+    p.write_text(p.read_text(encoding="utf-8") + "KIS_RETENTION_DAYS=40\n" + extra, encoding="utf-8")
+
+
+def test_kis_initial_and_today_provisional(install):
+    kis_settings(install)
+    m = FakeMarket()
+    a, res = collect(install, m)
+    con = reopen(install)
+    # 대상 종목 4개 (005930, 0041B0, 247540, 222220)
+    codes = {r[0] for r in con.execute("SELECT DISTINCT code FROM investor_daily")}
+    assert codes == {"005930", "0041B0", "247540", "222220"}
+    # 40거래일 = 오늘 + 이전 39일 -> 종목당 2회(30+30)
+    assert m.investor_calls == 3 * 2 + 1  # 0041B0은 상장 후 날짜만 와서 1회
+    t = con.execute("SELECT * FROM investor_daily WHERE code='005930' AND date='20261119'").fetchone()
+    assert (t["is_provisional"], t["frgn_net_amt_mil"], t["frgn_net_qty"]) == (1, 12, 10)
+    st = {r[0]: r[1] for r in con.execute(
+        "SELECT unit_key, status FROM collect_log WHERE source='KIS' AND dataset='investor' AND unit_key LIKE '005930|%'")}
+    assert st["005930|20261119"] == "provisional" and st["005930|20261118"] == "success"
+    assert len(st) == 40
+    nl = con.execute("SELECT COUNT(*) FROM collect_log WHERE status='not_listed' AND unit_key LIKE '0041B0|%'").fetchone()[0]
+    assert nl == 40 - 8  # 11/10~11/19 = 8거래일만 상장
+    # 당일 시세: KIS 잠정, 시가총액 = 직전 거래일 상장주식수(1000) x 종가(1050)
+    p = con.execute("SELECT * FROM price_daily WHERE code='005930' AND date='20261119'").fetchone()
+    assert (p["source"], p["is_provisional"], p["value_krw"], p["mktcap_krw"]) == ("KIS", 1, 735000, 1050000)
+    # 과거 KRX 값은 덮어쓰지 않음
+    assert con.execute("SELECT source FROM price_daily WHERE code='005930' AND date='20261118'").fetchone()[0] == "KRX"
+    # 당일 지수 잠정
+    ix = con.execute("SELECT close, is_provisional, source FROM index_daily WHERE date='20261119' AND index_name='코스닥'").fetchone()
+    assert tuple(ix) == (800.0, 1, "KIS")
+    # 관리종목 표시 (필터에는 영향 없음)
+    u = con.execute("SELECT in_universe, is_admin FROM universe_daily WHERE date='20261118' AND code='222220'").fetchone()
+    assert tuple(u) == (1, 1)
+
+
+def test_kis_next_day_confirms_and_records_changes(install):
+    kis_settings(install)
+    m = FakeMarket()
+    collect(install, m)
+    m.krx_until = "20261120"  # 다음 날엔 KRX가 11/19 확정값을 줌
+    m.inv_bump = {"20261119": 3}
+    nxt = datetime(2026, 11, 20, 20, 30, tzinfo=KST)
+    m.investor_calls = 0
+    collect(install, m, now=nxt)
+    con = reopen(install)
+    assert m.investor_calls == 4  # 매일 수집은 종목당 1회
+    assert db.get_status(con, "KIS", "investor", "005930|20261119") == "success"
+    r = con.execute("SELECT is_provisional, frgn_net_qty FROM investor_daily WHERE code='005930' AND date='20261119'").fetchone()
+    assert tuple(r) == (0, 13)
+    ch = con.execute("SELECT * FROM value_changes WHERE tbl='investor_daily' AND key='20261119|005930'").fetchall()
+    assert [(c["col"], c["old"], c["new"]) for c in ch] == [("frgn_net_qty", "10", "13")]
+    # KIS 잠정 시세 -> KRX 확정 교체, 차이 기록
+    p = con.execute("SELECT source, is_provisional, close FROM price_daily WHERE code='005930' AND date='20261119'").fetchone()
+    assert tuple(p) == ("KRX", 0, 1000.0)
+    assert con.execute("SELECT COUNT(*) FROM value_changes WHERE tbl='price_daily' AND key='20261119|005930' AND col='close'").fetchone()[0] == 1
+    # 지수 잠정 -> KRX 확정
+    assert con.execute("SELECT source FROM index_daily WHERE date='20261119' AND index_name='코스피'").fetchone()[0] == "KRX"
+
+
+def test_kis_skipped_outside_window(install):
+    kis_settings(install)
+    m = FakeMarket()
+    a, res = collect(install, m, now=NOW.replace(hour=15, minute=30))
+    assert m.investor_calls == 0
+    assert any("15:40~23:59" in l for l in res.lines)
+    assert m.krx_calls > 0  # KRX는 시간과 관계없이 진행
+
+
+def test_kis_after_market_asks(install):
+    kis_settings(install)
+    m = FakeMarket()
+    asked = []
+
+    def confirm(q):
+        asked.append(q)
+        return "애프터마켓" not in q
+
+    collect(install, m, now=NOW.replace(hour=19), confirm=confirm)
+    assert any("애프터마켓" in q for q in asked)
+    assert m.investor_calls == 0
+
+
+def test_kis_stops_at_midnight_and_resumes(install):
+    kis_settings(install)
+    m = FakeMarket()
+    late, after = NOW.replace(hour=23, minute=59), datetime(2026, 11, 20, 0, 1, tzinfo=KST)
+    clock = lambda: late if m.investor_calls < 2 else after
+    a = app_mod.start(install=install, now=clock, http_factory=m.factory(), out=lambda *_: None)
+    try:
+        res = run_collect(a, out=lambda *_: None)
+    finally:
+        a.close()
+    assert any("벗어나 멈춤" in l for l in res.lines)
+    assert m.investor_calls == 3  # 0041B0(1회) + 005930(2회) 뒤 종목 경계에서 멈춤
+    con = reopen(install)
+    done = con.execute("SELECT COUNT(DISTINCT code) FROM investor_daily").fetchone()[0]
+    assert done == 2
+
+
+def test_kis_time_limit_response_stops(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.kis_time_limit = True
+    a, res = collect(install, m)
+    assert m.investor_calls == 1
+    assert any("OPSQ2001" in l for l in res.lines)
+
+
+def test_stockinfo_refresh_every_7_days(install):
+    kis_settings(install)
+    m = FakeMarket()
+    collect(install, m)
+    n = lambda: sum("search-stock-info" in c for c in m.calls)
+    first = n()
+    assert first == 4
+    collect(install, m, now=datetime(2026, 11, 20, 20, 30, tzinfo=KST))
+    assert n() == first  # 7일 안에는 재조회 안 함
+    collect(install, m, now=datetime(2026, 11, 27, 20, 30, tzinfo=KST))
+    assert n() == first + 4

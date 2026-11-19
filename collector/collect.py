@@ -1,4 +1,4 @@
-"""수집 실행 (명세서 6장, 14장). 0.2.0: 거래일 달력 + KRX. KIS 수급은 0.3.0에서 추가."""
+"""수집 실행 (명세서 6장, 14장): 거래일 달력 -> KRX(시간 무관) -> KIS(15:40~23:59)."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import db, maintenance
-from . import krx_collect
+from . import kis_collect, krx_collect
 from . import trading_calendar as cal
 from . import universe
 from .app import App
@@ -75,7 +75,7 @@ def run_collect(app: App, mode: str = "daily", start: str | None = None, end: st
     app.con.execute("INSERT OR REPLACE INTO run_log(run_id, mode, version, started_at) VALUES(?,?,?,?)",
                     (run_id, mode, __version__, t0.isoformat(timespec="seconds")))
     res.add(f"주식데이터수집기 {__version__} / {'당일' if mode == 'daily' else '기간'} 수집 ({t0.strftime('%Y-%m-%d %H:%M')})")
-    retention = _int(app.settings, "KRX_RETENTION_DAYS", 250)
+    retention = max(_int(app.settings, "KRX_RETENTION_DAYS", 250), _int(app.settings, "KIS_RETENTION_DAYS", 120))
     try:
         update_calendar(app, res, retention)
         days = krx_targets(app, mode, start, end)
@@ -83,11 +83,7 @@ def run_collect(app: App, mode: str = "daily", start: str | None = None, end: st
             res.add("수집할 거래일이 없습니다. 거래일 달력이 비어 있으면 15:40~23:59에 다시 실행해 보세요 "
                     "(KIS 지수 API의 조회 가능 시각은 아직 확인되지 않았습니다).")
         _run_krx(app, res, days, force, confirm, out)
-        if investor_window_ok(app.now()):
-            res.add("KIS 수급·당일 시세 수집은 0.3.0에서 추가됩니다.")
-        else:
-            res.add(f"KIS 수급 단계: 실행 시각 {app.now().strftime('%H:%M')}은 조회 가능 시각(15:40~23:59)이 아님 "
-                    "(0.3.0부터 적용).")
+        _run_kis(app, res, confirm, out)
     except (KisAuthError, krx_collect.KrxAuthError) as exc:
         res.stopped = str(exc)
         res.errors += 1
@@ -165,3 +161,62 @@ def _finish(app, res, run_id, t0) -> None:
     app.con.execute("UPDATE run_log SET ended_at=?, calls=?, errors=?, summary=? WHERE run_id=?",
                     (t1.isoformat(timespec="seconds"), calls, res.errors,
                      json.dumps(res.lines, ensure_ascii=False), run_id))
+
+
+AFTER_MARKET_END = 20 * 60
+
+
+def _run_kis(app, res, confirm, out) -> None:
+    now = app.now()
+    if not investor_window_ok(now):
+        res.add(f"KIS 단계 건너뜀: 실행 시각 {now.strftime('%H:%M')}은 KIS 수급 조회 가능 시각(15:40~23:59)이 아닙니다 "
+                "(00:00~15:40에는 OPSQ2001 TIME LIMIT).")
+        return
+    kis = app.kis()
+    if kis is None:
+        res.add("KIS: 키가 없어 건너뜀")
+        return
+    if now.hour * 60 + now.minute < AFTER_MARKET_END:
+        if not confirm("지금은 애프터마켓(16:00~20:00) 진행 중이라 당일 거래량·대금이 더 늘어날 수 있습니다. "
+                       "KIS 수집을 계속할까요?"):
+            res.add("KIS 단계: 사용자가 애프터마켓 시간이라 건너뜀")
+            return
+    today = now.strftime("%Y%m%d")
+    base_day = app.con.execute("SELECT MAX(date) FROM krx_base_daily WHERE date < ?", (today,)).fetchone()[0]
+    if not base_day:
+        res.add("KIS 단계 건너뜀: KRX 종목기본정보가 없어 대상 종목을 정할 수 없습니다.")
+        return
+    codes = universe.universe_codes(app.con, base_day)
+    targets = kis_collect.target_dates(app.con, today, _int(app.settings, "KIS_RETENTION_DAYS", 120))
+    first = app.con.execute("SELECT COUNT(*) FROM collect_log WHERE source='KIS' AND dataset='investor'"
+                            " AND status IN ('success','provisional')").fetchone()[0] == 0
+    est = kis_collect.estimate_calls(app.con, codes, targets)
+    rate = float(app.settings.get("KIS_CALLS_PER_SEC") or 10)
+    msg = (f"KIS 수급: 대상 종목 {len(codes)}개({base_day} 기준), {len(targets)}거래일, 약 {est}회 호출, "
+           f"예상 약 {max(1, round(est / rate / 60))}분.")
+    if first:
+        if not confirm("KIS 초기 적재입니다. " + msg + " 자정을 넘기면 멈추고 다음 실행 때 이어서 받습니다. 진행할까요?"):
+            res.add("사용자가 KIS 초기 적재를 취소했습니다.")
+            return
+    else:
+        out(msg)
+    if cal.is_open(app.con, today):
+        for line in kis_collect.collect_index_today(app.con, kis, app.root, now):
+            res.add(line)
+    st = kis_collect.collect_investor(app.con, kis, app.root, codes, targets, app.now, progress=out)
+    res.errors += st.stocks_failed
+    res.add(f"KIS 수급: 종목 {st.stocks_done}개 처리, 실패 {st.stocks_failed}, 호출 {st.calls}회, "
+            f"확정 {st.confirmed}, 잠정(당일) {st.provisional}, 값 바뀜 {st.changed}, 빈 결과 {st.empty}, 상장 전 {st.not_listed}")
+    for e in st.errors[:10]:
+        res.add(f"  - {e}")
+    if st.stopped:
+        res.add("KIS 수급 " + st.stopped)
+        return
+    info = kis_collect.stockinfo_targets(app.con, codes, app.now(), _int(app.settings, "KIS_STOCKINFO_REFRESH_DAYS", 7))
+    if info:
+        ok, fail = kis_collect.collect_stockinfo(app.con, kis, app.root, info, app.now)
+        res.add(f"KIS 주식기본조회(관리종목·거래정지): {ok}개 갱신, 실패 {fail}")
+    with db.Tx(app.con):
+        kis_collect.apply_flags(app.con, base_day)
+    if kis.rate_limit_events:
+        res.add(f"KIS 한도 초과(EGW00201) {len(kis.rate_limit_events)}회, 마지막 속도 초당 {kis.api.limiter.per_sec:.2f}건")
