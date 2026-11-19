@@ -49,6 +49,11 @@ class FakeMarket:
         self.krx_auth_fail = False
         self.interrupt_after: int | None = None  # KRX 호출 n회 뒤 KeyboardInterrupt
         self.krx_calls = 0
+        self.krx_until = "20261119"  # 이 날짜 이상은 KRX가 빈 결과 (당일 미제공)
+        self.inv_bump: dict[str, int] = {}  # 날짜별로 수급 값에 더할 값 (재조회 변경 시험)
+        self.kis_time_limit = False
+        self.investor_calls = 0
+        self.admin_codes = {"222220"}
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         p, q = req.url.path, dict(req.url.params)
@@ -62,8 +67,27 @@ class FakeMarket:
         if p.endswith("inquire-index-daily-price"):
             d = q["FID_INPUT_DATE_1"]
             days = [s for s in reversed(OPEN) if s <= d][:100]
+            base = "2500" if q["FID_INPUT_ISCD"] == "0001" else "800"
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output1": {},
-                                             "output2": [{"stck_bsop_date": s, "bstp_nmix_prpr": "2500"} for s in days]})
+                                             "output2": [{"stck_bsop_date": s, "bstp_nmix_prpr": base} for s in days]})
+        if p.endswith("investor-trade-by-stock-daily"):
+            self.investor_calls += 1
+            assert q["FID_COND_MRKT_DIV_CODE"] == "J"
+            if self.kis_time_limit:
+                return httpx.Response(200, json={"rt_cd": "1", "msg_cd": "OPSQ2001", "msg1": "TIME LIMIT 00:00 ~ 15:40"})
+            code, d = q["FID_INPUT_ISCD"], q["FID_INPUT_DATE_1"]
+            listed = next((l for rows in BASE.values() for c, n, l, *_ in rows if c == code), "19000101")
+            days = [s for s in reversed(OPEN) if s <= d and s >= listed][:30]
+            rows = [{"stck_bsop_date": s, "stck_oprc": "1000", "stck_hgpr": "1100", "stck_lwpr": "900",
+                     "stck_clpr": "1050", "prdy_ctrt": "1.5", "acml_vol": "700", "acml_tr_pbmn": "735000",
+                     "frgn_ntby_qty": str(10 + self.inv_bump.get(s, 0)), "orgn_ntby_qty": "-5", "prsn_ntby_qty": "-5",
+                     "frgn_ntby_tr_pbmn": "12", "orgn_ntby_tr_pbmn": "-3", "prsn_ntby_tr_pbmn": "-9"} for s in days]
+            return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok", "output1": {}, "output2": rows})
+        if p.endswith("search-stock-info"):
+            code = q["PDNO"]
+            return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "x", "msg1": "ok", "output": {
+                "scty_grp_id_cd": "ST", "stck_kind_cd": "101", "admn_item_yn": "Y" if code in self.admin_codes else "N",
+                "tr_stop_yn": "N"}})
         if "/sto/" in p or "/idx/" in p:
             self.krx_calls += 1
             if self.interrupt_after is not None and self.krx_calls > self.interrupt_after:
@@ -71,7 +95,7 @@ class FakeMarket:
             if self.krx_auth_fail:
                 return httpx.Response(401, json={})
             d = q["basDd"]
-            if d in self.krx_empty or d not in OPEN or d >= "20261119":
+            if d in self.krx_empty or d not in OPEN or d >= self.krx_until:
                 return httpx.Response(200, json={"OutBlock_1": []})
             mk = "KOSPI" if ("stk_" in p or "kospi" in p) else "KOSDAQ"
             if "base_info" in p:
