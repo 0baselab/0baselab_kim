@@ -12,17 +12,92 @@ from .timeutil import now_kst, stamp
 from .version import __version__
 
 MENU = [
-    ("1", "당일 수집", None),
-    ("2", "기간 수집", None),
+    ("1", "당일 수집", "daily"),
+    ("2", "기간 수집", "range"),
     ("3", "브리핑 패키지 생성", None),
     ("4", "DART 수집", None),
     ("5", "DART 구글 시트용 내보내기", None),
-    ("6", "상태 점검", None),
+    ("6", "상태 점검", "status"),
     ("7", "실측 검증", "verify"),
 ]
 
 
-def cmd_verify() -> int:
+def _yes(question: str) -> bool:
+    try:
+        return input(question + " (y/N): ").strip().lower() in ("y", "yes", "예")
+    except EOFError:
+        return False
+
+
+def _valid_date(s: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"\d{8}", s or ""))
+
+
+def cmd_collect(args) -> int:
+    from .app import start
+    from .collect import run_collect
+    from .lock import AlreadyRunning
+
+    mode = args.command
+    start_d, end_d = getattr(args, "date_from", None), getattr(args, "date_to", None)
+    if mode == "range":
+        if not start_d or not end_d:
+            try:
+                start_d = start_d or input("시작일 (YYYYMMDD): ").strip()
+                end_d = end_d or input("종료일 (YYYYMMDD): ").strip()
+            except EOFError:
+                return 1
+        if not (_valid_date(start_d) and _valid_date(end_d)) or start_d > end_d:
+            print("날짜는 YYYYMMDD 형식이고, 시작일이 종료일보다 늦으면 안 됩니다.")
+            return 1
+    try:
+        app = start()
+    except AlreadyRunning as exc:
+        print(exc)
+        return 1
+    try:
+        confirm = (lambda q: True) if args.yes else _yes
+        res = run_collect(app, mode, start_d, end_d, force=args.force, confirm=confirm)
+        print("\n".join(["", "=== 실행 요약 ==="] + res.lines + [f"로그: {app.log_path}"]))
+        return 0 if not res.stopped else 2
+    finally:
+        app.close()
+
+
+def cmd_status(args) -> int:
+    from .app import start
+    from .lock import AlreadyRunning
+    from .secrets import KEY_NAMES, register_sensitive, save_keys
+    from .status import report
+    import getpass
+
+    try:
+        app = start()
+    except AlreadyRunning as exc:
+        print(exc)
+        return 1
+    try:
+        print("\n".join(report(app)))
+        if not args.yes and _yes("\n키를 다시 입력할까요?"):
+            for i, k in enumerate(KEY_NAMES, 1):
+                print(f"  {i}. {k}")
+            try:
+                pick = input("번호: ").strip()
+            except EOFError:
+                return 0
+            if pick.isdigit() and 1 <= int(pick) <= len(KEY_NAMES):
+                name = KEY_NAMES[int(pick) - 1]
+                app.keys[name] = getpass.getpass(f"{name}: ").strip()
+                register_sensitive(app.keys[name])
+                save_keys(app.install, app.keys)
+                print(f"{name}을(를) 저장했습니다.")
+        return 0
+    finally:
+        app.close()
+
+
+def cmd_verify(args=None) -> int:
     from .verify.runner import run_verify
 
     install = paths.install_dir()
@@ -43,7 +118,7 @@ def cmd_verify() -> int:
     return 0
 
 
-COMMANDS = {"verify": cmd_verify}
+COMMANDS = {"daily": cmd_collect, "range": cmd_collect, "status": cmd_status, "verify": cmd_verify}
 
 
 def menu() -> int:
@@ -58,17 +133,22 @@ def menu() -> int:
     if not cmd:
         print("아직 준비되지 않았거나 없는 번호입니다.")
         return 1
-    return COMMANDS[cmd]()
+    return COMMANDS[cmd](argparse.Namespace(command=cmd, date_from=None, date_to=None, force=False, yes=False))
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(prog="주식데이터수집기")
-    parser.add_argument("command", nargs="?", choices=sorted(COMMANDS))
+    parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
+                        help="daily(당일 수집) / range(기간 수집) / status(상태 점검) / verify(실측 검증)")
+    parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
+    parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
+    parser.add_argument("--force", action="store_true", help="이미 성공한 단위도 다시 받기")
+    parser.add_argument("--yes", action="store_true", help="확인 질문을 모두 '예'로 처리")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
     try:
-        code = COMMANDS[args.command]() if args.command else menu()
+        code = COMMANDS[args.command](args) if args.command else menu()
     except KeyboardInterrupt:
         print("\n사용자가 중단했습니다.")
         code = 130

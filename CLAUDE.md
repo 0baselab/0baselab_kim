@@ -34,7 +34,7 @@ KIS API 필드·URL·TR ID는 `docs/kis_api_reference.xlsx`(KIS 공식 문서 �
 - 평일을 거래일로 간주하지 않는다. 거래일 달력 테이블만 사용.
 - main 브랜치에 직접 push하지 않는다. 강제 push(-f, --force, --force-with-lease)를 하지 않는다. 모든 변경은 작업 브랜치 → PR로만 올린다.
 - 태그와 Release는 Actions만 만든다. Claude Code는 git tag와 태그 push를 하지 않고, PR마다 version.py의 버전을 올린다.
-- 호출 한도: KIS 초당 15건, KIS 휴장일조회 하루 1회, DART 하루 18,000건(설정값).
+- 호출 한도: KIS 초당 10건(균등 간격, 한도 초과 시 절반으로 감속), KIS 휴장일조회 하루 1회, DART 하루 18,000건(설정값).
 
 ## 실제 API 호출
 - 개발 환경(클라우드)에는 API 키가 없다. 키를 요청하거나 저장소·GitHub Secrets에 넣으라고 하지 않는다.
