@@ -191,6 +191,7 @@ def _save_price(con, d, code, r, today, prev, ts, raw) -> None:
     new["change_rate_pct"] = to_float(r.get("prdy_ctrt"))
     new["volume_sh"] = to_int(r.get("acml_vol"))
     new["value_krw"] = to_int(r.get("acml_tr_pbmn"))  # 실측: 원 단위
+    new["cmpprevdd_prc"] = to_float(r.get("prdy_vrss"))  # 전일대비 (기준가 조정 판정용, 부호 미확인)
     # 시가총액(잠정) = 직전 거래일 KRX 상장주식수 × 종가
     base_day = cal.prev_open(con, d) if d == today else d
     # KRX 일별매매정보의 LIST_SHRS를 먼저 쓰고(기업행동 판단과 같은 출처), 없으면 종목기본정보
@@ -208,10 +209,10 @@ def _save_price(con, d, code, r, today, prev, ts, raw) -> None:
     market = (con.execute("SELECT market FROM stock_master WHERE code=?", (code,)).fetchone() or [None])[0]
     con.execute(
         "INSERT OR REPLACE INTO price_daily(date, code, market, open, high, low, close, change_rate_pct, volume_sh,"
-        " value_krw, mktcap_krw, listed_shares, is_provisional, source, fetched_at, raw_file)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,'KIS',?,?)",
+        " value_krw, mktcap_krw, listed_shares, cmpprevdd_prc, is_provisional, source, fetched_at, raw_file)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'KIS',?,?)",
         (d, code, market, new["open"], new["high"], new["low"], new["close"], new["change_rate_pct"],
-         new["volume_sh"], new["value_krw"], new["mktcap_krw"], new["listed_shares"], ts, raw))
+         new["volume_sh"], new["value_krw"], new["mktcap_krw"], new["listed_shares"], new["cmpprevdd_prc"], ts, raw))
 
 
 def collect_index_today(con, kis: KisClient, root, now: datetime) -> list[str]:

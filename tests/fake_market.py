@@ -55,6 +55,8 @@ class FakeMarket:
         self.investor_calls = 0
         self.admin_codes = {"222220"}
         self.market_calls = 0
+        self.kis_close: dict[str, int] = {}  # 날짜 -> KIS 종가 (기본 1050)
+        self.kis_vrss: dict[str, str] = {}  # 날짜 -> KIS prdy_vrss (기본 종가-1000)
         self.split_day: dict[str, str] = {}  # code -> 기준가가 조정된 날 (KRX CMPPREVDD_PRC로 표현)
         self.share_change: dict[str, str] = {}  # code -> 상장주식수만 2000으로 바뀌는 날 (기준가 조정 없음)
         self.adj_fail = False
@@ -85,7 +87,9 @@ class FakeMarket:
             listed = next((l for rows in BASE.values() for c, n, l, *_ in rows if c == code), "19000101")
             days = [s for s in reversed(OPEN) if s <= d and s >= listed][:30]
             rows = [{"stck_bsop_date": s, "stck_oprc": "1000", "stck_hgpr": "1100", "stck_lwpr": "900",
-                     "stck_clpr": "1050", "prdy_ctrt": "1.5", "acml_vol": "700", "acml_tr_pbmn": "735000",
+                     "stck_clpr": str(self.kis_close.get(s, 1050 if s == d else 1000)), "prdy_ctrt": "1.5",
+                     "prdy_vrss": self.kis_vrss.get(s, "50" if s == d else "0"),  # 당일만 KRX 1000 대비 +50
+                     "acml_vol": "700", "acml_tr_pbmn": "735000",
                      "frgn_ntby_qty": str(10 + self.inv_bump.get(s, 0)), "orgn_ntby_qty": "-5", "prsn_ntby_qty": "-5",
                      "frgn_ntby_tr_pbmn": "12", "orgn_ntby_tr_pbmn": "-3", "prsn_ntby_tr_pbmn": "-9"} for s in days]
             return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok", "output1": {}, "output2": rows})

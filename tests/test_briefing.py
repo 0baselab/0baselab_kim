@@ -193,3 +193,28 @@ def test_backfill_cmpprevdd_from_raw(install):
     assert any("원본에서 채웠습니다" in l for l in res.lines)
     con = reopen(install)
     assert con.execute("SELECT cmpprevdd_prc FROM price_daily WHERE code='005930' AND date='20261113'").fetchone()[0] == 500
+
+
+@pytest.mark.parametrize("vrss", ["50", "-50"])  # prdy_vrss 부호 표기와 관계없이 판정
+def test_today_kis_split_detected(install, vrss):
+    kis_settings(install)
+    m = FakeMarket()
+    # 오늘(11/19) 1:2 분할: 기준가 500, 종가 550, 전일대비 +50 -> 직전 종가 1000과 다름
+    m.kis_close = {"20261119": 550}
+    m.kis_vrss = {"20261119": vrss}
+    m.split_day = {"005930": "20261119"}  # 가짜 수정주가 API: 11/19 이전 500, 이후 1000
+    collect(install, m)
+    con = reopen(install)
+    pkg = build(con, "20261119", themes_dir(install), NOW)
+    s = stock(pkg, "005930")
+    assert s["corp_action_suspect"] == 1
+    assert s["close"] == 550  # 원본 그대로
+    assert s["ret_5d_pct"] != round((550 / 1000 - 1) * 100, 4)  # 가짜 급락(-45%)이 아님
+    assert "수정주가 사용" in s["missing_note"]
+    assert m.adj_calls >= 1
+
+
+def test_today_kis_normal_day_not_flagged(filled):
+    con = reopen(filled)
+    s = stock(build(con, "20261119", themes_dir(filled), NOW), "005930")
+    assert s["corp_action_suspect"] == 0 and s["ret_5d_pct"] == 5.0
