@@ -1,18 +1,25 @@
-"""GUI (UI/UX 결정사항 2026-11-19): 탭 4개 [수집] [브리핑 데이터 가공] [테마 관리] [설정].
+"""GUI (UI/UX 결정사항 2026-11-19, CustomTkinter).
+
+화면 구성: 왼쪽 네이비 내비게이션 + 오른쪽 흰 작업 영역. 페이지 4개 [수집] [브리핑 데이터 가공] [테마 관리] [설정].
+[수집] 페이지 맨 위의 '저녁 시간 띠'가 이 화면의 기억에 남는 요소다: 15시~24시를 가로로 놓고,
+KIS 조회 가능 시간(15:40~23:59)과 권장 수집 시간(20:30~22:00), 지금 시각을 한 줄에 보여준다.
+나머지는 조용하게 둔다.
 
 작업은 별도 스레드에서 돌리고, 화면 갱신은 큐를 통해 메인 스레드에서만 한다.
-DB 연결은 작업 스레드 안에서 만들고 닫는다(실행 중 잠금 파일도 그때만 잡는다).
+DB 연결과 잠금 파일은 작업 스레드 안에서 열고 닫는다.
 """
 from __future__ import annotations
 
 import logging
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-import tkinter.font as tkfont
+
+import customtkinter as ctk
 
 from . import gui_logic as L
 from . import paths
@@ -21,10 +28,44 @@ from .settings import load_settings, set_setting
 from .timeutil import now_kst
 from .version import __version__
 
-NAVY, COBALT, GRAY, WHITE = "#0B1F3A", "#0047FF", "#8A94A6", "#FFFFFF"
-RED, YELLOW, LIGHT = "#D92D20", "#F5B800", "#F3F5F9"
+# 색 (결정사항 고정값 + 같은 계열의 보조 톤)
+NAVY = "#0B1F3A"
+NAVY_2 = "#14305A"      # 내비게이션 선택 배경
+COBALT = "#0047FF"
+COBALT_DARK = "#0036C4"
+GRAY = "#8A94A6"
+WHITE = "#FFFFFF"
+SURFACE = "#F3F5F9"     # 입력·로그 바탕 (차가운 회백색)
+LINE = "#DCE1EA"        # 구분선
+RED = "#D92D20"
+YELLOW = "#F5B800"
+YELLOW_BG = "#FFF6D6"
+RED_BG = "#FDECEA"
+
 SCALES = [("1.0", "보통"), ("1.2", "크게"), ("1.4", "아주 크게")]
 PROGRESS_RE = re.compile(r"(\d+)/(\d+)")
+FONT = "Pretendard"  # SIL OFL 1.1, collector/assets/fonts에 동봉 (PC에 설치하지 않고 이 프로그램 안에서만 불러옴)
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+
+
+def load_fonts() -> bool:
+    """동봉한 Pretendard를 불러온다. 실패하면 Windows 기본 글꼴로 대신 그린다."""
+    global FONT
+    ok = all(ctk.FontManager.load_font(str(FONT_DIR / f)) for f in ("Pretendard-Regular.ttf", "Pretendard-Bold.ttf"))
+    if not ok:
+        FONT = "Malgun Gothic" if sys.platform == "win32" else "TkDefaultFont"
+    return ok
+
+PAGES = [("collect", "수집"), ("brief", "브리핑 데이터 가공"), ("theme", "테마 관리"), ("settings", "설정")]
+
+# 저녁 시간 띠 (분 단위)
+BAND_START, BAND_END = 15 * 60, 24 * 60
+KIS_START, KIS_END = 15 * 60 + 40, 23 * 60 + 59
+REC_START, REC_END = 20 * 60 + 30, 22 * 60
+
+
+def F(size=13, weight="normal"):
+    return ctk.CTkFont(family=FONT, size=size, weight=weight)
 
 
 class QueueLogHandler(logging.Handler):
@@ -39,84 +80,150 @@ class QueueLogHandler(logging.Handler):
             pass
 
 
+class EveningBand(tk.Canvas):
+    """15시~24시 시간 띠. KIS 조회 가능 / 권장 수집 / 지금 시각."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, height=66, bg=WHITE, highlightthickness=0, **kw)
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def _x(self, minute, w, pad=24):
+        return pad + (w - 2 * pad) * (minute - BAND_START) / (BAND_END - BAND_START)
+
+    def draw(self, now=None):
+        now = now or now_kst()
+        self.delete("all")
+        w = max(self.winfo_width(), 200)
+        y0, y1 = 26, 40
+        self.create_rectangle(self._x(BAND_START, w), y0, self._x(BAND_END, w), y1, fill=SURFACE, width=0)
+        self.create_rectangle(self._x(KIS_START, w), y0, self._x(KIS_END, w), y1, fill=LINE, width=0)
+        self.create_rectangle(self._x(REC_START, w), y0 - 4, self._x(REC_END, w), y1 + 4, fill=COBALT, width=0)
+        for h in range(15, 25, 3):
+            x = self._x(h * 60, w)
+            self.create_text(x, y1 + 16, text=f"{h}:00" if h < 24 else "24:00", fill=GRAY, font=(FONT, 9))
+        self.create_text(self._x(REC_START, w), 12, text="20:30", fill=COBALT, font=(FONT, 9, "bold"), anchor="w")
+        self.create_text(self._x(REC_END, w), 12, text="22:00", fill=COBALT, font=(FONT, 9, "bold"), anchor="e")
+        self.create_text(self._x(KIS_START, w), 12, text="KIS 조회 가능 15:40부터", fill=GRAY, font=(FONT, 9), anchor="w")
+        m = now.hour * 60 + now.minute
+        if BAND_START <= m <= BAND_END:
+            x = self._x(m, w)
+            self.create_line(x, y0 - 10, x, y1 + 10, fill=NAVY, width=2)
+            self.create_oval(x - 4, y0 - 14, x + 4, y0 - 6, fill=NAVY, outline="")
+
+
 class MainWindow:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: ctk.CTk):
         self.root = root
         self.install = paths.install_dir()
         self.settings = load_settings(self.install)
         self.q: queue.Queue = queue.Queue()
         self.busy = False
         self.last_log_path: Path | None = None
+        self.scale = float(self.settings.get("GUI_FONT_SCALE") or 1.0)
+        ctk.set_appearance_mode("light")
+        ctk.set_widget_scaling(self.scale)
         root.title(f"주식데이터수집기 {__version__}")
-        root.geometry("980x700")
-        root.minsize(820, 560)
-        root.configure(bg=WHITE)
-        self._fonts()
-        self._style()
-        self._header()
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.tab_collect = self._tab("수집")
-        self.tab_brief = self._tab("브리핑 데이터 가공")
-        self.tab_theme = self._tab("테마 관리")
-        self.tab_settings = self._tab("설정")
+        root.geometry("1040x720")
+        root.minsize(900, 600)
+        root.configure(fg_color=WHITE)
+        root.grid_columnconfigure(1, weight=1)
+        root.grid_rowconfigure(0, weight=1)
+        self._action_buttons: list[ctk.CTkButton] = []
+        self._build_nav()
+        self.content = ctk.CTkFrame(root, fg_color=WHITE, corner_radius=0)
+        self.content.grid(row=0, column=1, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=1)
+        self.pages = {key: ctk.CTkFrame(self.content, fg_color=WHITE, corner_radius=0) for key, _ in PAGES}
+        for p in self.pages.values():
+            p.grid(row=0, column=0, sticky="nsew", padx=32, pady=28)
+        self.tab_collect, self.tab_brief = self.pages["collect"], self.pages["brief"]
+        self.tab_theme, self.tab_settings = self.pages["theme"], self.pages["settings"]
         self._build_collect()
         self._build_briefing()
         self._build_theme()
         self._build_settings()
+        self.show("collect")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(100, self._poll)
         root.after(300, self._startup_checks)
+        root.after(30_000, self._tick)
 
-    # ---------------- 모양 ----------------
-    def _fonts(self):
-        scale = float(self.settings.get("GUI_FONT_SCALE") or 1.0)
-        self.scale = scale
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkFixedFont"):
-            f = tkfont.nametofont(name)
-            f.configure(size=int(round(10 * scale)))
-        self.f_title = tkfont.Font(size=int(round(14 * scale)), weight="bold")
-        self.f_bold = tkfont.Font(size=int(round(10 * scale)), weight="bold")
+    # ---------------- 틀 ----------------
+    def _build_nav(self):
+        nav = ctk.CTkFrame(self.root, fg_color=NAVY, corner_radius=0, width=220)
+        nav.grid(row=0, column=0, sticky="nsw")
+        nav.grid_propagate(False)
+        ctk.CTkLabel(nav, text="주식데이터수집기", text_color=WHITE, font=F(17, "bold"), anchor="w").pack(
+            fill="x", padx=22, pady=(26, 2))
+        ctk.CTkLabel(nav, text=f"버전 {__version__}", text_color=GRAY, font=F(11), anchor="w").pack(fill="x", padx=22)
+        ctk.CTkFrame(nav, fg_color=NAVY_2, height=1).pack(fill="x", padx=22, pady=(20, 12))
+        self.nav_buttons = {}
+        for key, title in PAGES:
+            b = ctk.CTkButton(nav, text=title, anchor="w", height=40, corner_radius=8, font=F(14),
+                              fg_color="transparent", hover_color=NAVY_2, text_color=WHITE,
+                              command=lambda k=key: self.show(k))
+            b.pack(fill="x", padx=12, pady=2)
+            self.nav_buttons[key] = b
+        self.nav_note = ctk.CTkLabel(nav, text="", text_color=GRAY, font=F(11), anchor="w", justify="left",
+                                     wraplength=180)
+        self.nav_note.pack(side="bottom", fill="x", padx=22, pady=20)
 
-    def _style(self):
-        st = ttk.Style(self.root)
-        try:
-            st.theme_use("clam")
-        except tk.TclError:
-            pass
-        st.configure(".", background=WHITE, foreground=NAVY)
-        st.configure("TNotebook", background=WHITE, borderwidth=0)
-        st.configure("TNotebook.Tab", padding=(16, 8), background=LIGHT, foreground=GRAY)
-        st.map("TNotebook.Tab", background=[("selected", WHITE)], foreground=[("selected", NAVY)])
-        st.configure("TFrame", background=WHITE)
-        st.configure("TLabel", background=WHITE, foreground=NAVY)
-        st.configure("Muted.TLabel", foreground=GRAY)
-        st.configure("Warn.TLabel", foreground="#8A6100")
-        st.configure("Err.TLabel", foreground=RED)
-        st.configure("TCheckbutton", background=WHITE, foreground=NAVY)
-        st.configure("Primary.TButton", background=COBALT, foreground=WHITE, padding=(18, 8), borderwidth=0)
-        st.map("Primary.TButton", background=[("disabled", GRAY), ("active", "#0036C4")])
-        st.configure("TButton", padding=(12, 6))
-        st.configure("Horizontal.TProgressbar", background=COBALT, troughcolor=LIGHT)
-        st.configure("Treeview", rowheight=int(22 * self.scale))
+    def show(self, key):
+        self.pages[key].tkraise()
+        for k, b in self.nav_buttons.items():
+            on = k == key
+            b.configure(fg_color=NAVY_2 if on else "transparent", font=F(14, "bold" if on else "normal"),
+                        border_width=0)
+        self.current = key
+        if key == "theme":
+            self._refresh_theme_info()
 
-    def _header(self):
-        bar = tk.Frame(self.root, bg=NAVY, height=48)
-        bar.pack(fill="x")
-        tk.Label(bar, text="주식데이터수집기", bg=NAVY, fg=WHITE, font=self.f_title).pack(side="left", padx=16, pady=10)
-        tk.Label(bar, text=f"v{__version__}", bg=NAVY, fg=GRAY).pack(side="left")
-        tk.Frame(self.root, bg=WHITE, height=8).pack(fill="x")
+    def _title(self, parent, text, sub=None):
+        ctk.CTkLabel(parent, text=text, font=F(22, "bold"), text_color=NAVY, anchor="w").pack(fill="x")
+        if sub:
+            ctk.CTkLabel(parent, text=sub, font=F(13), text_color=GRAY, anchor="w", justify="left",
+                         wraplength=720).pack(fill="x", pady=(4, 0))
 
-    def _tab(self, title):
-        f = ttk.Frame(self.nb, padding=16)
-        self.nb.add(f, text=title)
-        return f
+    def _section(self, parent, text):
+        ctk.CTkLabel(parent, text=text, font=F(13, "bold"), text_color=NAVY, anchor="w").pack(fill="x", pady=(22, 8))
+
+    def _primary(self, parent, text, cmd, **kw):
+        b = ctk.CTkButton(parent, text=text, command=cmd, fg_color=COBALT, hover_color=COBALT_DARK,
+                          text_color=WHITE, text_color_disabled="#D6DEF5", corner_radius=8, height=40,
+                          font=F(14, "bold"), **kw)
+        self._action_buttons.append(b)
+        return b
+
+    def _secondary(self, parent, text, cmd, **kw):
+        return ctk.CTkButton(parent, text=text, command=cmd, fg_color=WHITE, hover_color=SURFACE,
+                             text_color=NAVY, border_color=LINE, border_width=1, corner_radius=8, height=40,
+                             font=F(13), **kw)
+
+    def _entry(self, parent, var, width=120, show=None):
+        return ctk.CTkEntry(parent, textvariable=var, width=width, height=36, corner_radius=8, fg_color=SURFACE,
+                            border_color=LINE, text_color=NAVY, font=F(14), show=show)
+
+    def _check(self, parent, text, var):
+        return ctk.CTkCheckBox(parent, text=text, variable=var, font=F(13), text_color=NAVY, fg_color=COBALT,
+                               hover_color=COBALT_DARK, border_color=GRAY, corner_radius=4, checkbox_width=20,
+                               checkbox_height=20)
+
+    def _notice(self, parent, kind="warn"):
+        """경고(노랑)·오류(빨강) 띠. 평소엔 숨겨 둔다."""
+        bg, edge = (YELLOW_BG, YELLOW) if kind == "warn" else (RED_BG, RED)
+        box = ctk.CTkFrame(parent, fg_color=bg, corner_radius=8, border_width=0, height=40)
+        bar = ctk.CTkFrame(box, fg_color=edge, width=4, height=1, corner_radius=2)
+        bar.pack(side="left", fill="y", padx=(0, 10), pady=6)
+        lbl = ctk.CTkLabel(box, text="", font=F(13), text_color=NAVY, anchor="w", justify="left", wraplength=640)
+        lbl.pack(side="left", fill="x", expand=True, pady=8, padx=(0, 12))
+        box.label = lbl
+        return box
 
     # ---------------- 작업 실행 공통 ----------------
     def _run_worker(self, fn, done):
-        """fn(app_factory, put) 을 작업 스레드에서 실행하고, 결과를 done(result)로 메인 스레드에 돌려준다."""
         if self.busy:
-            messagebox.showinfo("실행 중", "다른 작업이 진행 중입니다. 끝난 뒤 다시 눌러 주세요.")
+            messagebox.showinfo("작업 중", "다른 작업이 진행 중입니다. 끝난 뒤 다시 눌러 주세요.")
             return
         self.busy = True
         self._set_buttons("disabled")
@@ -125,7 +232,7 @@ class MainWindow:
             try:
                 result = fn(self.q.put)
                 self.q.put(("done", done, result, None))
-            except Exception as exc:  # 화면이 멈추지 않게 오류도 돌려준다
+            except Exception as exc:
                 logging.getLogger("collector").exception("작업 오류")
                 self.q.put(("done", done, None, exc))
 
@@ -135,7 +242,7 @@ class MainWindow:
         from .app import start
         app = start(prompt_keys=False, out=lambda s: put(("log", s)))
         h = QueueLogHandler(self.q)
-        h.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
+        h.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
         logging.getLogger("collector").addHandler(h)
         self.last_log_path = app.log_path
         return app
@@ -150,20 +257,20 @@ class MainWindow:
         try:
             while True:
                 msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "log":
+                if msg[0] == "log":
                     self._log(msg[1])
-                elif kind == "ask":
+                elif msg[0] == "ask":
                     _, question, ev, holder = msg
                     holder["answer"] = messagebox.askyesno("확인", question)
                     ev.set()
-                elif kind == "done":
+                elif msg[0] == "done":
                     _, done, result, exc = msg
                     self.busy = False
                     self._set_buttons("normal")
-                    self.progress.stop()
                     if exc is not None:
-                        messagebox.showerror("오류", f"{type(exc).__name__}: {exc}")
+                        self._finish_progress(error=True)
+                        messagebox.showerror("작업을 끝내지 못했습니다", f"{type(exc).__name__}: {exc}\n\n"
+                                             "[상세 로그 복사]로 로그를 복사해 알려 주세요.")
                     else:
                         done(result)
         except queue.Empty:
@@ -171,7 +278,7 @@ class MainWindow:
         self.root.after(100, self._poll)
 
     def _set_buttons(self, state):
-        for b in getattr(self, "_action_buttons", []):
+        for b in self._action_buttons:
             b.configure(state=state)
 
     def _on_close(self):
@@ -186,49 +293,91 @@ class MainWindow:
         if miss:
             head = "업데이트 후 첫 실행입니다. " if changed else ""
             messagebox.showwarning("API 키 확인", head + "다음 키가 없습니다: " + ", ".join(miss) +
-                                   "\n[설정] 탭에서 입력해 주세요.")
-            self.nb.select(self.tab_settings)
+                                   "\n[설정]에서 입력해 주세요.")
+            self.show("settings")
         elif changed:
-            self._log(f"업데이트 확인: v{__version__}, API 키 4개 모두 있음")
+            self._log(f"업데이트 확인: 버전 {__version__}, API 키 4개 모두 있음")
+        self._refresh_nav_note()
+
+    def _refresh_nav_note(self):
+        miss = L.missing_keys(self.install)
+        self.nav_note.configure(text=("API 키 없음: " + ", ".join(miss)) if miss else "API 키 4개 저장됨",
+                                text_color=YELLOW if miss else GRAY)
+
+    def _tick(self):
+        self.band.draw()
+        self._update_window_hint()
+        self.root.after(30_000, self._tick)
 
     # ---------------- [수집] ----------------
     def _build_collect(self):
         t = self.tab_collect
+        self._title(t, "수집", "매일은 장이 열린 날 저녁, 아래 [수집 실행]만 누르면 됩니다.")
+        band_wrap = ctk.CTkFrame(t, fg_color=WHITE)
+        band_wrap.pack(fill="x", pady=(18, 0))
+        self.band = EveningBand(band_wrap)
+        self.band.pack(fill="x")
+        self.window_hint = ctk.CTkLabel(t, text="", font=F(13), anchor="w", text_color=NAVY)
+        self.window_hint.pack(fill="x", pady=(2, 0))
+
+        form = ctk.CTkFrame(t, fg_color=WHITE)
+        form.pack(fill="x", pady=(18, 0))
+        form.grid_columnconfigure(1, weight=1)
         today = now_kst().strftime("%Y%m%d")
-        row = ttk.Frame(t)
-        row.pack(fill="x")
-        ttk.Label(row, text="기간", font=self.f_bold).pack(side="left")
-        self.c_start = tk.StringVar(value=today)
-        self.c_end = tk.StringVar(value=today)
-        ttk.Entry(row, textvariable=self.c_start, width=10).pack(side="left", padx=(8, 4))
-        ttk.Label(row, text="~").pack(side="left")
-        ttk.Entry(row, textvariable=self.c_end, width=10).pack(side="left", padx=4)
-        ttk.Label(row, text="YYYYMMDD. 오늘 하루면 빠진 날도 자동으로 채웁니다.", style="Muted.TLabel").pack(side="left", padx=8)
-        row2 = ttk.Frame(t)
-        row2.pack(fill="x", pady=(10, 0))
-        ttk.Label(row2, text="데이터", font=self.f_bold).pack(side="left")
+        self.c_start, self.c_end = tk.StringVar(value=today), tk.StringVar(value=today)
+        ctk.CTkLabel(form, text="기간", font=F(13, "bold"), text_color=NAVY, width=64, anchor="w").grid(row=0, column=0, sticky="w")
+        r0 = ctk.CTkFrame(form, fg_color=WHITE)
+        r0.grid(row=0, column=1, sticky="w")
+        self._entry(r0, self.c_start).pack(side="left")
+        ctk.CTkLabel(r0, text="부터", font=F(13), text_color=GRAY).pack(side="left", padx=8)
+        self._entry(r0, self.c_end).pack(side="left")
+        ctk.CTkLabel(r0, text="까지", font=F(13), text_color=GRAY).pack(side="left", padx=8)
+        ctk.CTkLabel(form, text="오늘 하루로 두면 빠진 날도 함께 채웁니다. 날짜는 20261119처럼 숫자 8자리.",
+                     font=F(12), text_color=GRAY, anchor="w").grid(row=1, column=1, sticky="w", pady=(4, 0))
         self.c_kis, self.c_krx, self.c_dart = tk.BooleanVar(value=True), tk.BooleanVar(value=True), tk.BooleanVar(value=False)
-        for text, var in (("KIS", self.c_kis), ("KRX", self.c_krx), ("DART", self.c_dart)):
-            ttk.Checkbutton(row2, text=text, variable=var).pack(side="left", padx=(8, 4))
         self.c_refetch = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="'시간대 밖' 표시된 데이터도 다시 받기", variable=self.c_refetch).pack(side="left", padx=16)
-        row3 = ttk.Frame(t)
-        row3.pack(fill="x", pady=12)
-        self.btn_collect = ttk.Button(row3, text="수집 실행", style="Primary.TButton", command=self._on_collect)
+        ctk.CTkLabel(form, text="데이터", font=F(13, "bold"), text_color=NAVY, width=64, anchor="w").grid(
+            row=2, column=0, sticky="w", pady=(16, 0))
+        r2 = ctk.CTkFrame(form, fg_color=WHITE)
+        r2.grid(row=2, column=1, sticky="w", pady=(16, 0))
+        for text, var in (("KIS 수급·당일 시세", self.c_kis), ("KRX 확정 시세", self.c_krx), ("DART 재무·공시", self.c_dart)):
+            self._check(r2, text, var).pack(side="left", padx=(0, 22))
+        self._check(form, "'시간대 밖' 표시된 데이터도 다시 받기", self.c_refetch).grid(
+            row=3, column=1, sticky="w", pady=(12, 0))
+
+        run = ctk.CTkFrame(t, fg_color=WHITE)
+        run.pack(fill="x", pady=(22, 0))
+        self.btn_collect = self._primary(run, "수집 실행", self._on_collect, width=180)
         self.btn_collect.pack(side="left")
-        self.c_status = ttk.Label(row3, text="권장 수집 시간: 장 열린 날 20:30~22:00", style="Muted.TLabel")
-        self.c_status.pack(side="left", padx=12)
-        self.progress = ttk.Progressbar(t, mode="indeterminate")
-        self.progress.pack(fill="x")
-        logf = ttk.Frame(t)
-        logf.pack(fill="both", expand=True, pady=(10, 0))
-        self.logbox = tk.Text(logf, height=16, wrap="word", bg=LIGHT, fg=NAVY, relief="flat", state="disabled")
-        sb = ttk.Scrollbar(logf, command=self.logbox.yview)
-        self.logbox.configure(yscrollcommand=sb.set)
-        self.logbox.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        ttk.Button(t, text="상세 로그 복사", command=self._copy_log).pack(anchor="e", pady=(8, 0))
-        self._action_buttons = [self.btn_collect]
+        self.c_status = ctk.CTkLabel(run, text="", font=F(13), text_color=GRAY, anchor="w")
+        self.c_status.pack(side="left", padx=16, fill="x", expand=True)
+        self.progress = ctk.CTkProgressBar(t, height=8, corner_radius=4, fg_color=SURFACE, progress_color=COBALT)
+        self.progress.set(0)
+        self.progress.pack(fill="x", pady=(16, 0))
+        self.c_notice = self._notice(t, "err")
+
+        head = ctk.CTkFrame(t, fg_color=WHITE)
+        head.pack(fill="x", pady=(18, 6))
+        ctk.CTkLabel(head, text="진행 기록", font=F(13, "bold"), text_color=NAVY).pack(side="left")
+        self._secondary(head, "상세 로그 복사", self._copy_log, width=130).pack(side="right")
+        self.logbox = ctk.CTkTextbox(t, fg_color=SURFACE, text_color=NAVY, corner_radius=8, border_width=0,
+                                     font=F(12), wrap="word")
+        self.logbox.pack(fill="both", expand=True)
+        self.logbox.configure(state="disabled")
+        self._update_window_hint()
+
+    def _update_window_hint(self):
+        from .collect import in_recommended_window
+        now = now_kst()
+        m = now.hour * 60 + now.minute
+        hm = now.strftime("%H:%M")
+        if in_recommended_window(now):
+            text, color = f"지금 {hm}. 권장 수집 시간입니다.", COBALT
+        elif KIS_START <= m <= KIS_END:
+            text, color = f"지금 {hm}. 수집은 되지만 권장 시간(20:30~22:00)이 아니어서 기록에 '시간대 밖' 표시가 남습니다.", "#8A6100"
+        else:
+            text, color = f"지금 {hm}. KIS 수급은 15:40부터 조회됩니다. KRX·DART만 받으려면 KIS를 끄고 실행하세요.", "#8A6100"
+        self.window_hint.configure(text=text, text_color=color)
 
     def _log(self, text):
         self.logbox.configure(state="normal")
@@ -236,11 +385,18 @@ class MainWindow:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
         m = PROGRESS_RE.search(text)
-        if m and ("KRX" in text or "KIS" in text or "DART" in text):
+        if m and any(k in text for k in ("KRX", "KIS", "DART")):
             a, b = int(m.group(1)), int(m.group(2))
-            self.progress.stop()
-            self.progress.configure(mode="determinate", maximum=max(b, 1), value=a)
-            self.c_status.configure(text=text.strip(), style="TLabel")
+            if self.progress.cget("mode") != "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+            self.progress.set(a / max(b, 1))
+            self.c_status.configure(text=text.strip(), text_color=NAVY)
+
+    def _finish_progress(self, error=False):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", progress_color=RED if error else COBALT)
+        self.progress.set(1)
 
     def _copy_log(self):
         text = ""
@@ -250,22 +406,23 @@ class MainWindow:
             text = self.logbox.get("1.0", "end")
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        messagebox.showinfo("복사", "상세 로그를 클립보드에 복사했습니다.")
+        self.c_status.configure(text="상세 로그를 클립보드에 복사했습니다.", text_color=NAVY)
 
     def _on_collect(self):
         from .collect import in_recommended_window
+        self.c_notice.pack_forget()
         start, end = self.c_start.get().strip(), self.c_end.get().strip()
         if not (re.fullmatch(r"\d{8}", start) and re.fullmatch(r"\d{8}", end)) or start > end:
-            messagebox.showerror("기간 오류", "기간은 YYYYMMDD 형식이고, 시작일이 종료일보다 늦으면 안 됩니다.")
+            self._show_notice(self.c_notice, "기간을 확인하세요. 날짜는 숫자 8자리이고, 시작일이 종료일보다 늦으면 안 됩니다.")
             return
         if not (self.c_kis.get() or self.c_krx.get() or self.c_dart.get()):
-            messagebox.showerror("데이터 선택", "데이터 종류를 하나 이상 고르세요.")
+            self._show_notice(self.c_notice, "받을 데이터를 하나 이상 고르세요.")
             return
         if not in_recommended_window(now_kst()) and (self.c_kis.get() or self.c_krx.get()):
             if not messagebox.askyesno(
                     "권장 시간대 밖", "지금은 권장 수집 시간(장 열린 날 20:30~22:00)이 아닙니다.\n"
                     "이 시간에 받은 데이터는 권장 시간대에 받는 데이터와 다를 수 있습니다.\n"
-                    "이번 수집 기록에는 '시간대 밖' 표시가 남고, 나중에 다시 받을 수 있습니다.\n\n계속할까요?",
+                    "이번 기록에는 '시간대 밖' 표시가 남고, 나중에 다시 받을 수 있습니다.\n\n계속할까요?",
                     icon="warning"):
                 return
         mode, s, e = L.collect_mode(start, end, now_kst().strftime("%Y%m%d"))
@@ -273,9 +430,9 @@ class MainWindow:
         self.logbox.configure(state="normal")
         self.logbox.delete("1.0", "end")
         self.logbox.configure(state="disabled")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(12)
-        self.c_status.configure(text="수집 중...", style="TLabel")
+        self.progress.configure(mode="indeterminate", progress_color=COBALT)
+        self.progress.start()
+        self.c_status.configure(text="수집하는 중", text_color=NAVY)
 
         def work(put):
             from .collect import run_collect
@@ -283,7 +440,6 @@ class MainWindow:
             out = {"lines": [], "failures": [], "root": app.root, "stopped": None}
             try:
                 if opts["kis"] or opts["krx"]:
-                    # 시간대 경고는 시작 전에 이미 했으므로 애프터마켓 질문은 다시 묻지 않는다
                     confirm = lambda q: True if "애프터마켓" in q else self._ask_from_worker(q)
                     res = run_collect(app, mode, s, e, confirm=confirm, out=lambda x: put(("log", x)),
                                       do_krx=opts["krx"], do_kis=opts["kis"], refetch_off_hours=opts["refetch"])
@@ -297,6 +453,10 @@ class MainWindow:
             return out
 
         self._run_worker(work, self._collect_done)
+
+    def _show_notice(self, box, text):
+        box.label.configure(text=text)
+        box.pack(fill="x", pady=(12, 0))
 
     def _run_dart(self, app, put, out):
         from .dart import DartClient
@@ -319,51 +479,63 @@ class MainWindow:
         return lines
 
     def _collect_done(self, out):
-        self.progress.configure(mode="determinate", value=self.progress["maximum"])
-        self.c_status.configure(text="완료" if not out["stopped"] else f"멈춤: {out['stopped']}",
-                                style="TLabel" if not out["stopped"] else "Warn.TLabel")
-        body = "\n".join(out["lines"])
-        if out["failures"]:
-            body += "\n\n건너뛴 항목 (" + str(len(out["failures"])) + "건)\n" + "\n".join(out["failures"][:50])
-        self._result_popup("수집 결과", body, out["root"])
+        self._finish_progress()
+        if out["stopped"]:
+            self.c_status.configure(text=f"멈춤: {out['stopped']}", text_color=RED)
+        else:
+            n = len(out["failures"])
+            self.c_status.configure(text="수집을 마쳤습니다." + (f" 건너뛴 항목 {n}건" if n else ""), text_color=NAVY)
+        self._result_popup("수집 결과", out["lines"], out["root"], out["failures"], out["stopped"])
 
-    def _result_popup(self, title, body, folder: Path):
-        w = tk.Toplevel(self.root)
+    def _result_popup(self, title, lines, folder: Path, failures=None, stopped=None):
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        failures = failures or []
+        w = ctk.CTkToplevel(self.root)
         w.title(title)
-        w.configure(bg=WHITE)
+        w.configure(fg_color=WHITE)
+        w.geometry("760x520")
         w.transient(self.root)
-        txt = tk.Text(w, width=90, height=20, wrap="word", bg=LIGHT, fg=NAVY, relief="flat")
-        txt.insert("1.0", body)
-        txt.configure(state="disabled")
-        txt.pack(fill="both", expand=True, padx=12, pady=12)
-        bar = ttk.Frame(w)
-        bar.pack(fill="x", padx=12, pady=(0, 12))
+        w.after(50, w.grab_set)
+        head = "멈췄습니다" if stopped else ("마쳤습니다" if not failures else f"마쳤습니다. 건너뛴 항목 {len(failures)}건")
+        ctk.CTkLabel(w, text=f"{title}: {head}", font=F(18, "bold"), text_color=RED if stopped else NAVY,
+                     anchor="w").pack(fill="x", padx=24, pady=(22, 10))
+        box = ctk.CTkTextbox(w, fg_color=SURFACE, text_color=NAVY, font=F(12), corner_radius=8, wrap="word")
+        box.pack(fill="both", expand=True, padx=24)
+        box.insert("end", "\n".join(lines))
+        if failures:
+            box.insert("end", "\n\n건너뛴 항목\n" + "\n".join(failures[:100]))
+        box.configure(state="disabled")
+        bar = ctk.CTkFrame(w, fg_color=WHITE)
+        bar.pack(fill="x", padx=24, pady=18)
 
         def open_and_close():
             L.open_folder(folder)
             w.destroy()
 
-        ttk.Button(bar, text="닫기", command=w.destroy).pack(side="right")
-        ttk.Button(bar, text="저장 폴더 열기", style="Primary.TButton", command=open_and_close).pack(side="right", padx=8)
+        ctk.CTkButton(bar, text="저장 폴더 열기", command=open_and_close, fg_color=COBALT, hover_color=COBALT_DARK,
+                      font=F(13, "bold"), corner_radius=8, height=38, width=150).pack(side="right")
+        self._secondary(bar, "닫기", w.destroy, width=90).pack(side="right", padx=10)
 
     # ---------------- [브리핑 데이터 가공] ----------------
     def _build_briefing(self):
         t = self.tab_brief
-        ttk.Label(t, text="기준일을 고르면, 그 날까지의 수집 데이터(직전 250거래일 KRX·KIS)로 브리핑용 xlsx 1개를 만듭니다.",
-                  style="Muted.TLabel").pack(anchor="w")
-        row = ttk.Frame(t)
-        row.pack(fill="x", pady=12)
-        ttk.Label(row, text="기준일", font=self.f_bold).pack(side="left")
+        self._title(t, "브리핑 데이터 가공",
+                    "기준일을 고르면 그 날까지의 직전 250거래일 KRX·KIS 데이터로 브리핑용 xlsx 1개를 만듭니다. "
+                    "API는 부르지 않고 저장된 데이터만 씁니다.")
+        self._section(t, "기준일")
+        row = ctk.CTkFrame(t, fg_color=WHITE)
+        row.pack(fill="x")
         self.b_date = tk.StringVar(value=now_kst().strftime("%Y%m%d"))
-        ttk.Entry(row, textvariable=self.b_date, width=10).pack(side="left", padx=8)
-        ttk.Button(row, text="마지막 수집일", command=self._fill_last_date).pack(side="left")
+        self._entry(row, self.b_date, width=140).pack(side="left")
+        self._secondary(row, "마지막 수집일로", self._fill_last_date, width=130).pack(side="left", padx=10)
         self.b_json = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="JSON도 저장", variable=self.b_json).pack(side="left", padx=16)
-        self.btn_brief = ttk.Button(t, text="브리핑 파일 만들기", style="Primary.TButton", command=self._on_briefing)
-        self.btn_brief.pack(anchor="w")
-        self.b_status = ttk.Label(t, text="", style="Muted.TLabel", wraplength=800, justify="left")
-        self.b_status.pack(anchor="w", pady=12)
-        self._action_buttons.append(self.btn_brief)
+        self._check(t, "같은 내용을 JSON으로도 저장", self.b_json).pack(anchor="w", pady=(14, 0))
+        self.btn_brief = self._primary(t, "브리핑 파일 만들기", self._on_briefing, width=200)
+        self.btn_brief.pack(anchor="w", pady=(22, 0))
+        self.b_notice = self._notice(t, "err")
+        self.b_result = ctk.CTkLabel(t, text="", font=F(13), text_color=NAVY, anchor="w", justify="left", wraplength=720)
+        self.b_result.pack(fill="x", pady=(18, 0))
 
     def _fill_last_date(self):
         def work(put):
@@ -373,14 +545,21 @@ class MainWindow:
                 return default_date(app.con)
             finally:
                 app.close()
-        self._run_worker(work, lambda d: self.b_date.set(d) if d else messagebox.showinfo("기준일", "수집된 데이터가 없습니다."))
+
+        def done(d):
+            if d:
+                self.b_date.set(d)
+            else:
+                self._show_notice(self.b_notice, "수집된 데이터가 아직 없습니다. [수집]에서 먼저 수집하세요.")
+        self._run_worker(work, done)
 
     def _on_briefing(self):
+        self.b_notice.pack_forget()
         day, with_json = self.b_date.get().strip(), self.b_json.get()
         if not re.fullmatch(r"\d{8}", day):
-            messagebox.showerror("기준일 오류", "기준일은 YYYYMMDD 형식으로 입력하세요.")
+            self._show_notice(self.b_notice, "기준일은 20261119처럼 숫자 8자리로 입력하세요.")
             return
-        self.b_status.configure(text="만드는 중...")
+        self.b_result.configure(text="만드는 중")
 
         def work(put):
             from .briefing import BriefingError, build
@@ -402,14 +581,15 @@ class MainWindow:
 
     def _briefing_done(self, r):
         if r.get("error"):
-            self.b_status.configure(text="만들지 않았습니다: " + r["error"], style="Err.TLabel")
+            self.b_result.configure(text="")
+            self._show_notice(self.b_notice, "브리핑 파일을 만들지 않았습니다. " + r["error"])
             return
         pkg = r["pkg"]
-        body = (f"기준일 {pkg.date}, 대상 종목 {len(pkg.stocks)}개, 테마 버전 {pkg.theme_version or '없음'}\n"
-                f"잠정값: 시세 {pkg.provisional['price']}종목, 수급 {pkg.provisional['investor']}종목\n\n" +
-                "\n".join(f"저장: {p}" for p in r["paths"]))
-        self.b_status.configure(text=body, style="TLabel")
-        self._result_popup("브리핑 결과", body, r["folder"])
+        lines = [f"기준일 {pkg.date}, 대상 종목 {len(pkg.stocks)}개, 테마 버전 {pkg.theme_version or '없음'}",
+                 f"잠정값: 시세 {pkg.provisional['price']}종목, 수급 {pkg.provisional['investor']}종목"] + \
+                [f"저장: {p}" for p in r["paths"]]
+        self.b_result.configure(text="\n".join(lines))
+        self._result_popup("브리핑 결과", lines, r["folder"])
 
     # ---------------- [테마 관리] ----------------
     def _themes_dir(self) -> Path:
@@ -417,18 +597,20 @@ class MainWindow:
 
     def _build_theme(self):
         t = self.tab_theme
-        ttk.Label(t, text="테마 마스터 파일(theme_master.csv)을 불러오거나 저장합니다. 편집은 엑셀 등에서 하세요.",
-                  style="Muted.TLabel").pack(anchor="w")
-        self.t_info = ttk.Label(t, text="", wraplength=800, justify="left")
-        self.t_info.pack(anchor="w", pady=12)
-        row = ttk.Frame(t)
-        row.pack(anchor="w")
-        ttk.Button(row, text="불러오기...", style="Primary.TButton", command=self._theme_import).pack(side="left")
-        ttk.Button(row, text="다른 이름으로 저장...", command=self._theme_export).pack(side="left", padx=8)
-        ttk.Button(row, text="폴더 열기", command=lambda: L.open_folder(self._themes_dir())).pack(side="left")
-        ttk.Label(t, text="형식: theme,code,name,basis,added_date,note  (종목코드 앞의 0이 지워져도 자동 보정)",
-                  style="Muted.TLabel").pack(anchor="w", pady=12)
-        self._refresh_theme_info()
+        self._title(t, "테마 관리", "테마 마스터 파일을 불러오거나 저장합니다. 내용 편집은 엑셀 등에서 하세요.")
+        self._section(t, "지금 쓰는 파일")
+        self.t_info = ctk.CTkLabel(t, text="", font=F(13), text_color=NAVY, anchor="w", justify="left", wraplength=720)
+        self.t_info.pack(fill="x")
+        row = ctk.CTkFrame(t, fg_color=WHITE)
+        row.pack(fill="x", pady=(22, 0))
+        self._primary(row, "불러오기", self._theme_import, width=150).pack(side="left")
+        self._secondary(row, "다른 이름으로 저장", self._theme_export, width=160).pack(side="left", padx=10)
+        self._secondary(row, "폴더 열기", lambda: L.open_folder(self._themes_dir()), width=110).pack(side="left")
+        self._section(t, "파일 형식")
+        ctk.CTkLabel(t, text="theme,code,name,basis,added_date,note\n"
+                             "HBM,000660,SK하이닉스,사업보고서 주요 제품,2026-11-20,\n\n"
+                             "엑셀이 종목코드 앞의 0을 지워도 자동으로 채웁니다. 불러오면 이전 파일은 history 폴더에 보관합니다.",
+                     font=F(12), text_color=GRAY, anchor="w", justify="left").pack(fill="x")
 
     def _refresh_theme_info(self):
         self.t_info.configure(text=L.theme_summary(self._themes_dir()))
@@ -440,7 +622,7 @@ class MainWindow:
         L.import_theme(Path(src), self._themes_dir(), now_kst())
         self._refresh_theme_info()
         messagebox.showinfo("불러오기", "불러왔습니다. 이전 파일은 themes/history에 보관했습니다.\n"
-                                       "검사 결과(문제 줄)는 다음 브리핑의 6_데이터상태 시트에 나옵니다.")
+                                       "문제 있는 줄은 다음 브리핑의 6_데이터상태 시트에 나옵니다.")
 
     def _theme_export(self):
         dst = filedialog.asksaveasfilename(title="테마 마스터 저장", defaultextension=".csv",
@@ -449,52 +631,56 @@ class MainWindow:
             return
         try:
             L.export_theme(self._themes_dir(), Path(dst))
-            messagebox.showinfo("저장", f"저장했습니다: {dst}")
+            messagebox.showinfo("저장", f"저장했습니다.\n{dst}")
         except FileNotFoundError as exc:
             messagebox.showerror("저장", str(exc))
 
     # ---------------- [설정] ----------------
     def _build_settings(self):
         t = self.tab_settings
-        ttk.Label(t, text="API 키", font=self.f_bold).pack(anchor="w")
-        ttk.Label(t, text=f"설치 폴더의 secret/keys.env에만 저장됩니다. 비워 두면 기존 값을 유지합니다.",
-                  style="Muted.TLabel").pack(anchor="w")
-        grid = ttk.Frame(t)
-        grid.pack(anchor="w", pady=8)
+        self._title(t, "설정")
+        self._section(t, "API 키")
+        ctk.CTkLabel(t, text="설치 폴더의 secret/keys.env에만 저장됩니다. 바꿀 키만 입력하고, 비워 두면 기존 값을 유지합니다.",
+                     font=F(12), text_color=GRAY, anchor="w").pack(fill="x")
+        grid = ctk.CTkFrame(t, fg_color=WHITE)
+        grid.pack(fill="x", pady=(10, 0))
         self.k_vars, self.k_state = {}, {}
         for i, name in enumerate(KEY_NAMES):
-            ttk.Label(grid, text=name).grid(row=i, column=0, sticky="w", pady=3)
+            ctk.CTkLabel(grid, text=name, font=F(13), text_color=NAVY, width=150, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
             v = tk.StringVar()
-            ttk.Entry(grid, textvariable=v, show="•", width=44).grid(row=i, column=1, padx=8)
-            s = ttk.Label(grid, text="", style="Muted.TLabel")
+            self._entry(grid, v, width=360, show="•").grid(row=i, column=1, padx=10)
+            s = ctk.CTkLabel(grid, text="", font=F(12), anchor="w")
             s.grid(row=i, column=2, sticky="w")
             self.k_vars[name], self.k_state[name] = v, s
-        ttk.Button(t, text="키 저장", style="Primary.TButton", command=self._save_keys).pack(anchor="w")
+        self._primary(t, "키 저장", self._save_keys, width=120).pack(anchor="w", pady=(12, 0))
         self._refresh_key_state()
-        ttk.Separator(t).pack(fill="x", pady=16)
-        row = ttk.Frame(t)
-        row.pack(anchor="w")
-        ttk.Label(row, text="글자 크기", font=self.f_bold).pack(side="left")
-        cur = self.settings.get("GUI_FONT_SCALE") or "1.0"
+
+        self._section(t, "글자 크기")
         labels = [f"{lbl} ({v}배)" for v, lbl in SCALES]
+        cur = self.settings.get("GUI_FONT_SCALE") or "1.0"
         self.s_scale = tk.StringVar(value=next((l for l, (v, _) in zip(labels, SCALES) if v == cur), labels[0]))
-        cb = ttk.Combobox(row, textvariable=self.s_scale, values=labels, state="readonly", width=16)
-        cb.pack(side="left", padx=8)
-        cb.bind("<<ComboboxSelected>>", self._on_scale)
-        ttk.Separator(t).pack(fill="x", pady=16)
-        row2 = ttk.Frame(t)
-        row2.pack(anchor="w")
-        ttk.Button(row2, text="작업 이력", command=self._show_history).pack(side="left")
-        ttk.Button(row2, text="데이터 폴더 열기",
-                   command=lambda: L.open_folder(paths.data_dir(load_settings(self.install)))).pack(side="left", padx=8)
-        ttk.Label(t, text="업데이트할 때 새 zip을 같은 위치에 덮어쓰세요. secret 폴더와 config/settings.env는 지우지 마세요.",
-                  style="Warn.TLabel").pack(anchor="w", pady=16)
+        srow = ctk.CTkFrame(t, fg_color=WHITE)
+        srow.pack(fill="x")
+        for lbl in labels:
+            ctk.CTkRadioButton(srow, text=lbl, value=lbl, variable=self.s_scale, command=self._on_scale, font=F(13),
+                               text_color=NAVY, fg_color=COBALT, hover_color=COBALT_DARK, border_color=GRAY,
+                               radiobutton_width=18, radiobutton_height=18).pack(side="left", padx=(0, 24))
+
+        self._section(t, "기록과 폴더")
+        row = ctk.CTkFrame(t, fg_color=WHITE)
+        row.pack(fill="x")
+        self._secondary(row, "작업 이력", self._show_history, width=120).pack(side="left")
+        self._secondary(row, "데이터 폴더 열기",
+                        lambda: L.open_folder(paths.data_dir(load_settings(self.install))), width=140).pack(side="left", padx=10)
+        note = self._notice(t, "warn")
+        note.label.configure(text="업데이트할 때 새 zip을 같은 위치에 덮어쓰세요. secret 폴더와 config/settings.env는 지우지 마세요.")
+        note.pack(fill="x", pady=(24, 0))
 
     def _refresh_key_state(self):
         keys = load_keys(self.install)
         for name, lbl in self.k_state.items():
             v = keys.get(name)
-            lbl.configure(text=f"저장됨 ({mask(v)})" if v else "없음", style="Muted.TLabel" if v else "Err.TLabel")
+            lbl.configure(text=f"저장됨 {mask(v)}" if v else "없음", text_color=GRAY if v else RED)
 
     def _save_keys(self):
         keys = load_keys(self.install)
@@ -507,19 +693,20 @@ class MainWindow:
                 changed.append(name)
                 var.set("")
         if not changed:
-            messagebox.showinfo("키 저장", "입력된 키가 없습니다.")
+            messagebox.showinfo("키 저장", "바꿀 키를 입력한 뒤 눌러 주세요.")
             return
         save_keys(self.install, keys)
         self._refresh_key_state()
+        self._refresh_nav_note()
         messagebox.showinfo("키 저장", "저장했습니다: " + ", ".join(changed))
 
-    def _on_scale(self, _evt=None):
+    def _on_scale(self):
         label = self.s_scale.get()
         value = next(v for v, lbl in SCALES if label.startswith(lbl))
         set_setting(self.install, "GUI_FONT_SCALE", value)
         self.settings["GUI_FONT_SCALE"] = value
-        self._fonts()
-        self._style()
+        self.scale = float(value)
+        ctk.set_widget_scaling(self.scale)
 
     def _show_history(self):
         def work(put):
@@ -530,29 +717,45 @@ class MainWindow:
                 app.close()
 
         def show(rows):
-            w = tk.Toplevel(self.root)
+            w = ctk.CTkToplevel(self.root)
             w.title("작업 이력")
-            w.geometry("900x420")
-            cols = [("started", "수집 일시", 140), ("target", "대상 기간", 150), ("kinds", "데이터 종류", 100),
-                    ("result", "결과", 80), ("off_hours", "시간대 밖", 70), ("calls", "호출 수", 70)]
-            tv = ttk.Treeview(w, columns=[c for c, *_ in cols], show="headings")
+            w.configure(fg_color=WHITE)
+            w.geometry("920x460")
+            w.transient(self.root)
+            ctk.CTkLabel(w, text="작업 이력", font=F(18, "bold"), text_color=NAVY, anchor="w").pack(fill="x", padx=24, pady=(20, 4))
+            ctk.CTkLabel(w, text="줄을 두 번 누르면 그 실행의 요약을 봅니다.", font=F(12), text_color=GRAY, anchor="w").pack(fill="x", padx=24)
+            st = ttk.Style(w)
+            try:
+                st.theme_use("clam")
+            except tk.TclError:
+                pass
+            st.configure("H.Treeview", background=WHITE, fieldbackground=WHITE, foreground=NAVY,
+                         rowheight=int(26 * self.scale), font=(FONT, int(10 * self.scale)), borderwidth=0)
+            st.configure("H.Treeview.Heading", background=SURFACE, foreground=NAVY, font=(FONT, int(10 * self.scale), "bold"),
+                         relief="flat")
+            st.map("H.Treeview", background=[("selected", COBALT)], foreground=[("selected", WHITE)])
+            cols = [("started", "수집 일시", 140), ("target", "대상 기간", 170), ("kinds", "데이터 종류", 110),
+                    ("result", "결과", 90), ("off_hours", "시간대 밖", 80), ("calls", "호출 수", 80)]
+            tv = ttk.Treeview(w, columns=[c for c, *_ in cols], show="headings", style="H.Treeview")
             for c, title, width in cols:
-                tv.heading(c, text=title)
+                tv.heading(c, text=title, anchor="w")
                 tv.column(c, width=width, anchor="w")
             for i, r in enumerate(rows):
                 tv.insert("", "end", iid=str(i), values=[r[c] for c, *_ in cols])
-            tv.pack(fill="both", expand=True, padx=12, pady=12)
-            ttk.Label(w, text="줄을 두 번 누르면 실행 요약을 봅니다.", style="Muted.TLabel").pack(anchor="w", padx=12, pady=(0, 8))
+            tv.pack(fill="both", expand=True, padx=24, pady=16)
             tv.bind("<Double-1>", lambda e: tv.selection() and self._result_popup(
-                "실행 요약", "\n".join(rows[int(tv.selection()[0])]["summary"]) or "(요약 없음)",
+                "실행 요약", rows[int(tv.selection()[0])]["summary"] or ["(요약 없음)"],
                 paths.data_dir(load_settings(self.install)) / "logs"))
 
         self._run_worker(work, show)
 
 
 def run_gui() -> int:
-    L.hide_console_on_windows()
-    root = tk.Tk()
+    if sys.stdout is None:  # 창 전용 exe에는 콘솔이 없다
+        import os
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    load_fonts()
+    root = ctk.CTk()
     MainWindow(root)
     root.mainloop()
     return 0

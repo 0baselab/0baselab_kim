@@ -265,7 +265,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command:
             code = COMMANDS[args.command](args)
-        else:  # 인자 없이 실행(더블클릭) -> GUI. 터미널 메뉴는 `menu` 명령으로
+        elif getattr(sys, "frozen", False):  # 명령줄용 exe를 인자 없이 실행 -> 터미널 메뉴
+            args.command = "menu"
+            code = menu()
+        else:  # 코드로 실행(python -m collector) -> GUI
             from .gui import run_gui
             return run_gui()
     except KeyboardInterrupt:

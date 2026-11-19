@@ -62,20 +62,19 @@ jobs:
         if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: python -m pytest -q
 
-      - name: PyInstaller 빌드 (--onedir)
+      - name: PyInstaller 빌드 (--onedir, GUI exe + 명령줄 exe)
         if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
-        run: |
-          python -m PyInstaller --noconfirm --clean --onedir --console `
-            --name 주식데이터수집기 `
-            --collect-data tzdata `
-            run_collector.py
+        run: python -m PyInstaller --noconfirm --clean packaging/collector.spec
 
       - name: 실행 확인 (--version)
         if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
         run: |
-          $out = & "dist/주식데이터수집기/주식데이터수집기.exe" --version
+          $out = & "dist/주식데이터수집기/주식데이터수집기-명령.exe" --version
           Write-Output $out
           if ($out -ne "${{ steps.ver.outputs.version }}") { throw "버전 불일치: $out" }
+          if (-not (Test-Path "dist/주식데이터수집기/주식데이터수집기.exe")) { throw "GUI exe 없음" }
+          $f = Get-ChildItem -Recurse "dist/주식데이터수집기" -Filter "Pretendard-Regular.ttf"
+          if (-not $f) { throw "Pretendard 글꼴이 들어가지 않음" }
 
       - name: zip 만들기
         id: zip

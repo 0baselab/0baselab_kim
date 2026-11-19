@@ -88,29 +88,34 @@ def test_theme_import_export(tmp_path):
 
 @pytest.mark.skipif(not os.environ.get("DISPLAY"), reason="화면(DISPLAY) 없음")
 def test_gui_smoke(install, monkeypatch):
-    import tkinter as tk
+    import customtkinter as ctk
     from collector import gui, paths
     monkeypatch.setattr(paths, "install_dir", lambda: install)
     monkeypatch.setattr(gui.paths, "install_dir", lambda: install)
     monkeypatch.setattr(gui.messagebox, "showwarning", lambda *a, **k: None)
-    root = tk.Tk()
+    assert gui.load_fonts() and gui.FONT == "Pretendard"
+    root = ctk.CTk()
     w = gui.MainWindow(root)
-    for tab in (w.tab_collect, w.tab_brief, w.tab_theme, w.tab_settings):
-        w.nb.select(tab)
+    for key in ("collect", "brief", "theme", "settings"):
+        w.show(key)
         root.update()
-    assert "테마 마스터" in w.t_info.cget("text") or "theme_master" in w.t_info.cget("text")
+    assert "theme_master" in w.t_info.cget("text") or "테마 마스터" in w.t_info.cget("text")
     w._log("  KRX 20/100 (20261118 trade_KOSPI)")
-    assert int(w.progress["value"]) == 20
+    assert abs(w.progress.get() - 0.2) < 1e-6
     w.s_scale.set("크게 (1.2배)")
     w._on_scale()
     assert w.scale == 1.2
+    w._on_collect.__func__  # 존재 확인
+    w.c_start.set("2026111")
+    w._on_collect()
+    assert "기간을 확인하세요" in w.c_notice.label.cget("text")
     root.destroy()
 
 
 @pytest.mark.skipif(not os.environ.get("DISPLAY"), reason="화면(DISPLAY) 없음")
 def test_gui_collect_and_briefing_flow(install, monkeypatch):
     import time
-    import tkinter as tk
+    import customtkinter as ctk
     from collector import app as app_mod, gui, paths
     kis_settings(install)
     m = FakeMarket()
@@ -122,8 +127,9 @@ def test_gui_collect_and_briefing_flow(install, monkeypatch):
     monkeypatch.setattr(gui, "now_kst", lambda: NOW)
     monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
     popups = []
-    monkeypatch.setattr(gui.MainWindow, "_result_popup", lambda self, t, body, folder: popups.append((t, body)))
-    root = tk.Tk()
+    monkeypatch.setattr(gui.MainWindow, "_result_popup",
+                        lambda self, t, lines, folder, failures=None, stopped=None: popups.append((t, "\n".join(lines))))
+    root = ctk.CTk()
     w = gui.MainWindow(root)
 
     def wait():
