@@ -15,8 +15,8 @@ MENU = [
     ("1", "당일 수집", "daily"),
     ("2", "기간 수집", "range"),
     ("3", "브리핑 패키지 생성", "briefing"),
-    ("4", "DART 수집", None),
-    ("5", "DART 구글 시트용 내보내기", None),
+    ("4", "DART 수집", "dart"),
+    ("5", "DART 구글 시트용 내보내기", "dart-export"),
     ("6", "상태 점검", "status"),
     ("7", "실측 검증", "verify"),
 ]
@@ -118,6 +118,58 @@ def cmd_unclassified(args) -> int:
         app.close()
 
 
+def cmd_dart(args) -> int:
+    from .app import start
+    from .dart import DartClient
+    from .dart_collect import run
+    from .lock import AlreadyRunning
+
+    try:
+        app = start()
+    except AlreadyRunning as exc:
+        print(exc)
+        return 1
+    try:
+        key = app.keys.get("DART_API_KEY")
+        if not key:
+            print("DART_API_KEY가 없습니다. 상태 점검(6번)에서 입력하세요.")
+            return 1
+        api = app.http_factory("DART", float(app.settings.get("DART_CALLS_PER_SEC") or 5))
+        dart = DartClient(api, app.settings["DART_BASE_URL"], key)
+        base_day = app.con.execute("SELECT MAX(date) FROM universe_daily").fetchone()[0]
+        targets = {r[0] for r in app.con.execute(
+            "SELECT code FROM universe_daily WHERE date=? AND in_universe=1", (base_day,))} if base_day else set()
+        if not targets:
+            print("대상 종목이 없습니다. 먼저 당일 수집(1번)을 실행하세요.")
+            return 1
+        limit = int(app.settings.get("DART_DAILY_LIMIT") or 18000)
+        st = run(app.con, dart, app.root, app.now, limit, targets, progress=print)
+        lines = [f"DART: 호출 {st.calls}회, 새 공시 {st.filings}건(정기보고서 {st.periodic_new}),",
+                 f"  재무 받음 {st.fs_ok}, 자료 없음 {st.fs_nodata}, 실패 {st.fs_failed}, 분기 계산 {st.quarters}행,",
+                 f"  12월 결산이 아니어서 건너뜀 {st.skipped_fy}건, 남은 정기보고서 {st.remaining}건"]
+        if st.stopped:
+            lines.append("  " + st.stopped)
+        lines += [f"  - {e}" for e in st.errors[:10]]
+        print("\n".join(lines))
+        return 0
+    finally:
+        app.close()
+
+
+def cmd_dart_export(args) -> int:
+    from .app import start
+    from .dart_export import export
+
+    app = start()
+    try:
+        for p in export(app.con, app.dirs["dart_export"], app.now()):
+            print(f"저장: {p}")
+        print("구글 시트: 파일 > 가져오기 > 업로드 > '현재 시트 바꾸기'로 올리세요.")
+        return 0
+    finally:
+        app.close()
+
+
 def cmd_status(args) -> int:
     from .app import start
     from .lock import AlreadyRunning
@@ -172,7 +224,7 @@ def cmd_verify(args=None) -> int:
 
 
 COMMANDS = {"daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
-            "unclassified": cmd_unclassified, "verify": cmd_verify}
+            "unclassified": cmd_unclassified, "dart": cmd_dart, "dart-export": cmd_dart_export, "verify": cmd_verify}
 
 
 def menu() -> int:
@@ -196,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="주식데이터수집기")
     parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
                         help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
-                             "unclassified(미분류 반복 등장 CSV) / verify(실측 검증)")
+                             "unclassified(미분류 반복 등장 CSV) / dart(DART 수집) / dart-export(구글 시트용 CSV) / verify(실측 검증)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
     parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")

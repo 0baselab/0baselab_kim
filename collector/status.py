@@ -36,6 +36,14 @@ def report(app: App) -> list[str]:
     for mk in ("KOSPI", "KOSDAQ"):
         last = con.execute("SELECT MAX(date) FROM market_investor_daily WHERE market=?", (mk,)).fetchone()[0]
         L.append(f"KIS 시장별 수급 {mk}: 마지막 {last or '-'}")
+    d_last = con.execute("SELECT MAX(rcept_dt) FROM dart_filings").fetchone()[0]
+    d_q = con.execute("SELECT COUNT(*), COUNT(DISTINCT corp_code) FROM dart_fs_quarter").fetchone()
+    d_left = con.execute("SELECT COUNT(*) FROM dart_filings f WHERE is_periodic=1 AND reprt_code IS NOT NULL AND NOT EXISTS"
+                         " (SELECT 1 FROM collect_log c WHERE c.source='DART' AND c.dataset='fs' AND c.unit_key=f.rcept_no"
+                         " AND c.status IN ('success','empty'))").fetchone()[0]
+    d_used = con.execute("SELECT value FROM meta WHERE key=?", (f"dart_calls_{today}",)).fetchone()
+    L.append(f"DART: 마지막 공시 접수일 {d_last or '-'}, 분기 재무 {d_q[0]}행({d_q[1]}개사), "
+             f"아직 안 받은 정기보고서 {d_left}건, 오늘 호출 {d_used[0] if d_used else 0}회")
     admin = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_admin=1").fetchone()[0]
     halted = con.execute("SELECT COUNT(*) FROM stock_master WHERE is_halted=1").fetchone()[0]
     L.append(f"KIS 주식기본조회: 관리종목 {admin}개, 거래정지 {halted}개")

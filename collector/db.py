@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -109,6 +109,27 @@ CREATE TABLE IF NOT EXISTS adj_price_daily (
     open REAL, high REAL, low REAL, close REAL,
     source TEXT, fetched_at TEXT, raw_file TEXT,
     PRIMARY KEY (code, date));
+""",
+    5: """
+CREATE TABLE IF NOT EXISTS dart_corp (
+    corp_code TEXT PRIMARY KEY, stock_code TEXT, corp_name TEXT, modify_date TEXT, fetched_at TEXT);
+CREATE INDEX IF NOT EXISTS dart_corp_stock ON dart_corp(stock_code);
+CREATE TABLE IF NOT EXISTS dart_filings (
+    rcept_no TEXT PRIMARY KEY, corp_code TEXT, stock_code TEXT, corp_name TEXT, report_nm TEXT, rcept_dt TEXT,
+    pblntf_ty TEXT, is_correction INTEGER, is_periodic INTEGER, fiscal_year TEXT, reprt_code TEXT,
+    fetched_at TEXT, raw_file TEXT);
+CREATE TABLE IF NOT EXISTS dart_fs_raw (
+    rcept_no TEXT NOT NULL, fs_div TEXT NOT NULL, sj_div TEXT NOT NULL, account_id TEXT NOT NULL, ord INTEGER NOT NULL,
+    account_nm TEXT, thstrm_nm TEXT, thstrm_amount TEXT, thstrm_add_amount TEXT, currency TEXT,
+    fetched_at TEXT, raw_file TEXT,
+    PRIMARY KEY (rcept_no, fs_div, sj_div, account_id, ord));
+CREATE TABLE IF NOT EXISTS dart_fs_quarter (
+    corp_code TEXT NOT NULL, fiscal_year TEXT NOT NULL, quarter INTEGER NOT NULL, fs_div TEXT NOT NULL,
+    revenue_krw INTEGER, op_income_krw INTEGER, net_income_krw INTEGER,
+    assets_krw INTEGER, liabilities_krw INTEGER, equity_krw INTEGER, ocf_krw INTEGER,
+    revenue_cum_krw INTEGER, op_income_cum_krw INTEGER, net_income_cum_krw INTEGER, ocf_cum_krw INTEGER,
+    rcept_no TEXT, rcept_dt TEXT, calc_note TEXT, updated_at TEXT,
+    PRIMARY KEY (corp_code, fiscal_year, quarter, fs_div));
 """,
 }
 
