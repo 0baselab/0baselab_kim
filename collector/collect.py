@@ -66,14 +66,35 @@ def krx_targets(app: App, mode: str, start: str | None = None, end: str | None =
     return sorted(days, reverse=True)  # 최근 날짜부터
 
 
+RECOMMENDED_START, RECOMMENDED_END = 20 * 60 + 30, 22 * 60  # 권장 수집 시간 20:30~22:00 (UI/UX 결정사항)
+
+
+def in_recommended_window(now) -> bool:
+    hm = now.hour * 60 + now.minute
+    return RECOMMENDED_START <= hm <= RECOMMENDED_END
+
+
+def requeue_off_hours(con) -> int:
+    """'시간대 밖' 표시가 있는 성공 기록을 다시 받을 대상으로 돌린다 (provisional = 다시 받아 비교)."""
+    cur = con.execute("UPDATE collect_log SET status='provisional' WHERE off_hours=1 AND status='success'")
+    return cur.rowcount
+
+
 def run_collect(app: App, mode: str = "daily", start: str | None = None, end: str | None = None,
                 force: bool = False, confirm: Callable[[str], bool] = lambda q: True,
-                out: Callable[[str], None] = print) -> RunResult:
+                out: Callable[[str], None] = print, do_krx: bool = True, do_kis: bool = True,
+                refetch_off_hours: bool = False) -> RunResult:
     res = RunResult()
     run_id = stamp(app.started)
     t0 = app.now()
-    app.con.execute("INSERT OR REPLACE INTO run_log(run_id, mode, version, started_at) VALUES(?,?,?,?)",
-                    (run_id, mode, __version__, t0.isoformat(timespec="seconds")))
+    off = 0 if in_recommended_window(t0) else 1
+    kinds = ",".join(k for k, on in (("KRX", do_krx), ("KIS", do_kis)) if on)
+    target = "당일" if mode == "daily" else f"{start}~{end}"
+    app.con.execute("INSERT OR REPLACE INTO run_log(run_id, mode, version, started_at, target, kinds, off_hours)"
+                    " VALUES(?,?,?,?,?,?,?)", (run_id, mode, __version__, t0.isoformat(timespec="seconds"), target, kinds, off))
+    if refetch_off_hours:
+        n = requeue_off_hours(app.con)
+        res.add(f"시간대 밖 표시 기록 {n}건을 다시 받습니다.")
     res.add(f"주식데이터수집기 {__version__} / {'당일' if mode == 'daily' else '기간'} 수집 ({t0.strftime('%Y-%m-%d %H:%M')})")
     retention = max(_int(app.settings, "KRX_RETENTION_DAYS", 260), _int(app.settings, "KIS_RETENTION_DAYS", 120))
     try:
@@ -85,8 +106,10 @@ def run_collect(app: App, mode: str = "daily", start: str | None = None, end: st
         if not days:
             res.add("수집할 거래일이 없습니다. 거래일 달력이 비어 있으면 15:40~23:59에 다시 실행해 보세요 "
                     "(KIS 지수 API의 조회 가능 시각은 아직 확인되지 않았습니다).")
-        _run_krx(app, res, days, force, confirm, out)
-        _run_kis(app, res, confirm, out)
+        if do_krx:
+            _run_krx(app, res, days, force, confirm, out)
+        if do_kis:
+            _run_kis(app, res, confirm, out)
     except (KisAuthError, krx_collect.KrxAuthError) as exc:
         res.stopped = str(exc)
         res.errors += 1
@@ -95,6 +118,9 @@ def run_collect(app: App, mode: str = "daily", start: str | None = None, end: st
         res.stopped = "사용자 중단"
         res.add("사용자가 중단했습니다. 진행 중이던 단위만 버렸고, 다음 실행 때 이어서 받습니다.")
     finally:
+        if off:  # 권장 시간대(20:30~22:00) 밖에서 받은 기록에 표시
+            app.con.execute("UPDATE collect_log SET off_hours=1 WHERE updated_at >= ? AND source IN ('KRX','KIS')",
+                            (t0.isoformat(timespec="seconds"),))
         _finish(app, res, run_id, t0)
     return res
 

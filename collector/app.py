@@ -57,7 +57,7 @@ class App:
 
 def start(*, install: Path | None = None, now: Callable[[], datetime] = now_kst,
           http_factory: Callable[[str, float], ApiClient] | None = None,
-          ask_key=None, out: Callable[[str], None] = print) -> App:
+          ask_key=None, out: Callable[[str], None] = print, prompt_keys: bool = True) -> App:
     install = install or paths.install_dir()
     settings = load_settings(install)
     root = paths.data_dir(settings)
@@ -67,7 +67,11 @@ def start(*, install: Path | None = None, now: Callable[[], datetime] = now_kst,
     dirs = paths.ensure_data_dirs(root)
     started = now()
     log_path = setup_logging(dirs["logs"], stamp(started))
-    keys = ensure_keys(install, **({"ask": ask_key} if ask_key else {}), out=out)
+    if prompt_keys:
+        keys = ensure_keys(install, **({"ask": ask_key} if ask_key else {}), out=out)
+    else:  # GUI: 콘솔에서 묻지 않고, 빠진 키는 [설정] 탭에서 입력
+        from .secrets import load_keys
+        keys = load_keys(install)
     lock = Lock(dirs["system"] / "collector.lock")
     lock.acquire()
     try:
