@@ -80,3 +80,16 @@ def ensure_verify_dirs(root: Path) -> dict[str, Path]:
     for p in dirs.values():
         p.mkdir(parents=True, exist_ok=True)
     return dirs
+
+
+DATA_SUBDIRS = ["db", "raw", "briefing", "dart_export", "themes", "themes/history", "logs", "backup", "system"]
+
+
+def ensure_data_dirs(root: Path) -> dict[str, Path]:
+    """명세서 3.2의 폴더 구조. 없으면 만든다."""
+    dirs = {"root": root}
+    for sub in DATA_SUBDIRS:
+        p = root.joinpath(*sub.split("/"))
+        p.mkdir(parents=True, exist_ok=True)
+        dirs[sub] = p
+    return dirs
