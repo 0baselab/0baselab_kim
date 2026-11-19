@@ -89,16 +89,20 @@ def test_themes_versions_and_problems(filled):
                    "HBM,5930,앞0빠짐,근거,2026-11-20,\n"
                    "HBM,005935,우선주,근거,2026-11-20,\n"
                    "HBM,999999,없음,근거,2026-11-20,\n"
-                   "HBM,000660,,,2026-11-20,\n", encoding="utf-8-sig")
+                   "HBM,000660,,,2026-11-20,\n"
+                   "AI,12AB,형식오류,근거,2026-11-20,\n"
+                   "AI,5930,앞0빠짐2,근거,2026-11-20,\n", encoding="utf-8-sig")
     pkg = build(con, "20261119", td, NOW)
     assert pkg.theme_version == 1
-    t = pkg.themes[0]
+    t = next(x for x in pkg.themes if x["theme"] == "HBM")
     assert (t["theme"], t["stocks"], t["ret_1d_pct_median"]) == ("HBM", 2, 1.5)
     assert t["frgn_net_amt_mil_1d"] == 24
     probs = {r["detail"] for r in pkg.status if r["kind"] == "테마 CSV 문제"}
-    assert probs == {"같은 (theme, code) 중복", "종목코드 형식 오류 (영문 대문자·숫자 6자리. 엑셀이 앞의 0을 지웠는지 확인)",
+    assert probs == {"같은 (theme, code) 중복", "종목코드 형식 오류 (영문 대문자·숫자 6자리)",
                      "분석 대상에서 제외된 종목", "없는 종목코드", "빈 필수 칸: basis"}
-    assert stock(pkg, "005930")["themes"] == "HBM"
+    fixes = [r["detail"] for r in pkg.status if r["kind"] == "자동 보정"]
+    assert fixes == ["종목코드 5930 -> 005930", "종목코드 5930 -> 005930"]
+    assert stock(pkg, "005930")["themes"] == "AI;HBM"  # 보정된 줄은 그대로 반영
     assert all(u["code"] not in ("005930", "247540") for u in pkg.unclassified)
     assert build(con, "20261119", td, NOW).theme_version == 1  # 같은 파일 -> 같은 버전
     csv.write_text(csv.read_text(encoding="utf-8-sig") + "AI,0041B0,신규,근거,2026-11-20,\n", encoding="utf-8-sig")
@@ -128,3 +132,38 @@ def test_write_xlsx_json_and_unclassified(filled):
     record_unclassified(con, pkg)
     p = export_unclassified_repeats(con, filled.parent / "data" / "briefing", NOW)
     assert p.read_text(encoding="utf-8-sig").startswith("code,name,days_listed")
+
+
+def test_adjusted_price_used_for_corp_action(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.share_change = {"005930": "20261113"}
+    collect(install, m)
+    con = reopen(install)
+    assert m.adj_calls >= 1
+    assert con.execute("SELECT COUNT(*) FROM adj_price_daily WHERE code='005930'").fetchone()[0] > 0
+    # 원본 가격은 그대로
+    assert con.execute("SELECT close FROM price_daily WHERE code='005930' AND date='20261112'").fetchone()[0] == 1000
+    pkg = build(con, "20261118", themes_dir(install), NOW)
+    s = stock(pkg, "005930")
+    assert s["close"] == 1000  # 원본
+    # 수정주가: 11/13 이전 500, 이후 1000 -> 5일 전(11/11) 500 대비 +100%
+    assert s["ret_5d_pct"] == 100.0
+    assert "수정주가 사용" in s["missing_note"]
+    # 다시 수집해도 같은 변경일이면 재조회하지 않음
+    n = m.adj_calls
+    collect(install, m, now=NOW.replace(minute=50))
+    assert m.adj_calls == n
+
+
+def test_adjusted_price_failure_blanks(install):
+    kis_settings(install)
+    m = FakeMarket()
+    m.share_change = {"005930": "20261113"}
+    m.adj_fail = True
+    collect(install, m)
+    con = reopen(install)
+    pkg = build(con, "20261118", themes_dir(install), NOW)
+    s = stock(pkg, "005930")
+    assert s["ret_5d_pct"] is None
+    assert "수정주가 없음" in s["missing_note"] and "상장주식수 변경 20261113" in s["missing_note"]

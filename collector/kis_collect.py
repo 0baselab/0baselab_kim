@@ -15,8 +15,9 @@ from typing import Callable
 
 from . import db
 from . import trading_calendar as cal
-from .kis import (INDEX_DAILY, INVESTOR_BY_STOCK, MARKET_INVESTOR, STOCK_INFO, KisClient, index_daily_params,
-                  investor_params, investor_window_ok, is_ok, market_investor_params, stock_info_params)
+from .kis import (ADJ_PRICE, INDEX_DAILY, INVESTOR_BY_STOCK, MARKET_INVESTOR, STOCK_INFO, KisClient, index_daily_params,
+                  investor_params, investor_window_ok, is_ok, market_investor_params, stock_info_params,
+                  adj_price_params)
 from .http import ApiError
 from .krx_collect import to_float, to_int
 from .rawstore import save_raw
@@ -192,8 +193,11 @@ def _save_price(con, d, code, r, today, prev, ts, raw) -> None:
     new["value_krw"] = to_int(r.get("acml_tr_pbmn"))  # 실측: 원 단위
     # 시가총액(잠정) = 직전 거래일 KRX 상장주식수 × 종가
     base_day = cal.prev_open(con, d) if d == today else d
-    shares_row = con.execute("SELECT list_shares FROM krx_base_daily WHERE code=? AND date<=? ORDER BY date DESC LIMIT 1",
-                             (code, base_day or d)).fetchone()
+    # KRX 일별매매정보의 LIST_SHRS를 먼저 쓰고(기업행동 판단과 같은 출처), 없으면 종목기본정보
+    shares_row = con.execute("SELECT listed_shares FROM price_daily WHERE code=? AND date<=? AND source='KRX'"
+                             " AND listed_shares IS NOT NULL ORDER BY date DESC LIMIT 1", (code, base_day or d)).fetchone() \
+        or con.execute("SELECT list_shares FROM krx_base_daily WHERE code=? AND date<=? ORDER BY date DESC LIMIT 1",
+                       (code, base_day or d)).fetchone()
     shares = shares_row[0] if shares_row else None
     new["listed_shares"] = shares
     new["mktcap_krw"] = int(round(shares * new["close"])) if shares is not None and new["close"] is not None else None
@@ -363,3 +367,78 @@ def _save_market(con, d, market, r, today, ts, raw) -> None:
         " index_close, detail_json, is_provisional, source, fetched_at, raw_file) VALUES(?,?,?,?,?,?,?,?,?,?,?,'KIS',?,?)",
         (d, market, *[new[c] for c in MKT_COLS], to_float(r.get("bstp_nmix_prpr")), json.dumps(r, ensure_ascii=False),
          1 if d == today else 0, ts, raw))
+
+
+# ---------------------------------------------------------------------------
+# 수정주가 재조회 (명세서 8.4): 상장주식수가 바뀐 종목만. 원본 price_daily는 건드리지 않는다.
+# ---------------------------------------------------------------------------
+ADJ_WINDOW = 251  # 250일 수익률에 필요한 거래일 수
+ADJ_CHUNK = 100   # 1회 최대 100건 (KIS 문서)
+
+
+def latest_share_changes(con, day: str, codes: list[str] | None = None) -> dict[str, str]:
+    """day까지 최근 ADJ_WINDOW 거래일 안에서 상장주식수가 마지막으로 바뀐 날 (종목별)."""
+    days = sorted(r[0] for r in con.execute(
+        "SELECT date FROM trading_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT ?", (day, ADJ_WINDOW)))
+    if not days:
+        return {}
+    out: dict[str, str] = {}
+    prev: dict[str, int] = {}
+    for r in con.execute("SELECT code, date, listed_shares FROM price_daily WHERE date BETWEEN ? AND ?"
+                         " AND listed_shares IS NOT NULL ORDER BY code, date", (days[0], days[-1])):
+        c = r["code"]
+        if c in prev and prev[c] != r["listed_shares"]:
+            out[c] = r["date"]
+        prev[c] = r["listed_shares"]
+    if codes is not None:
+        keep = set(codes)
+        out = {c: d for c, d in out.items() if c in keep}
+    return out
+
+
+def collect_adjusted(con, kis: KisClient, root, codes: list[str], now_fn) -> tuple[int, int, int]:
+    """기업행동 의심 종목의 수정주가 250거래일. (받음, 실패, 이미 받음) 개수."""
+    today = now_fn().strftime("%Y%m%d")
+    changes = latest_share_changes(con, today, codes)
+    days = sorted(r[0] for r in con.execute(
+        "SELECT date FROM trading_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT ?", (today, ADJ_WINDOW)))
+    ok = fail = skip = 0
+    for code, changed in sorted(changes.items()):
+        key = f"{code}|{changed}"
+        if db.get_status(con, "KIS", "adj_price", key) == "success":
+            skip += 1
+            continue
+        if not investor_window_ok(now_fn()):
+            break
+        now = now_fn()
+        ts = now.isoformat(timespec="seconds")
+        rows, raws, err = {}, [], None
+        for i in range(0, len(days), ADJ_CHUNK):
+            chunk = days[i:i + ADJ_CHUNK]
+            try:
+                body = kis.get(ADJ_PRICE, adj_price_params(code, chunk[0], chunk[-1])).body
+            except ApiError as exc:
+                err = str(exc)[:200]
+                break
+            raws.append(save_raw(root, "kis", f"adj_price_{code}", chunk[-1], body, now))
+            if not is_ok(body):
+                err = f"{body.get('msg_cd')} {body.get('msg1')}"
+                break
+            for r in body.get("output2") or []:
+                d = r.get("stck_bsop_date")
+                if d and chunk[0] <= d <= chunk[-1]:
+                    rows[d] = r
+        with db.Tx(con):
+            if err or not rows:
+                db.set_status(con, "KIS", "adj_price", key, "failed" if err else "empty", ts, err,
+                              raws[-1] if raws else None)
+                fail += 1
+                continue
+            con.execute("DELETE FROM adj_price_daily WHERE code=?", (code,))
+            for d, r in rows.items():
+                con.execute("INSERT INTO adj_price_daily VALUES(?,?,?,?,?,?,?,'KIS',?,?)",
+                            (code, d, changed, to_float(r.get("stck_oprc")), to_float(r.get("stck_hgpr")),
+                             to_float(r.get("stck_lwpr")), to_float(r.get("stck_clpr")), ts, raws[0]))
+            db.set_status(con, "KIS", "adj_price", key, "success", ts, None, raws[0])
+        ok += 1
+    return ok, fail, skip

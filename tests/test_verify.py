@@ -93,7 +93,7 @@ def test_disallowed_tr_id_blocked(tmp_path):
 
 
 def test_only_query_tr_ids_allowed():
-    assert kis_mod.ALLOWED_TR_IDS == {"FHPTJ04160001", "CTCA0903R", "CTPF1002R", "FHPUP02120000", "FHPTJ04040000"}
+    assert kis_mod.ALLOWED_TR_IDS == {"FHPTJ04160001", "CTCA0903R", "CTPF1002R", "FHPUP02120000", "FHPTJ04040000", "FHKST03010100"}
 
 
 def test_before_1540_skips_investor_items(env):
