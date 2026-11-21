@@ -43,6 +43,16 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 - 실패가 20건 쌓이면 중단합니다. 토큰 오류는 1회만 재발급 후 재시도하고, 그래도 실패하면 즉시 중단합니다.
 - 봉이 0개인 날(거래정지 등)도 완료로 기록되며 `done.n_bars=0`으로 구분됩니다.
 
+### jobs의 대상 범위(보통주) 정하는 방법
+
+날짜마다 아래 중 하나를 쓰고, `job_days` 테이블과 로그에 날짜별로 기록합니다. 미래 날짜의 범위는 쓰지 않습니다.
+
+| method | 언제 | 내용 |
+|---|---|---|
+| `universe` | 기존 DB에 그날 `universe_daily`가 있음 | 그날 범위 그대로 |
+| `past_universe` | 빠진 날짜가 전체 기간의 5% 이하 | 가장 가까운 과거 날짜의 범위 (`basis_date`) |
+| `price_common` | 빠진 날짜가 5% 초과, 또는 과거 범위가 없음 | 그날 `price_daily` 종목 중 보통주만. 판정 기준은 기존 수집기와 같음(주권·보통주·스팩 아님). 종목정보는 그날 `krx_base_daily` 우선, 없으면 `stock_master`(최신 정보). 정보가 없는 종목은 빼고 `note`에 개수 기록 |
+
 ## 측정 순서
 
 **기존 수집기를 돌리지 않는 시간에** 실행하세요(같은 KIS 키를 씁니다).
@@ -79,6 +89,7 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 | `minute_bar` | code, date, time, open, high, low, close, volume, acml_value_krw(누적 거래대금), value_krw(1분 거래대금), 기본키 (code, date, time) |
 | `done` | code, date, n_bars, n_calls, fetched_at |
 | `jobs` | date, code, reason(value / change / value+change) |
+| `job_days` | date, method, basis_date, note, n_codes (날짜별로 대상 범위를 정한 방법) |
 
 ## 개발
 

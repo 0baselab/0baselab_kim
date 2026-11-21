@@ -1,6 +1,7 @@
 """CLI 하위 명령 본체. 실행 결과는 log()로 화면과 로그 파일에 함께 남는다."""
 from __future__ import annotations
 
+import bisect
 import time
 from collections import Counter
 from datetime import date as Date, datetime, timedelta
@@ -144,24 +145,59 @@ def cmd_ratetest(client, log: Log, day: str, code: str = "005930", stages=(5, 10
 
 
 # ---------------------------------------------------------------- jobs
+MISSING_RATIO_LIMIT = 0.05
+
+
 def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_change: int = 50) -> int:
+    """날짜별 대상 범위:
+    - universe_daily가 있으면 그날 범위 (universe)
+    - 빠진 날짜가 전체의 5% 이하: 가장 가까운 과거 날짜의 범위 (past_universe). 미래 날짜는 쓰지 않는다.
+    - 5% 초과: 그날 price_daily 종목 중 보통주만 (price_common)
+    과거 범위가 하나도 없는 날짜도 price_common으로 처리한다. 어느 방법을 썼는지 job_days에 날짜별로 기록.
+    """
     start, end = ymd(one_year_ago(today)), ymd(today - timedelta(days=1))
     days = source.open_days(src_con, start, end)
     log(f"[jobs] 기간 {start}~{end}, 거래일 달력상 개장일 {len(days)}일")
-    rows, skipped = [], []
+    have = source.universe_dates(src_con)
+    have_set = set(have)
+    missing = [d for d in days if d not in have_set]
+    ratio = len(missing) / len(days) if days else 0.0
+    use_past = ratio <= MISSING_RATIO_LIMIT
+    log(f"[jobs] universe_daily 빠진 날짜 {len(missing)}일 ({ratio * 100:.1f}%) → "
+        f"{'가장 가까운 과거 날짜 범위' if use_past else '그날 price_daily 보통주'} 사용")
+    rows, day_rows = [], []
     for d in days:
-        if not source.has_universe(src_con, d):
-            skipped.append(d)
-            continue
-        for c, why in source.select_codes(src_con, d, top_value, top_change).items():
+        basis, note = None, None
+        if d in have_set:
+            method, allowed = "universe", source.universe_set(src_con, d)
+        else:
+            past = bisect.bisect_left(have, d) - 1  # d보다 이전인 가장 가까운 날짜
+            if use_past and past >= 0:
+                method, basis = "past_universe", have[past]
+                allowed = source.universe_set(src_con, basis)
+            else:
+                method = "price_common"
+                allowed, info_src, unknown = source.common_from_price(src_con, d)
+                note = f"종목정보 {info_src}, 정보 없어 뺀 종목 {unknown}"
+                if use_past:
+                    note += ", 과거 universe 없음"
+        picked = source.select_codes(src_con, d, top_value, top_change, allowed)
+        if not picked:
+            note = (note + ", " if note else "") + "선정 종목 없음(price_daily 없음 등)"
+        for c, why in picked.items():
             rows.append((d, c, why))
+        day_rows.append((d, method, basis, note, len(picked)))
     with con:
         con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM job_days")
         con.executemany("INSERT INTO jobs(date, code, reason) VALUES (?,?,?)", rows)
-    log(f"[jobs] 작업 {len(rows)}건 생성 (날짜 {len(days) - len(skipped)}일)")
-    if skipped:
-        log(f"[jobs] 보통주 범위(universe_daily)가 없어 건너뛴 날짜 {len(skipped)}일: "
-            f"{skipped[0]}~{skipped[-1]}")
+        con.executemany("INSERT INTO job_days(date, method, basis_date, note, n_codes) VALUES (?,?,?,?,?)", day_rows)
+    counts = Counter(r[1] for r in day_rows)
+    log(f"[jobs] 작업 {len(rows)}건 생성. 날짜별 방법: " + ", ".join(f"{k} {v}일" for k, v in sorted(counts.items())))
+    for d, method, basis, note, n in day_rows:
+        if method != "universe":
+            log(f"  {d}: {method}" + (f" (기준 {basis})" if basis else "") + (f" - {note}" if note else "")
+                + f", {n}종목")
     return len(rows)
 
 

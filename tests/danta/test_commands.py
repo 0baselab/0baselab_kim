@@ -64,51 +64,98 @@ def test_backfill_stops_after_failures(tmp_path):
     assert store.pending_jobs(con).__len__() == 30   # 실패는 완료로 기록하지 않음
 
 
-def make_source(path):
+def make_source(path, open_days=("20261119", "20261120"), universe_days=("20261120",), krx_base=True):
     con = sqlite3.connect(path)
     con.executescript("""
     CREATE TABLE trading_calendar(date TEXT PRIMARY KEY, is_open INTEGER, source TEXT, fetched_at TEXT, raw_file TEXT);
     CREATE TABLE price_daily(date TEXT, code TEXT, value_krw INTEGER, change_rate_pct REAL, PRIMARY KEY(date,code));
     CREATE TABLE universe_daily(date TEXT, code TEXT, in_universe INTEGER, PRIMARY KEY(date,code));
+    CREATE TABLE krx_base_daily(date TEXT, code TEXT, name TEXT, secugrp TEXT, sect_tp TEXT, kind TEXT,
+                                PRIMARY KEY(date,code));
+    CREATE TABLE stock_master(code TEXT PRIMARY KEY, name TEXT, krx_secugrp TEXT, krx_kind TEXT, krx_sect_tp TEXT);
     """)
     con.executemany("INSERT INTO trading_calendar VALUES (?,?,'t','t',NULL)",
-                    [("20251120", 1), ("20251121", 0), ("20261119", 1), ("20261120", 1), ("20261121", 1)])
-    rows = []
-    for i in range(200):
-        c = f"{i:06d}"
-        rows.append(("20261120", c, 1000 * (200 - i), float(i)))  # 거래대금 상위=앞번호, 등락률 상위=뒷번호
-    rows.append(("20261120", "PREF01", 10 ** 9, 30.0))           # 보통주 범위 밖
-    rows.append(("20261121", "TODAY1", 10 ** 9, 30.0))           # 오늘 → 기간 밖
-    con.executemany("INSERT INTO price_daily VALUES (?,?,?,?)", rows)
-    con.executemany("INSERT INTO universe_daily VALUES (?,?,?)",
-                    [("20261120", f"{i:06d}", 1) for i in range(200)] + [("20261120", "PREF01", 0)])
+                    [(d, 1) for d in open_days] + [("20261121", 1), ("20251122", 0)])
+    for d in open_days:
+        rows = [(d, f"{i:06d}", 1000 * (200 - i), float(i)) for i in range(200)]  # 거래대금 상위=앞번호, 등락률 상위=뒷번호
+        rows.append((d, "PREF01", 10 ** 9, 30.0))      # 우선주 (보통주 아님)
+        rows.append((d, "NOINFO", 10 ** 9, 30.0))      # 종목정보 없음
+        con.executemany("INSERT INTO price_daily VALUES (?,?,?,?)", rows)
+        if krx_base:
+            con.executemany("INSERT INTO krx_base_daily VALUES (?,?,?,?,?,?)",
+                            [(d, f"{i:06d}", "회사", "주권", "", "보통주") for i in range(200)]
+                            + [(d, "PREF01", "회사우", "주권", "", "구형우선주")])
+    con.executemany("INSERT INTO stock_master VALUES (?,?,?,?,?)",
+                    [(f"{i:06d}", "회사", "주권", "보통주", "") for i in range(200)]
+                    + [("PREF01", "회사우", "주권", "구형우선주", "")])
+    con.execute("INSERT INTO price_daily VALUES ('20261121','TODAY1',1000000000,30.0)")  # 오늘 → 기간 밖
+    for d in universe_days:
+        con.executemany("INSERT INTO universe_daily VALUES (?,?,?)",
+                        [(d, f"{i:06d}", 1) for i in range(200)] + [(d, "PREF01", 0)])
     con.commit()
     con.close()
 
 
-def test_jobs_from_readonly_source(tmp_path):
-    make_source(tmp_path / "market.sqlite")
-    src = source.open_ro(tmp_path / "market.sqlite")
-    with pytest.raises(sqlite3.OperationalError):
-        src.execute("CREATE TABLE x(a)")                  # 읽기 전용
+def _run_jobs(tmp_path, **kw):
+    make_source(tmp_path / "m.sqlite", **kw)
+    src = source.open_ro(tmp_path / "m.sqlite")
     con = store.connect(tmp_path / "d.sqlite")
     logs = []
     n = commands.cmd_jobs(src, con, logs.append, date(2026, 11, 21), 100, 50)
-    assert n == 150
-    rows = con.execute("SELECT date, code, reason FROM jobs").fetchall()
-    assert {r[0] for r in rows} == {"20261120"}
-    codes = {r[1] for r in rows}
-    assert "PREF01" not in codes and "TODAY1" not in codes
+    days = {r[0]: r[1:] for r in con.execute("SELECT date, method, basis_date, note, n_codes FROM job_days")}
+    return con, src, n, days, logs
+
+
+def test_jobs_readonly_and_filters(tmp_path):
+    con, src, n, days, logs = _run_jobs(tmp_path)
+    with pytest.raises(sqlite3.OperationalError):
+        src.execute("CREATE TABLE x(a)")                  # 읽기 전용
+    codes = {r[0] for r in con.execute("SELECT code FROM jobs")}
+    assert "PREF01" not in codes and "NOINFO" not in codes and "TODAY1" not in codes
     assert "000000" in codes and "000199" in codes
-    assert any("건너뛴 날짜" in l for l in logs)           # 20251120, 20261119: universe 없음
+    assert days["20261120"][0] == "universe"
+    # 2일 중 1일 빠짐(50%) → 그날 price_daily 보통주
+    assert days["20261119"][0] == "price_common"
+    assert "krx_base_daily" in days["20261119"][2] and "정보 없어 뺀 종목 1" in days["20261119"][2]
+    assert n == 300
+
+
+def _open_days(n):
+    from datetime import timedelta
+    out, d = [], date(2025, 12, 1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y%m%d"))
+        d += timedelta(days=1)
+    return out
+
+
+def test_jobs_few_missing_uses_nearest_past_not_future(tmp_path):
+    ds = _open_days(40)
+    missing = {ds[0], ds[20]}                        # 2/40 = 5% → 과거 범위 사용
+    con, src, n, days, logs = _run_jobs(tmp_path, open_days=ds, universe_days=[d for d in ds if d not in missing])
+    assert days[ds[20]][:2] == ("past_universe", ds[19])   # 미래(ds[21])가 아닌 직전 과거
+    assert days[ds[0]][0] == "price_common"               # 과거 범위가 없음
+    assert "과거 universe 없음" in days[ds[0]][2]
+    assert all(v[0] == "universe" for k, v in days.items() if k not in missing)
+
+
+def test_jobs_many_missing_uses_price_common_with_master_fallback(tmp_path):
+    ds = _open_days(40)
+    missing = set(ds[10:13])                          # 3/40 = 7.5% → price_common
+    con, src, n, days, logs = _run_jobs(tmp_path, open_days=ds, universe_days=[d for d in ds if d not in missing],
+                                        krx_base=False)
+    for d in missing:
+        assert days[d][0] == "price_common" and "stock_master" in days[d][2] and days[d][3] == 150
+    assert any("price_daily 보통주" in l for l in logs)
 
 
 def test_jobs_overlap_dedup(tmp_path):
     make_source(tmp_path / "m.sqlite")
     src = source.open_ro(tmp_path / "m.sqlite")
     con = store.connect(tmp_path / "d.sqlite")
-    assert commands.cmd_jobs(src, con, lambda m: None, date(2026, 11, 21), 150, 100) == 200
-    assert con.execute("SELECT COUNT(*) FROM jobs WHERE reason='value+change'").fetchone()[0] == 50
+    commands.cmd_jobs(src, con, lambda m: None, date(2026, 11, 21), 150, 100)
+    assert con.execute("SELECT COUNT(*) FROM jobs WHERE reason='value+change' AND date='20261120'").fetchone()[0] == 50
 
 
 def test_probe_reports_sum_vs_daily(tmp_path):

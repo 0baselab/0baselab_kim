@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS done (
 CREATE TABLE IF NOT EXISTS jobs (
     date TEXT NOT NULL, code TEXT NOT NULL, reason TEXT,
     PRIMARY KEY (date, code));
+CREATE TABLE IF NOT EXISTS job_days (
+    date TEXT PRIMARY KEY,
+    method TEXT NOT NULL,     -- universe / past_universe / price_common
+    basis_date TEXT,          -- past_universe일 때 빌려 쓴 과거 날짜
+    note TEXT,                -- price_common일 때 종목정보 출처, 정보 없어 뺀 종목 수 등
+    n_codes INTEGER NOT NULL);
 """
 
 
