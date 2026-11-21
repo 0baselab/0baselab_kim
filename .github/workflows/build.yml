@@ -5,13 +5,28 @@
 # - 수동 실행(Run workflow): 시험 빌드만 (Release 없음)
 # - 빌드 결과물은 Actions 저장소(artifact)에 올리지 않는다 (무료 저장 한도 문제). zip은 Release에만 첨부한다.
 # 빌드에만 쓰고 데이터 수집에는 쓰지 않는다. API 키·GitHub Secrets를 쓰지 않는다.
+# 단타분봉수집기(danta/) 파일만 바뀐 PR·병합은 build-danta.yml이 처리하므로 여기서는 건너뛴다.
 name: build-windows
 
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "danta/**"
+      - "tests/danta/**"
+      - "run_danta.py"
+      - "packaging/danta.spec"
+      - "config/danta_settings.env.example"
+      - ".github/workflows/build-danta.yml"
   push:
     branches: [main]
+    paths-ignore:
+      - "danta/**"
+      - "tests/danta/**"
+      - "run_danta.py"
+      - "packaging/danta.spec"
+      - "config/danta_settings.env.example"
+      - ".github/workflows/build-danta.yml"
   workflow_dispatch: {}
 
 permissions:
