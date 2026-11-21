@@ -46,11 +46,11 @@ def universe_set(con, day: str) -> set[str]:
     return {r[0] for r in con.execute("SELECT code FROM universe_daily WHERE date=? AND in_universe=1", (day,))}
 
 
-def common_from_price(con, day: str) -> tuple[set[str], str, int]:
+def common_from_price(con, day: str) -> tuple[set[str], str, list[str]]:
     """그날 price_daily 종목 중 보통주만 (기존 수집기 universe.exclude_reason과 같은 기준).
 
     종목 정보는 그날 krx_base_daily 우선, 없으면 stock_master(최신 정보). 정보가 없는 종목은 뺀다.
-    반환: (종목 집합, 사용한 정보 출처, 정보가 없어 뺀 종목 수)
+    반환: (보통주 집합, 사용한 정보 출처, 정보가 없어 판정 못 한 종목 목록)
     """
     codes = [r[0] for r in con.execute("SELECT code FROM price_daily WHERE date=?", (day,))]
     info = {r[0]: r[1:] for r in con.execute(
@@ -60,13 +60,18 @@ def common_from_price(con, day: str) -> tuple[set[str], str, int]:
         info = {r[0]: r[1:] for r in con.execute(
             "SELECT code, krx_secugrp, krx_kind, krx_sect_tp, name FROM stock_master")}
         src = "stock_master"
-    out, unknown = set(), 0
+    out, unknown = set(), []
     for c in codes:
         if c not in info:
-            unknown += 1
+            unknown.append(c)
         elif exclude_reason(*info[c]) is None:
             out.add(c)
-    return out, src, unknown
+    return out, src, sorted(unknown)
+
+
+def presumed_common(code: str) -> bool:
+    """보조 기준: 종목코드 끝자리가 0이면 보통주로 추정 (우선주는 보통 5·7·9 등)."""
+    return code.endswith("0")
 
 
 def select_codes(con, day: str, top_value: int, top_change: int, allowed: set[str]) -> dict[str, str]:

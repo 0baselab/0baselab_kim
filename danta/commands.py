@@ -167,7 +167,7 @@ def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_chan
         f"{'가장 가까운 과거 날짜 범위' if use_past else '그날 price_daily 보통주'} 사용")
     rows, day_rows = [], []
     for d in days:
-        basis, note = None, None
+        basis, note, unknown, presumed = None, None, [], set()
         if d in have_set:
             method, allowed = "universe", source.universe_set(src_con, d)
         else:
@@ -178,10 +178,23 @@ def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_chan
             else:
                 method = "price_common"
                 allowed, info_src, unknown = source.common_from_price(src_con, d)
-                note = f"종목정보 {info_src}, 정보 없어 뺀 종목 {unknown}"
+                presumed = {c for c in unknown if source.presumed_common(c)}
+                allowed = allowed | presumed
+                note = f"종목정보 {info_src}"
                 if use_past:
                     note += ", 과거 universe 없음"
         picked = source.select_codes(src_con, d, top_value, top_change, allowed)
+        if method == "price_common" and unknown:
+            got = sorted(c for c in picked if c in presumed)
+            for c in got:
+                picked[c] += "+판정불가"
+            # 끝자리 0이 아니라 뺐지만, 넣었다면 상위권이었을 종목 (기록용)
+            dropped = sorted(set(source.select_codes(src_con, d, top_value, top_change, allowed | set(unknown)))
+                             & (set(unknown) - presumed))
+            note += (f", 판정 불가 {len(unknown)}종목 중 코드 끝자리 0으로 추정해 포함 {len(got)}"
+                     f"{': ' + ' '.join(got) if got else ''}")
+            if dropped:
+                note += f", 끝자리 0 아님으로 제외(상위권) {len(dropped)}: {' '.join(dropped)}"
         if not picked:
             note = (note + ", " if note else "") + "선정 종목 없음(price_daily 없음 등)"
         for c, why in picked.items():

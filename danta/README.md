@@ -51,7 +51,7 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 |---|---|---|
 | `universe` | 기존 DB에 그날 `universe_daily`가 있음 | 그날 범위 그대로 |
 | `past_universe` | 빠진 날짜가 전체 기간의 5% 이하 | 가장 가까운 과거 날짜의 범위 (`basis_date`) |
-| `price_common` | 빠진 날짜가 5% 초과, 또는 과거 범위가 없음 | 그날 `price_daily` 종목 중 보통주만. 판정 기준은 기존 수집기와 같음(주권·보통주·스팩 아님). 종목정보는 그날 `krx_base_daily` 우선, 없으면 `stock_master`(최신 정보). 정보가 없는 종목은 빼고 `note`에 개수 기록 |
+| `price_common` | 빠진 날짜가 5% 초과, 또는 과거 범위가 없음 | 그날 `price_daily` 종목 중 보통주만. 판정 기준은 기존 수집기와 같음(주권·보통주·스팩 아님). 종목정보는 그날 `krx_base_daily` 우선, 없으면 `stock_master`(최신 정보). 정보가 없어 판정할 수 없는 종목은 종목코드 끝자리가 0이면 보통주로 추정해 후보에 넣습니다. 상위권에 들면 `jobs.reason`에 `+판정불가`를 붙이고, 추정으로 들어간 종목과 끝자리 0이 아니라 뺀 상위권 종목을 `note`에 적습니다 |
 
 ## 측정 순서
 
@@ -88,7 +88,7 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 |---|---|
 | `minute_bar` | code, date, time, open, high, low, close, volume, acml_value_krw(누적 거래대금), value_krw(1분 거래대금), 기본키 (code, date, time) |
 | `done` | code, date, n_bars, n_calls, fetched_at |
-| `jobs` | date, code, reason(value / change / value+change) |
+| `jobs` | date, code, reason(value / change / value+change, 추정 포함이면 끝에 +판정불가) |
 | `job_days` | date, method, basis_date, note, n_codes (날짜별로 대상 범위를 정한 방법) |
 
 ## 개발

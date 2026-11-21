@@ -79,7 +79,9 @@ def make_source(path, open_days=("20261119", "20261120"), universe_days=("202611
     for d in open_days:
         rows = [(d, f"{i:06d}", 1000 * (200 - i), float(i)) for i in range(200)]  # 거래대금 상위=앞번호, 등락률 상위=뒷번호
         rows.append((d, "PREF01", 10 ** 9, 30.0))      # 우선주 (보통주 아님)
-        rows.append((d, "NOINFO", 10 ** 9, 30.0))      # 종목정보 없음
+        rows.append((d, "NOINFO", 10 ** 9, 30.0))      # 종목정보 없음, 끝자리 0 아님
+        rows.append((d, "999990", 10 ** 9, 300.0))      # 종목정보 없음, 끝자리 0 → 추정 포함
+        rows.append((d, "999980", 1, -5.0))            # 종목정보 없음, 끝자리 0이지만 상위권 아님
         con.executemany("INSERT INTO price_daily VALUES (?,?,?,?)", rows)
         if krx_base:
             con.executemany("INSERT INTO krx_base_daily VALUES (?,?,?,?,?,?)",
@@ -116,8 +118,15 @@ def test_jobs_readonly_and_filters(tmp_path):
     assert days["20261120"][0] == "universe"
     # 2일 중 1일 빠짐(50%) → 그날 price_daily 보통주
     assert days["20261119"][0] == "price_common"
-    assert "krx_base_daily" in days["20261119"][2] and "정보 없어 뺀 종목 1" in days["20261119"][2]
-    assert n == 300
+    note = days["20261119"][2]
+    assert "krx_base_daily" in note
+    assert "판정 불가 3종목 중 코드 끝자리 0으로 추정해 포함 1: 999990" in note
+    assert "끝자리 0 아님으로 제외(상위권) 1: NOINFO" in note
+    reason = dict(con.execute("SELECT code, reason FROM jobs WHERE date='20261119'").fetchall())
+    assert reason["999990"] == "value+change+판정불가"
+    assert "999980" not in reason
+    assert "999990" not in dict(con.execute("SELECT code, reason FROM jobs WHERE date='20261120'").fetchall())
+    assert n == 299                                   # 999990이 두 목록 모두에 들어 중복 1
 
 
 def _open_days(n):
@@ -146,7 +155,7 @@ def test_jobs_many_missing_uses_price_common_with_master_fallback(tmp_path):
     con, src, n, days, logs = _run_jobs(tmp_path, open_days=ds, universe_days=[d for d in ds if d not in missing],
                                         krx_base=False)
     for d in missing:
-        assert days[d][0] == "price_common" and "stock_master" in days[d][2] and days[d][3] == 150
+        assert days[d][0] == "price_common" and "stock_master" in days[d][2] and days[d][3] == 149 and "999990" in days[d][2]
     assert any("price_daily 보통주" in l for l in logs)
 
 
