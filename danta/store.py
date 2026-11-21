@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS done (
     PRIMARY KEY (code, date));
 CREATE TABLE IF NOT EXISTS jobs (
     date TEXT NOT NULL, code TEXT NOT NULL, reason TEXT,
+    common_check TEXT NOT NULL DEFAULT 'confirmed',
+    -- confirmed: universe 또는 종목정보로 보통주 확인 / unknown_code0, unknown_other: 종목정보 없음(판정 불가),
+    -- 코드 끝자리 0 여부는 표시용. 분석 단계에서 WHERE common_check='confirmed'로 걸러낼 수 있다.
     PRIMARY KEY (date, code));
 CREATE TABLE IF NOT EXISTS job_days (
     date TEXT PRIMARY KEY,
@@ -35,6 +38,9 @@ def connect(path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(path))
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+    if "common_check" not in cols:  # 이전 버전 DB
+        con.execute("ALTER TABLE jobs ADD COLUMN common_check TEXT NOT NULL DEFAULT 'confirmed'")
     return con
 
 

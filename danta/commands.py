@@ -167,7 +167,7 @@ def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_chan
         f"{'가장 가까운 과거 날짜 범위' if use_past else '그날 price_daily 보통주'} 사용")
     rows, day_rows = [], []
     for d in days:
-        basis, note, unknown, presumed = None, None, [], set()
+        basis, note, unknown = None, None, []
         if d in have_set:
             method, allowed = "universe", source.universe_set(src_con, d)
         else:
@@ -178,32 +178,35 @@ def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_chan
             else:
                 method = "price_common"
                 allowed, info_src, unknown = source.common_from_price(src_con, d)
-                presumed = {c for c in unknown if source.presumed_common(c)}
-                allowed = allowed | presumed
+                allowed = allowed | set(unknown)  # 판정 불가 종목도 후보 (코드 규칙은 표시용)
                 note = f"종목정보 {info_src}"
                 if use_past:
                     note += ", 과거 universe 없음"
         picked = source.select_codes(src_con, d, top_value, top_change, allowed)
+        flags: dict[str, str] = {}
         if method == "price_common" and unknown:
-            got = sorted(c for c in picked if c in presumed)
-            for c in got:
+            got0 = sorted(c for c in picked if c in unknown and source.presumed_common(c))
+            gotx = sorted(c for c in picked if c in unknown and not source.presumed_common(c))
+            for c in got0:
                 picked[c] += "+판정불가"
-            # 끝자리 0이 아니라 뺐지만, 넣었다면 상위권이었을 종목 (기록용)
-            dropped = sorted(set(source.select_codes(src_con, d, top_value, top_change, allowed | set(unknown)))
-                             & (set(unknown) - presumed))
-            note += (f", 판정 불가 {len(unknown)}종목 중 코드 끝자리 0으로 추정해 포함 {len(got)}"
-                     f"{': ' + ' '.join(got) if got else ''}")
-            if dropped:
-                note += f", 끝자리 0 아님으로 제외(상위권) {len(dropped)}: {' '.join(dropped)}"
+                flags[c] = "unknown_code0"
+            for c in gotx:
+                picked[c] += "+판정불가(끝자리0아님)"
+                flags[c] = "unknown_other"
+            note += f", 판정 불가 {len(unknown)}종목 중 상위권 포함 {len(got0) + len(gotx)}"
+            if got0:
+                note += f" / 끝자리 0: {' '.join(got0)}"
+            if gotx:
+                note += f" / 끝자리 0 아님: {' '.join(gotx)}"
         if not picked:
             note = (note + ", " if note else "") + "선정 종목 없음(price_daily 없음 등)"
         for c, why in picked.items():
-            rows.append((d, c, why))
+            rows.append((d, c, why, flags.get(c, "confirmed")))
         day_rows.append((d, method, basis, note, len(picked)))
     with con:
         con.execute("DELETE FROM jobs")
         con.execute("DELETE FROM job_days")
-        con.executemany("INSERT INTO jobs(date, code, reason) VALUES (?,?,?)", rows)
+        con.executemany("INSERT INTO jobs(date, code, reason, common_check) VALUES (?,?,?,?)", rows)
         con.executemany("INSERT INTO job_days(date, method, basis_date, note, n_codes) VALUES (?,?,?,?,?)", day_rows)
     counts = Counter(r[1] for r in day_rows)
     log(f"[jobs] 작업 {len(rows)}건 생성. 날짜별 방법: " + ", ".join(f"{k} {v}일" for k, v in sorted(counts.items())))

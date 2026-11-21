@@ -113,20 +113,23 @@ def test_jobs_readonly_and_filters(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         src.execute("CREATE TABLE x(a)")                  # 읽기 전용
     codes = {r[0] for r in con.execute("SELECT code FROM jobs")}
-    assert "PREF01" not in codes and "NOINFO" not in codes and "TODAY1" not in codes
+    assert "PREF01" not in codes and "TODAY1" not in codes
     assert "000000" in codes and "000199" in codes
     assert days["20261120"][0] == "universe"
     # 2일 중 1일 빠짐(50%) → 그날 price_daily 보통주
     assert days["20261119"][0] == "price_common"
     note = days["20261119"][2]
     assert "krx_base_daily" in note
-    assert "판정 불가 3종목 중 코드 끝자리 0으로 추정해 포함 1: 999990" in note
-    assert "끝자리 0 아님으로 제외(상위권) 1: NOINFO" in note
-    reason = dict(con.execute("SELECT code, reason FROM jobs WHERE date='20261119'").fetchall())
-    assert reason["999990"] == "value+change+판정불가"
-    assert "999980" not in reason
-    assert "999990" not in dict(con.execute("SELECT code, reason FROM jobs WHERE date='20261120'").fetchall())
-    assert n == 299                                   # 999990이 두 목록 모두에 들어 중복 1
+    assert "판정 불가 3종목 중 상위권 포함 2 / 끝자리 0: 999990 / 끝자리 0 아님: NOINFO" in note
+    got = {r[0]: r[1:] for r in con.execute("SELECT code, reason, common_check FROM jobs WHERE date='20261119'")}
+    assert got["999990"] == ("value+change+판정불가", "unknown_code0")
+    assert got["NOINFO"] == ("value+판정불가(끝자리0아님)", "unknown_other")
+    assert got["000000"][1] == "confirmed"
+    assert "999980" not in got                       # 판정 불가지만 상위권 아님
+    assert "PREF01" not in got                       # 정보로 우선주 확인 → 제외
+    assert con.execute("SELECT COUNT(*) FROM jobs WHERE date='20261120' AND common_check!='confirmed'"
+                       ).fetchone()[0] == 0
+    assert n == 299                                   # 20261120: 150, 20261119: 149 (999990이 두 목록에 중복)
 
 
 def _open_days(n):
@@ -155,7 +158,7 @@ def test_jobs_many_missing_uses_price_common_with_master_fallback(tmp_path):
     con, src, n, days, logs = _run_jobs(tmp_path, open_days=ds, universe_days=[d for d in ds if d not in missing],
                                         krx_base=False)
     for d in missing:
-        assert days[d][0] == "price_common" and "stock_master" in days[d][2] and days[d][3] == 149 and "999990" in days[d][2]
+        assert days[d][0] == "price_common" and "stock_master" in days[d][2] and days[d][3] == 149 and "999990" in days[d][2] and "NOINFO" in days[d][2]
     assert any("price_daily 보통주" in l for l in logs)
 
 
@@ -190,3 +193,13 @@ def test_find_oldest_skips_holidays():
     srv = FakeMinuteServer(days)
     got = commands.find_oldest(Client(srv), "005930", "20261120", lambda m: None)
     assert got == "20251125"
+
+
+def test_old_db_gets_common_check_column(tmp_path):
+    p = tmp_path / "old.sqlite"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE jobs(date TEXT NOT NULL, code TEXT NOT NULL, reason TEXT, PRIMARY KEY(date, code))")
+    c.execute("INSERT INTO jobs VALUES ('20261120','005930','value')")
+    c.commit(); c.close()
+    con = store.connect(p)
+    assert con.execute("SELECT common_check FROM jobs").fetchone()[0] == "confirmed"

@@ -70,7 +70,7 @@ def common_from_price(con, day: str) -> tuple[set[str], str, list[str]]:
 
 
 def presumed_common(code: str) -> bool:
-    """보조 기준: 종목코드 끝자리가 0이면 보통주로 추정 (우선주는 보통 5·7·9 등)."""
+    """표시용: 종목코드 끝자리가 0이면 보통주일 가능성이 높다 (포함 여부에는 쓰지 않음)."""
     return code.endswith("0")
 
 
