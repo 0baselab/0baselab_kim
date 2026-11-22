@@ -34,7 +34,12 @@ DEFAULTS: dict[str, str] = {
     "RATETEST_STAGES": "5,10,15,20,25,30",
     "RATETEST_SECONDS": "20",
     "MAX_FAILURES": "20",
-    "ACML_IS_CUMULATIVE": "",      # probe로 누적 확인 후 Y로 바꾸면 1분 거래대금(value_krw)을 계산해 저장
+    "ACML_IS_CUMULATIVE": "",
+    "DAILY_RATE": "5",             # daily 기본 초당 호출 수 (실측 한도 약 6)
+    "MAX_RETRY": "3",              # 같은 (종목, 날짜)가 연속 이 횟수만큼 실패하면 재시도 중단
+    "COLLECTOR_WAIT_MINUTES": "60",  # 기존 수집기 실행 중이면 최대 대기 시간
+    "THEME_FILE": "",              # 비우면 기존 수집기 데이터 폴더/themes/theme_master.csv
+    "COLLECTOR_LOCK": "",          # 비우면 기존 수집기 데이터 폴더/system/collector.lock      # probe로 누적 확인 후 Y로 바꾸면 1분 거래대금(value_krw)을 계산해 저장
 }
 
 
@@ -96,6 +101,21 @@ def load_config(install: Path | None = None, platform: str | None = None) -> Con
     data = Path(vals["DATA_DIR"]).expanduser() if vals["DATA_DIR"] else desk / DATA_FOLDER_NAME
     src = Path(vals["SOURCE_DB"]).expanduser() if vals["SOURCE_DB"] else desk.joinpath(*SOURCE_DB_PARTS)
     return Config(vals, data, src)
+
+
+def collector_root(cfg: "Config") -> Path:
+    """기존 수집기 데이터 폴더 = SOURCE_DB(…/db/market.sqlite)의 두 단계 위."""
+    return cfg.source_db.parent.parent
+
+
+def theme_file(cfg: "Config") -> Path:
+    v = cfg.values["THEME_FILE"]
+    return Path(v).expanduser() if v else collector_root(cfg) / "themes" / "theme_master.csv"
+
+
+def collector_lock(cfg: "Config") -> Path:
+    v = cfg.values["COLLECTOR_LOCK"]
+    return Path(v).expanduser() if v else collector_root(cfg) / "system" / "collector.lock"
 
 
 def load_keys(install: Path, ask: Callable[[str], str] = getpass.getpass,
