@@ -73,6 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     dl = sub.add_parser("daily", help="미수집 개장일만 골라 작업 생성 + 수집, 테마 스냅샷 (작업 스케줄러용)")
     dl.add_argument("--rate", type=float, help="초당 호출 수 (기본: 설정 DAILY_RATE=5)")
     dl.add_argument("--wait-minutes", type=float, help="기존 수집기 실행 중일 때 최대 대기 분 (기본 60)")
+    ex = sub.add_parser("export", help="기존 DB에서 분석용 부분 DB(analysis/market_subset.sqlite) 만들기")
+    ex.add_argument("--since", default="20250901", help="이 날짜(YYYYMMDD) 이후 행만 (기본 20250901)")
+    ex.add_argument("--max-mb", type=float, default=380, help="결과 파일 크기 한도 MB (기본 380)")
     sub.add_parser("recalc", help="저장된 분봉의 1분 거래대금(value_krw) 다시 계산")
     return p
 
@@ -112,6 +115,15 @@ def run(argv: list[str]) -> int:
             con = store.connect(cfg.db_path)
             commands.cmd_jobs(_src(cfg, log, True), con, log, now.date(),
                               cfg.int("TOP_VALUE"), cfg.int("TOP_CHANGE"))
+        elif args.cmd == "export":
+            from .export import ExportError, export_subset
+            try:
+                r = export_subset(cfg.source_db, cfg.data_dir / "analysis" / "market_subset.sqlite", log,
+                                  args.since, args.max_mb)
+            except ExportError as exc:
+                raise SystemExit(str(exc))
+            log(f"로그 파일: {log.path}")
+            return 0 if r["ok"] else 1
         elif args.cmd == "recalc":
             n = store.recalc_values(store.connect(cfg.db_path))
             log(f"[recalc] {n}개 (종목, 날짜) 다시 계산")
