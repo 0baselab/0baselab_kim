@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     ex = sub.add_parser("export", help="기존 DB에서 분석용 부분 DB(analysis/market_subset.sqlite) 만들기")
     ex.add_argument("--since", default="20250901", help="이 날짜(YYYYMMDD) 이후 행만 (기본 20250901)")
     ex.add_argument("--max-mb", type=float, default=380, help="결과 파일 크기 한도 MB (기본 380)")
+    ex.add_argument("--profile", default="analysis", choices=["analysis", "all"],
+                    help="analysis: 분석에 필요한 표·열만 (기본) / all: 모든 표 (이전 동작)")
     sub.add_parser("recalc", help="저장된 분봉의 1분 거래대금(value_krw) 다시 계산")
     return p
 
@@ -119,7 +121,7 @@ def run(argv: list[str]) -> int:
             from .export import ExportError, export_subset
             try:
                 r = export_subset(cfg.source_db, cfg.data_dir / "analysis" / "market_subset.sqlite", log,
-                                  args.since, args.max_mb)
+                                  args.since, args.max_mb, profile=args.profile)
             except ExportError as exc:
                 raise SystemExit(str(exc))
             log(f"로그 파일: {log.path}")
