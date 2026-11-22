@@ -1,5 +1,5 @@
-10:15:24 단타분봉수집기 0.1.0 / probe / 데이터 폴더 C:\Users\0base\OneDrive\Desktop\단타분석
-10:15:24 기존 DB(읽기 전용): C:\Users\0base\OneDrive\Desktop\주식데이터수집\db\market.sqlite
+10:15:24 단타분봉수집기 0.1.0 / probe / 데이터 폴더 <바탕화면>\단타분석
+10:15:24 기존 DB(읽기 전용): <바탕화면>\주식데이터수집\db\market.sqlite
 10:15:45 [probe] 종목 005930, 날짜 20261120, 시장 J, FID_PW_DATA_INCU_YN=N
 10:15:45   봉 개수: 381
 10:15:45   호출 수: 4
@@ -22,4 +22,4 @@
 10:15:51   20251112: 있음 (20251112)
 10:15:51   가장 오래된 날짜: 20251112
 10:15:51 [probe] 총 호출 30회, EGW00201 3회
-10:15:51 로그 파일: C:\Users\0base\OneDrive\Desktop\단타분석\logs\danta_probe_20261122-101524.txt
+10:15:51 로그 파일: <바탕화면>\단타분석\logs\danta_probe_20261122-101524.txt

@@ -111,6 +111,53 @@ def cmd_probe(client, src_con, log: Log, today: Date, code: str = "005930", day:
     return out
 
 
+def cmd_probe_compare(client, src_con, log: Log, today: Date, day: str | None = None,
+                      markets=("J", "UN"), pw: str = "N", n: int = 5) -> list[dict]:
+    """거래대금 상위 n + 하위 n 종목을 같은 날짜로 시장 구분별 수집해 일봉 거래대금과 비교.
+
+    마지막 봉 누적 증가분 = 마지막 봉 누적 - 직전 봉 누적 (15:30 마감 동시호가 체결분으로 추정).
+    """
+    if src_con is None:
+        raise SystemExit("비교에는 기존 수집기 DB가 필요합니다 (일봉 거래대금).")
+    day = day or source.last_open_before(src_con, ymd(today))
+    if not day:
+        raise SystemExit("거래일 달력에 오늘 이전 개장일이 없습니다. --date로 지정하세요.")
+    top, low = source.value_extremes(src_con, day, n)
+    log(f"[probe --compare] 날짜 {day}, 시장 {','.join(markets)}, 거래대금 상위 {len(top)} + 하위 {len(low)}")
+    log("  구분 | 종목 | 시장 | 봉 | 분봉 합계 | 일봉 value_krw | 차이(%) | 마지막 봉 누적 증가분 | 마지막 봉 시각")
+    out = []
+    c0 = client.stats.calls
+    for group, codes in (("상위", top), ("하위", low)):
+        for code in codes:
+            dv = source.daily_value(src_con, day, code)
+            for m in markets:
+                try:
+                    res = fetch_day(client, code, day, m, pw)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  {group} | {code} | {m} | 오류: {exc}")
+                    continue
+                known = [b["acml_value_krw"] for b in res.bars if b["acml_value_krw"] is not None]
+                last = known[-1] if known else None
+                last_inc = known[-1] - known[-2] if len(known) >= 2 else None
+                pct = (last - dv) / dv * 100 if (last is not None and dv) else None
+                r = {"group": group, "code": code, "market": m, "bars": len(res.bars), "sum": last,
+                     "daily": dv, "pct": pct, "last_inc": last_inc,
+                     "last_time": res.bars[-1]["time"] if res.bars else None}
+                out.append(r)
+                log(f"  {group} | {code} | {m} | {r['bars']} | {_n(last)} | {_n(dv)} | "
+                    f"{'-' if pct is None else f'{pct:+.3f}'} | {_n(last_inc)} | {r['last_time'] or '-'}")
+    for m in markets:
+        ps = [r["pct"] for r in out if r["market"] == m and r["pct"] is not None]
+        if ps:
+            log(f"  [{m}] 차이(%) 평균 {sum(ps) / len(ps):+.3f}, 최소 {min(ps):+.3f}, 최대 {max(ps):+.3f} ({len(ps)}종목)")
+    log(f"[probe --compare] 총 호출 {client.stats.calls - c0}회, EGW00201 {client.stats.rate_limited}회")
+    return out
+
+
+def _n(v) -> str:
+    return "-" if v is None else f"{v:,}"
+
+
 # ---------------------------------------------------------------- ratetest
 def cmd_ratetest(client, log: Log, day: str, code: str = "005930", stages=(5, 10, 15, 20, 25, 30),
                  seconds: float = 20, market: str = "J", pw: str = "N",

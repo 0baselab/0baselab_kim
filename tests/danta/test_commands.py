@@ -203,3 +203,43 @@ def test_old_db_gets_common_check_column(tmp_path):
     c.commit(); c.close()
     con = store.connect(p)
     assert con.execute("SELECT common_check FROM jobs").fetchone()[0] == "confirmed"
+
+
+class MarketServer:
+    """시장 구분별로 누적 거래대금 배율이 다른 가짜 서버."""
+
+    def __init__(self, day, scale):
+        self.day, self.scale, self.servers = day, scale, {}
+
+    def respond(self, params):
+        key = (params["FID_INPUT_ISCD"], params["FID_COND_MRKT_DIV_CODE"])
+        if key not in self.servers:
+            self.servers[key] = FakeMinuteServer({self.day: day_times()})
+            for r in self.servers[key].rows:
+                r["acml_tr_pbmn"] = str(int(r["acml_tr_pbmn"]) * self.scale[key[1]])
+        return self.servers[key].respond(params)
+
+
+def test_probe_compare_top_low_and_markets(tmp_path):
+    make_source(tmp_path / "m.sqlite")
+    src = source.open_ro(tmp_path / "m.sqlite")
+    srv = MarketServer("20261120", {"J": 1, "UN": 2})
+    logs = []
+    out = commands.cmd_probe_compare(Client(srv), src, logs.append, date(2026, 11, 21), markets=("J", "UN"))
+    codes = [r["code"] for r in out if r["market"] == "J"]
+    assert codes[:5] == ["000000", "000001", "000002", "000003", "000004"]   # 거래대금 상위
+    assert codes[5:] == ["000199", "000198", "000197", "000196", "000195"]   # 하위
+    assert len(out) == 20 and "PREF01" not in codes
+    r0 = next(r for r in out if r["code"] == "000000" and r["market"] == "J")
+    assert r0["sum"] == 391_000 and r0["daily"] == 200_000 and round(r0["pct"], 1) == 95.5
+    assert r0["last_inc"] == 1000 and r0["last_time"] == "153000"
+    un = next(r for r in out if r["code"] == "000000" and r["market"] == "UN")
+    assert un["sum"] == 782_000
+    assert any(l.startswith("  [UN] 차이(%) 평균") for l in logs)
+
+
+def test_mask_paths():
+    from danta.cli import mask_paths
+    masks = [(r"C:\Users\0base\OneDrive\Desktop", "<바탕화면>"), (r"C:\Users\0base", "<사용자폴더>")]
+    assert mask_paths(r"폴더 C:\Users\0base\OneDrive\Desktop\단타분석", masks) == r"폴더 <바탕화면>\단타분석"
+    assert mask_paths(r"키 C:\Users\0base\a\secret", masks) == r"키 <사용자폴더>\a\secret"
