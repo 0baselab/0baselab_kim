@@ -1,0 +1,7 @@
+10:17:36 단타분봉수집기 0.1.0 / backfill / 데이터 폴더 C:\Users\0base\OneDrive\Desktop\단타분석
+10:17:36 기존 DB(읽기 전용): C:\Users\0base\OneDrive\Desktop\주식데이터수집\db\market.sqlite
+10:17:37 (참고) ACML_IS_CUMULATIVE가 Y가 아니어서 value_krw는 비워 둡니다. 나중에 recalc로 채울 수 있습니다.
+10:17:37 [backfill] 전체 33558건 중 남은 33558건, 초당 10건, 호출 상한 200
+10:18:09   진행 49/33558 (0.1%), 호출 200, 실제 6.23/초, EGW00201 13, 남은 예상 6:05:36
+10:18:09 [backfill] 종료: 완료 49, 실패 0, 중단 사유: 호출 상한 200회 도달
+10:18:09 로그 파일: C:\Users\0base\OneDrive\Desktop\단타분석\logs\danta_backfill_20261122-101736.txt
