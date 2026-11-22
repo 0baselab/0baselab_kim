@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime
+from pathlib import Path
+
+from collector.paths import desktop_dir
 
 from collector.timeutil import now_kst
 
@@ -13,6 +16,23 @@ from .kis import KisMinuteClient, redact
 from .version import __version__
 
 
+def _path_masks() -> list[tuple[str, str]]:
+    """로그에서 가릴 경로 (Windows 사용자 폴더명, OneDrive 경로). 긴 것부터 바꾼다."""
+    out = []
+    try:
+        out.append((str(desktop_dir()), "<바탕화면>"))
+    except OSError:
+        pass
+    out.append((str(Path.home()), "<사용자폴더>"))
+    return sorted({(a, b) for a, b in out if a and len(a) > 3}, key=lambda x: len(x[0]), reverse=True)
+
+
+def mask_paths(text: str, masks: list[tuple[str, str]] | None = None) -> str:
+    for src, dst in (masks if masks is not None else _path_masks()):
+        text = text.replace(src, dst)
+    return text
+
+
 class Logger:
     """화면과 logs/danta_<명령>_<시각>.txt에 같은 내용을 남긴다. 키·토큰은 가린다."""
 
@@ -20,9 +40,10 @@ class Logger:
         log_dir.mkdir(parents=True, exist_ok=True)
         self.path = log_dir / f"danta_{name}_{now.strftime('%Y%m%d-%H%M%S')}.txt"
         self.f = self.path.open("a", encoding="utf-8")
+        self.masks = _path_masks()
 
     def __call__(self, msg: str) -> None:
-        line = f"{now_kst().strftime('%H:%M:%S')} {redact(msg)}"
+        line = f"{now_kst().strftime('%H:%M:%S')} {mask_paths(redact(msg), self.masks)}"
         print(line, flush=True)
         self.f.write(line + "\n")
         self.f.flush()
@@ -39,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--code", default="005930")
     pr.add_argument("--date", help="YYYYMMDD (기본: 기존 DB 달력의 직전 거래일)")
     pr.add_argument("--no-oldest", action="store_true", help="가장 오래된 날짜 탐색 생략")
+    pr.add_argument("--compare", action="store_true",
+                    help="거래대금 상위 5 + 하위 5 종목을 같은 날짜로 시장별 수집해 일봉 거래대금과 비교")
+    pr.add_argument("--markets", default="J,UN", help="--compare에서 비교할 시장 구분 (기본 J,UN)")
     rt = sub.add_parser("ratetest", help="초당 호출 한도 단계별 측정")
     rt.add_argument("--code", default="005930")
     rt.add_argument("--date", help="YYYYMMDD (기본: 직전 거래일)")
@@ -88,6 +112,10 @@ def run(argv: list[str]) -> int:
         elif args.cmd == "recalc":
             n = store.recalc_values(store.connect(cfg.db_path))
             log(f"[recalc] {n}개 (종목, 날짜) 다시 계산")
+        elif args.cmd == "probe" and args.compare:
+            markets = tuple(m.strip().upper() for m in args.markets.split(",") if m.strip())
+            commands.cmd_probe_compare(_client(cfg, install), _src(cfg, log, True), log, now.date(),
+                                       args.date, markets, pw)
         elif args.cmd == "probe":
             commands.cmd_probe(_client(cfg, install), _src(cfg, log, False), log, now.date(),
                                args.code, args.date, market, pw, oldest=not args.no_oldest)
@@ -111,7 +139,7 @@ def run(argv: list[str]) -> int:
                 log("(참고) ACML_IS_CUMULATIVE가 Y가 아니어서 value_krw는 비워 둡니다. 나중에 recalc로 채울 수 있습니다.")
             commands.cmd_backfill(client, con, log, now_kst, market, pw, args.max_calls,
                                   cfg.int("MAX_FAILURES"), cfg.acml_is_cumulative)
-        log(f"로그 파일: {log.path}")
+        log(f"로그 파일: {log.path}")  # 화면·로그 모두 경로는 가려서 출력
         return 0
     except SystemExit as exc:
         if isinstance(exc.code, str):

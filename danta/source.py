@@ -88,6 +88,17 @@ def select_codes(con, day: str, top_value: int, top_change: int, allowed: set[st
     return out
 
 
+def value_extremes(con, day: str, n: int = 5) -> tuple[list[str], list[str]]:
+    """그날 보통주 범위(universe_daily, 없으면 price_daily 전체) 중 거래대금 상위 n, 하위 n(0 초과)."""
+    has_u = con.execute("SELECT 1 FROM universe_daily WHERE date=? LIMIT 1", (day,)).fetchone() is not None
+    base = ("SELECT p.code FROM price_daily p JOIN universe_daily u ON u.date=p.date AND u.code=p.code"
+            " AND u.in_universe=1 WHERE p.date=? AND p.value_krw > 0") if has_u else \
+           "SELECT p.code FROM price_daily p WHERE p.date=? AND p.value_krw > 0"
+    top = [r[0] for r in con.execute(base + " ORDER BY p.value_krw DESC, p.code LIMIT ?", (day, n))]
+    low = [r[0] for r in con.execute(base + " ORDER BY p.value_krw ASC, p.code LIMIT ?", (day, n))]
+    return top, [c for c in low if c not in top]
+
+
 def daily_value(con, day: str, code: str) -> int | None:
     r = con.execute("SELECT value_krw FROM price_daily WHERE date=? AND code=?", (day, code)).fetchone()
     return r[0] if r else None
