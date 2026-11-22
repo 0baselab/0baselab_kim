@@ -63,11 +63,38 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 ## 분석용 부분 DB 내보내기 (export)
 
 ```bash
-단타분봉수집기.exe export --since 20250901 --max-mb 380
+단타분봉수집기.exe export
+```
+
+```bash
+단타분봉수집기.exe export --profile all --since 20250901 --max-mb 380
 ```
 
 기존 수집기 DB(`market.sqlite`)를 읽기 전용으로 열어 일부만 `<바탕화면>/단타분석/analysis/market_subset.sqlite`로 복사합니다.
-같은 이름의 파일이 있으면 지우고 새로 만듭니다. 기존 DB는 바뀌지 않습니다.
+같은 이름의 파일이 있으면 지우고 새로 만듭니다. 기존 DB는 바뀌지 않습니다. 기본값은 `--since 20250901`, `--max-mb 380`입니다.
+
+### `--profile analysis` (기본)
+
+분석에 필요한 표·열만 복사합니다. `date` 열이 있는 표는 `date >= --since` 행만 복사합니다. 원본 JSON 판정 규칙은 쓰지 않습니다.
+
+| 표 | 열 |
+|---|---|
+| price_daily | date, code, market, open, high, low, close, change_rate_pct, volume_sh, value_krw, mktcap_krw, listed_shares, is_provisional |
+| universe_daily | date, code, in_universe, exclude_reason, is_admin, is_halted, days_since_listing, is_new_listing |
+| investor_daily | date, code, frgn_net_qty, orgn_net_qty, prsn_net_qty, frgn_net_amt_mil, orgn_net_amt_mil, prsn_net_amt_mil, is_provisional |
+| market_investor_daily | date, market, `*_unconfirmed` 열 전부, index_close, is_provisional |
+| index_daily | date, series, index_name, index_class, open, high, low, close, change_rate_pct, is_provisional |
+| adj_price_daily | code, date, as_of, open, high, low, close |
+| trading_calendar | date, is_open |
+| stock_master | code, name, market, listed_date, krx_secugrp, krx_sect_tp, krx_kind, is_admin, is_halted, first_seen, last_seen |
+| theme_membership, theme_versions | 전체 |
+
+- 원본에 없는 표·열은 경고만 출력하고 건너뜁니다.
+- 열 타입과 기본키(기본키 열이 모두 남을 때)는 원본과 같게 만듭니다.
+- 끝에 표별 행 수와 크기, `investor_daily`의 날짜별 종목 수(최소·평균·최대),
+  `price_daily` 대비 수급이 있는 비율(전체 / 보통주 범위만)을 출력합니다.
+
+### `--profile all` (이전 동작)
 
 | 테이블 종류 | 처리 |
 |---|---|
@@ -75,10 +102,10 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 | `date` 컬럼이 없음 | 20만 행 이하면 통째로 복사, 넘으면 건너뜀 |
 | 원본 응답(JSON 원문)처럼 보이는 큰 텍스트 컬럼이 있음 | 건너뜀 (값이 `{` 또는 `[`로 시작하고 평균 2,000자 이상) |
 
-- 테이블 정의(기본키 포함)는 그대로 복사하고, 별도 인덱스는 크기를 줄이려고 복사하지 않습니다.
-- 화면과 로그에 테이블별 복사 행 수 / 전체 행 수, 컬럼 목록, 건너뛴 이유, 최종 파일 크기를 출력합니다.
-- 마지막에 VACUUM으로 파일 크기를 줄입니다.
-- 결과가 `--max-mb`(기본 380MB)를 넘으면 큰 테이블부터 크기를 출력하고 **실패로 끝납니다**(종료 코드 1).
+### 공통
+
+- 별도 인덱스는 크기를 줄이려고 복사하지 않습니다. 마지막에 VACUUM으로 파일 크기를 줄입니다.
+- 결과가 `--max-mb`를 넘으면 큰 테이블부터 크기를 출력하고 **실패로 끝납니다**(종료 코드 1).
   잘못 넘기는 일이 없도록 결과 파일은 지웁니다. `--since`를 늦춰 다시 실행하세요.
 - 원본 DB 크기만큼 읽으므로 몇 분 걸릴 수 있습니다. 기존 수집기가 실행 중이 아닐 때 돌리세요.
 
