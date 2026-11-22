@@ -34,6 +34,7 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 | `단타분봉수집기.exe ratetest` | 초당 5,10,15,20,25,30건을 단계별 20초씩 호출. EGW00201이 처음 난 단계에서 중단 |
 | `단타분봉수집기.exe jobs` | 기존 일봉 DB에서 날짜별 "거래대금 상위 100 + 등락률 상위 50"(중복 제거)으로 (날짜, 종목) 작업 목록 생성. 기간은 1년 전 ~ 어제 |
 | `단타분봉수집기.exe backfill --rate 10 --max-calls 200` | 작업 목록을 오래된 날짜부터 수집. 이어받기 지원 |
+| `단타분봉수집기.exe daily` | 매일 수집. 아직 수집하지 않은 개장일만 골라 작업을 만들고 바로 수집 + 테마 스냅샷. 기본 초당 5건 (`--rate`로 변경) |
 | `단타분봉수집기.exe recalc` | 저장된 분봉의 1분 거래대금(`value_krw`)을 다시 계산 |
 
 ### backfill 동작
@@ -57,6 +58,49 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 
 분석 단계에서 판정 불가 종목을 빼려면 `WHERE common_check = 'confirmed'` 조건을 쓰면 됩니다.
 분봉 테이블과 함께 쓸 때는 `minute_bar`를 `jobs`와 (code, date)로 연결합니다.
+
+## 매일 수집 (daily)
+
+실행하면 아래 순서로 동작합니다.
+
+1. 기존 수집기가 실행 중이면(`주식데이터수집/system/collector.lock`의 프로그램이 살아 있으면) 1분마다 확인하며 최대 60분 기다립니다.
+   그래도 실행 중이면 로그를 남기고 종료합니다(종료 코드 2). 잠금 파일은 읽기만 합니다.
+2. 테마 스냅샷: 기존 수집기의 `themes/theme_master.csv`를 `theme_snapshot` 테이블에 오늘 날짜로 저장합니다.
+   같은 날짜가 이미 있으면 건너뜁니다. 위치는 설정 `THEME_FILE`로 바꿀 수 있습니다.
+3. 오늘이 개장일인데 기존 DB에 오늘 일봉이 아직 없거나, 달력에 오늘이 없으면
+   "기존 수집기 데이터 대기" 로그를 남기고 정상 종료합니다(종료 코드 0).
+4. 1년 전 ~ 오늘 사이 개장일 중 작업 목록에 아직 없는 날짜(일봉이 있는 날)만 골라 작업을 추가하고 수집합니다.
+   대상 범위를 정하는 방법은 `jobs`와 같습니다.
+5. 실패한 (종목, 날짜)는 다음 실행 때 자동으로 다시 시도합니다. 같은 건이 연속 3회 실패하면(`fail_log` 테이블)
+   재시도를 멈추고 요약에 목록으로 출력합니다. 다시 시도하게 하려면 `fail_log`에서 그 행을 지우면 됩니다.
+6. 요약: 수집 날짜, 완료·실패 건수, 호출 수, EGW00201 수, 재시도 중단 목록, DB에 있는 분봉 날짜 범위.
+
+### Windows 작업 스케줄러 등록
+
+평일 21:30(기존 수집기 20:30 수집 이후)에 실행하고, 22:40에 한 번 더 실행합니다(재실행 1회).
+두 번째 실행은 첫 실행이 기존 수집기를 기다리다 끝났거나 PC가 꺼져 있었을 때를 위한 것입니다.
+이미 다 받은 날에는 호출 없이 바로 끝납니다.
+
+> 작업 스케줄러의 "실패 시 다시 시작" 설정은 프로그램이 0이 아닌 코드로 끝난 경우에는 동작하지 않는 것으로 알려져 있습니다(확인 필요).
+> 그래서 재실행은 두 번째 시각을 등록하는 방식으로 합니다.
+
+PowerShell을 열고 첫 줄의 경로를 실제 설치 경로로 바꿔 아래를 붙여 넣습니다.
+
+```powershell
+$exe = "C:\단타분봉수집기\단타분봉수집기.exe"
+$a = New-ScheduledTaskAction -Execute $exe -Argument "daily" -WorkingDirectory (Split-Path $exe)
+$days = "Monday","Tuesday","Wednesday","Thursday","Friday"
+$t1 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $days -At 21:30
+$t2 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $days -At 22:40
+$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+Register-ScheduledTask -TaskName "단타분봉수집기 daily" -Action $a -Trigger $t1,$t2 -Settings $s
+```
+
+- `-StartWhenAvailable`: 그 시각에 PC가 꺼져 있었으면 켜진 뒤 실행합니다.
+- `-MultipleInstances IgnoreNew`: 앞 실행이 아직 돌고 있으면 두 번째는 건너뜁니다.
+- 로그온한 상태에서만 실행됩니다(바탕화면·OneDrive 경로와 키 파일을 쓰기 때문).
+- 확인: 작업 스케줄러 앱의 "작업 스케줄러 라이브러리"에서 `단타분봉수집기 daily`를 오른쪽 클릭 → 실행 → `<바탕화면>\단타분석\logs\danta_daily_*.txt` 확인.
+- 삭제: `Unregister-ScheduledTask -TaskName "단타분봉수집기 daily"`
 
 ## 측정 순서
 
@@ -96,6 +140,8 @@ KIS 1분봉(주식일별분봉조회, FHKST03010230)을 실측하고, 과거 1�
 | `minute_bar` | code, date, time, open, high, low, close, volume, acml_value_krw(누적 거래대금), value_krw(1분 거래대금), 기본키 (code, date, time) |
 | `done` | code, date, n_bars, n_calls, fetched_at |
 | `jobs` | date, code, reason(value / change / value+change, 판정 불가면 끝에 +판정불가 또는 +판정불가(끝자리0아님)), common_check(confirmed / unknown_code0 / unknown_other) |
+| `fail_log` | code, date, fail_count(연속 실패 횟수), last_error, updated_at. 성공하면 삭제 |
+| `theme_snapshot` | date, code, theme, added_date, basis, note, file_hash. 기본키 (date, theme, code) |
 | `job_days` | date, method, basis_date, note, n_codes (날짜별로 대상 범위를 정한 방법) |
 
 ## 개발

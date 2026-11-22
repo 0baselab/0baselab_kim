@@ -195,23 +195,16 @@ def cmd_ratetest(client, log: Log, day: str, code: str = "005930", stages=(5, 10
 MISSING_RATIO_LIMIT = 0.05
 
 
-def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_change: int = 50) -> int:
-    """날짜별 대상 범위:
+def plan_days(src_con, days: list[str], use_past: bool, top_value: int, top_change: int
+              ) -> tuple[list[tuple], list[tuple]]:
+    """날짜별 작업 선정. 반환: jobs 행 (date, code, reason, common_check), job_days 행.
+
     - universe_daily가 있으면 그날 범위 (universe)
-    - 빠진 날짜가 전체의 5% 이하: 가장 가까운 과거 날짜의 범위 (past_universe). 미래 날짜는 쓰지 않는다.
-    - 5% 초과: 그날 price_daily 종목 중 보통주만 (price_common)
-    과거 범위가 하나도 없는 날짜도 price_common으로 처리한다. 어느 방법을 썼는지 job_days에 날짜별로 기록.
+    - use_past(빠진 날짜 5% 이하)면 가장 가까운 과거 날짜의 범위 (past_universe). 미래 날짜는 쓰지 않는다.
+    - 아니면(또는 과거 범위가 없으면) 그날 price_daily 종목 중 보통주 (price_common)
     """
-    start, end = ymd(one_year_ago(today)), ymd(today - timedelta(days=1))
-    days = source.open_days(src_con, start, end)
-    log(f"[jobs] 기간 {start}~{end}, 거래일 달력상 개장일 {len(days)}일")
     have = source.universe_dates(src_con)
     have_set = set(have)
-    missing = [d for d in days if d not in have_set]
-    ratio = len(missing) / len(days) if days else 0.0
-    use_past = ratio <= MISSING_RATIO_LIMIT
-    log(f"[jobs] universe_daily 빠진 날짜 {len(missing)}일 ({ratio * 100:.1f}%) → "
-        f"{'가장 가까운 과거 날짜 범위' if use_past else '그날 price_daily 보통주'} 사용")
     rows, day_rows = [], []
     for d in days:
         basis, note, unknown = None, None, []
@@ -250,25 +243,48 @@ def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_chan
         for c, why in picked.items():
             rows.append((d, c, why, flags.get(c, "confirmed")))
         day_rows.append((d, method, basis, note, len(picked)))
-    with con:
-        con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM job_days")
-        con.executemany("INSERT INTO jobs(date, code, reason, common_check) VALUES (?,?,?,?)", rows)
-        con.executemany("INSERT INTO job_days(date, method, basis_date, note, n_codes) VALUES (?,?,?,?,?)", day_rows)
+    return rows, day_rows
+
+
+def _use_past(src_con, days: list[str], log: Log) -> bool:
+    have = set(source.universe_dates(src_con))
+    missing = [d for d in days if d not in have]
+    ratio = len(missing) / len(days) if days else 0.0
+    use_past = ratio <= MISSING_RATIO_LIMIT
+    log(f"[jobs] universe_daily 빠진 날짜 {len(missing)}일 ({ratio * 100:.1f}%) → "
+        f"{'가장 가까운 과거 날짜 범위' if use_past else '그날 price_daily 보통주'} 사용")
+    return use_past
+
+
+def _log_day_rows(log: Log, rows: list[tuple], day_rows: list[tuple]) -> None:
     counts = Counter(r[1] for r in day_rows)
     log(f"[jobs] 작업 {len(rows)}건 생성. 날짜별 방법: " + ", ".join(f"{k} {v}일" for k, v in sorted(counts.items())))
     for d, method, basis, note, n in day_rows:
         if method != "universe":
             log(f"  {d}: {method}" + (f" (기준 {basis})" if basis else "") + (f" - {note}" if note else "")
                 + f", {n}종목")
+
+
+def cmd_jobs(src_con, con, log: Log, today: Date, top_value: int = 100, top_change: int = 50) -> int:
+    """기간 전체(1년 전 ~ 어제)의 작업 목록을 새로 만든다. 날짜별 방법은 job_days에 기록."""
+    start, end = ymd(one_year_ago(today)), ymd(today - timedelta(days=1))
+    days = source.open_days(src_con, start, end)
+    log(f"[jobs] 기간 {start}~{end}, 거래일 달력상 개장일 {len(days)}일")
+    rows, day_rows = plan_days(src_con, days, _use_past(src_con, days, log), top_value, top_change)
+    with con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM job_days")
+        con.executemany("INSERT INTO jobs(date, code, reason, common_check) VALUES (?,?,?,?)", rows)
+        con.executemany("INSERT INTO job_days(date, method, basis_date, note, n_codes) VALUES (?,?,?,?,?)", day_rows)
+    _log_day_rows(log, rows, day_rows)
     return len(rows)
 
 
 # ---------------------------------------------------------------- backfill
 def cmd_backfill(client, con, log: Log, now: Callable[[], datetime], market: str = "J", pw: str = "N",
                  max_calls: int = 0, max_failures: int = 20, compute_value: bool = False,
-                 every: int = 50, clock: Callable[[], float] = time.monotonic) -> dict:
-    todo = store.pending_jobs(con)
+                 every: int = 50, clock: Callable[[], float] = time.monotonic, max_retry: int = 3) -> dict:
+    todo = store.pending_jobs(con, max_retry)
     total_jobs = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     log(f"[backfill] 전체 {total_jobs}건 중 남은 {len(todo)}건, 초당 {client.limiter.per_sec:g}건, "
         f"호출 상한 {max_calls or '무제한'}")
@@ -290,7 +306,9 @@ def cmd_backfill(client, con, log: Log, now: Callable[[], datetime], market: str
             break
         except Exception as exc:  # noqa: BLE001
             fails += 1
-            log(f"  실패 {day} {code}: {exc} (누적 {fails})")
+            n = store.record_fail(con, code, day, str(exc), now().isoformat(timespec="seconds"))
+            log(f"  실패 {day} {code}: {exc} (이번 실행 누적 {fails}, 이 건 연속 {n}회"
+                + (" → 재시도 중단" if max_retry and n >= max_retry else "") + ")")
             if fails >= max_failures:
                 stop = f"실패 {fails}건 누적"
                 break
@@ -300,7 +318,8 @@ def cmd_backfill(client, con, log: Log, now: Callable[[], datetime], market: str
     _progress(log, done + fails, len(todo), client.stats.calls - c0, clock() - t0,
               client.stats.rate_limited - egw0)
     log(f"[backfill] 종료: 완료 {done}, 실패 {fails}" + (f", 중단 사유: {stop}" if stop else ""))
-    return {"done": done, "fails": fails, "stop": stop, "calls": client.stats.calls - c0}
+    return {"done": done, "fails": fails, "stop": stop, "calls": client.stats.calls - c0,
+            "egw": client.stats.rate_limited - egw0}
 
 
 def _progress(log: Log, i: int, n: int, calls: int, el: float, egw: int) -> None:
@@ -308,3 +327,96 @@ def _progress(log: Log, i: int, n: int, calls: int, el: float, egw: int) -> None
     eta = (n - i) * (el / i) if i else 0.0
     log(f"  진행 {i}/{n} ({i / n * 100 if n else 100:.1f}%), 호출 {calls}, 실제 {rate:.2f}/초, "
         f"EGW00201 {egw}, 남은 예상 {timedelta(seconds=int(eta))}")
+
+
+# ---------------------------------------------------------------- daily
+def wait_for_collector(lock_path, wait_minutes: float, log: Log, sleep: Callable[[float], None] = time.sleep,
+                       alive: Callable[[int], bool] | None = None, step_sec: float = 60) -> bool:
+    """기존 수집기 잠금 파일(system/collector.lock)의 PID가 살아 있으면 최대 wait_minutes분 기다린다.
+
+    잠금 파일은 읽기만 한다 (지우거나 고치지 않음). 끝내 실행 중이면 False.
+    """
+    if alive is None:
+        from collector.lock import pid_alive as alive
+
+    def running() -> int | None:
+        try:
+            pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            return None
+        return pid if pid > 0 and alive(pid) else None
+
+    pid = running()
+    if pid is None:
+        return True
+    log(f"[daily] 기존 수집기 실행 중 (PID {pid}) → 최대 {wait_minutes:g}분 대기")
+    waited = 0.0
+    while waited < wait_minutes * 60:
+        sleep(step_sec)
+        waited += step_sec
+        if running() is None:
+            log(f"[daily] 기존 수집기 종료 확인 ({waited / 60:.0f}분 대기)")
+            return True
+    log(f"[daily] {wait_minutes:g}분 기다렸지만 기존 수집기가 아직 실행 중 → 이번 실행 종료")
+    return False
+
+
+def snapshot_themes(con, theme_file, day: str, log: Log) -> str:
+    if not theme_file.exists():
+        log(f"[theme] 테마 파일 없음: {theme_file} → 스냅샷 건너뜀")
+        return "missing"
+    rows, digest = source.read_theme_file(theme_file)
+    if store.save_theme_snapshot(con, day, rows, digest):
+        log(f"[theme] {day} 스냅샷 저장: {len(rows)}행")
+        return "saved"
+    log(f"[theme] {day} 스냅샷이 이미 있어 건너뜀")
+    return "exists"
+
+
+def cmd_daily(client, src_con, con, log: Log, now: Callable[[], datetime], theme_file, collector_lock,
+              market: str = "J", pw: str = "N", wait_minutes: float = 60, top_value: int = 100,
+              top_change: int = 50, compute_value: bool = True, max_retry: int = 3,
+              max_failures: int = 20, sleep: Callable[[float], None] = time.sleep,
+              alive: Callable[[int], bool] | None = None) -> dict:
+    """미수집 개장일의 작업을 만들고 바로 수집한다 (jobs + backfill, 새 날짜만).
+
+    반환 status: done / waiting_data / collector_running
+    """
+    if not wait_for_collector(collector_lock, wait_minutes, log, sleep, alive):
+        return {"status": "collector_running"}
+    today = now().date()
+    t = ymd(today)
+    snapshot_themes(con, theme_file, t, log)
+
+    st = source.calendar_status(src_con, t)
+    if st is None:
+        log(f"[daily] 기존 수집기 데이터 대기: 거래일 달력에 오늘({t}) 개장 여부가 아직 없음 → 정상 종료")
+        return {"status": "waiting_data"}
+    if st == 1 and not source.has_price(src_con, t):
+        log(f"[daily] 기존 수집기 데이터 대기: 오늘({t}) 일봉이 기존 DB에 아직 없음 → 정상 종료")
+        return {"status": "waiting_data"}
+
+    start = ymd(one_year_ago(today))
+    period = source.open_days(src_con, start, t)
+    planned = store.planned_dates(con)
+    new_days = [d for d in period if d not in planned and source.has_price(src_con, d)]
+    if new_days:
+        log(f"[daily] 새로 수집할 날짜 {len(new_days)}일: {new_days[0]}~{new_days[-1]}")
+        rows, day_rows = plan_days(src_con, new_days, _use_past(src_con, period, log), top_value, top_change)
+        store.add_jobs(con, rows, day_rows)
+        _log_day_rows(log, rows, day_rows)
+    else:
+        log("[daily] 새로 수집할 날짜 없음 (남은 작업·재시도만 처리)")
+
+    r = cmd_backfill(client, con, log, now, market, pw, 0, max_failures, compute_value, max_retry=max_retry)
+    gave_up = store.given_up(con, max_retry)
+    lo, hi = store.bar_date_range(con)
+    log("[daily] 요약")
+    log(f"  수집 날짜: {', '.join(new_days) if new_days else '(새 날짜 없음)'}")
+    log(f"  완료 {r['done']}건, 실패 {r['fails']}건, 호출 {r['calls']}회, EGW00201 {r['egw']}회"
+        + (f", 중단 사유: {r['stop']}" if r["stop"] else ""))
+    log(f"  재시도 중단(연속 {max_retry}회 실패) {len(gave_up)}건" + (":" if gave_up else ""))
+    for d, c, n, err in gave_up:
+        log(f"    {d} {c} ({n}회) {err}")
+    log(f"  DB 분봉 날짜 범위: {lo or '-'} ~ {hi or '-'}")
+    return {"status": "done", "new_days": new_days, "gave_up": gave_up, "range": (lo, hi), **r}

@@ -11,7 +11,7 @@ from collector.paths import desktop_dir
 from collector.timeutil import now_kst
 
 from . import commands, source, store
-from .config import install_dir, load_config, load_keys
+from .config import collector_lock, install_dir, load_config, load_keys, theme_file
 from .kis import KisMinuteClient, redact
 from .version import __version__
 
@@ -70,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     bf = sub.add_parser("backfill", help="작업 목록을 오래된 날짜부터 수집 (이어받기)")
     bf.add_argument("--rate", type=float, help="초당 호출 수 (기본: 설정 RATE)")
     bf.add_argument("--max-calls", type=int, default=0, help="이번 실행 호출 상한 (0=무제한)")
+    dl = sub.add_parser("daily", help="미수집 개장일만 골라 작업 생성 + 수집, 테마 스냅샷 (작업 스케줄러용)")
+    dl.add_argument("--rate", type=float, help="초당 호출 수 (기본: 설정 DAILY_RATE=5)")
+    dl.add_argument("--wait-minutes", type=float, help="기존 수집기 실행 중일 때 최대 대기 분 (기본 60)")
     sub.add_parser("recalc", help="저장된 분봉의 1분 거래대금(value_krw) 다시 계산")
     return p
 
@@ -138,7 +141,21 @@ def run(argv: list[str]) -> int:
             if not cfg.acml_is_cumulative:
                 log("(참고) ACML_IS_CUMULATIVE가 Y가 아니어서 value_krw는 비워 둡니다. 나중에 recalc로 채울 수 있습니다.")
             commands.cmd_backfill(client, con, log, now_kst, market, pw, args.max_calls,
-                                  cfg.int("MAX_FAILURES"), cfg.acml_is_cumulative)
+                                  cfg.int("MAX_FAILURES"), cfg.acml_is_cumulative, max_retry=cfg.int("MAX_RETRY"))
+        elif args.cmd == "daily":
+            client = _client(cfg, install)
+            client.set_rate(args.rate or cfg.num("DAILY_RATE"))
+            if not cfg.acml_is_cumulative:
+                log("(참고) ACML_IS_CUMULATIVE가 Y가 아니어서 value_krw는 비워 둡니다.")
+            r = commands.cmd_daily(
+                client, _src(cfg, log, True), store.connect(cfg.db_path), log, now_kst,
+                theme_file(cfg), collector_lock(cfg), market, pw,
+                args.wait_minutes if args.wait_minutes is not None else cfg.num("COLLECTOR_WAIT_MINUTES"),
+                cfg.int("TOP_VALUE"), cfg.int("TOP_CHANGE"), cfg.acml_is_cumulative,
+                cfg.int("MAX_RETRY"), cfg.int("MAX_FAILURES"))
+            log(f"로그 파일: {log.path}")
+            # 기존 수집기가 끝내 실행 중이면 2로 끝내 작업 스케줄러가 '실패'로 보고 다시 실행하게 한다
+            return 2 if r["status"] == "collector_running" else 0
         log(f"로그 파일: {log.path}")  # 화면·로그 모두 경로는 가려서 출력
         return 0
     except SystemExit as exc:
