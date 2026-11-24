@@ -140,6 +140,7 @@ class TossClient:
     client_secret: str
     token_path: Path
     rate_factor: float = 0.5
+    group_rates: dict = field(default_factory=dict)   # 그룹별 초당 호출 수 직접 지정 (예: {"MARKET_DATA_CHART": 5})
     retry_429: int = 5
     http: httpx.Client | None = None
     now: Callable[[], datetime] = now_kst
@@ -159,9 +160,14 @@ class TossClient:
 
     def limiter(self, group: str) -> RateLimiter:
         if group not in self._limiters:
-            self._limiters[group] = RateLimiter(DOC_LIMITS.get(group, 1) * self.rate_factor,
-                                                clock=self.clock, sleep=self.sleep)
+            rate = self.group_rates.get(group) or DOC_LIMITS.get(group, 1) * self.rate_factor
+            self._limiters[group] = RateLimiter(rate, clock=self.clock, sleep=self.sleep)
         return self._limiters[group]
+
+    def set_group_rate(self, group: str, per_sec: float) -> None:
+        self.group_rates[group] = per_sec
+        if group in self._limiters:
+            self._limiters[group].set_rate(per_sec)
 
     def _send(self, method: str, path: str, **kw) -> tuple[str, httpx.Response]:
         group = group_of(method, path)  # 허용 목록 검사가 항상 먼저
