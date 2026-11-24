@@ -1,0 +1,124 @@
+# 토스측정(toss/) 릴리즈 자동화 (기존 수집기 build.yml과 같은 규칙, 별도 버전·태그)
+# 토스 Open API 키는 쓰지 않는다 (테스트는 가짜 서버로만).
+# - PR: 테스트·빌드 성공 여부와 toss/version.py 버전이 이미 릴리즈됐는지 검사
+# - main 병합: toss-v<버전> 태그가 없을 때만 빌드 → 태그·Release 생성 → zip 첨부
+# - 수동 실행: 시험 빌드만
+# API 키·GitHub Secrets를 쓰지 않는다. 데이터 수집에 쓰지 않는다.
+name: build-toss
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "toss/**"
+      - "tests/toss/**"
+      - "run_toss.py"
+      - "packaging/toss.spec"
+      - "collector/http.py"
+      - "collector/paths.py"
+      - "collector/timeutil.py"
+      - "danta/cli.py"
+      - "danta/source.py"
+      - "requirements*.txt"
+      - ".github/workflows/build-toss.yml"
+  push:
+    branches: [main]
+    paths:
+      - "toss/**"
+      - "tests/toss/**"
+      - "run_toss.py"
+      - "packaging/toss.spec"
+      - "collector/http.py"
+      - "collector/paths.py"
+      - "collector/timeutil.py"
+      - "danta/cli.py"
+      - "danta/source.py"
+      - "requirements*.txt"
+      - ".github/workflows/build-toss.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-toss-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 버전 읽기, 이미 릴리즈된 버전인지 확인
+        id: ver
+        run: |
+          $v = python -c "import toss.version as m; print(m.__version__)"
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "toss/version.py 버전 형식 오류: $v" }
+          $tag = "toss-v$v"
+          $exists = git ls-remote --tags origin "refs/tags/$tag"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          if ($exists) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          Write-Output "toss/version.py = $v, 태그 존재 = $([bool]$exists)"
+
+      - name: PR 검사 - 버전을 올렸는지
+        if: github.event_name == 'pull_request' && steps.ver.outputs.exists == 'true'
+        run: throw "${{ steps.ver.outputs.tag }}는 이미 릴리즈된 버전입니다. toss/version.py의 버전을 올려주세요."
+
+      - name: 의존성 설치
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: 테스트 (실제 API 호출 없음)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
+        run: python -m pytest -q tests/toss
+
+      - name: PyInstaller 빌드 (--onedir)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
+        run: python -m PyInstaller --noconfirm --clean packaging/toss.spec
+
+      - name: 실행 확인 (--version)
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
+        run: |
+          $out = & "dist/토스측정/토스측정.exe" --version
+          Write-Output $out
+          if ($out -ne "${{ steps.ver.outputs.version }}") { throw "버전 불일치: $out" }
+
+      - name: zip 만들기
+        id: zip
+        if: steps.ver.outputs.exists == 'false' || github.event_name == 'workflow_dispatch'
+        run: |
+          $name = "토스측정_${{ steps.ver.outputs.tag }}.zip"
+          Copy-Item toss/README.md "dist/토스측정/README.md"
+          New-Item -ItemType Directory -Force "dist/토스측정/config" | Out-Null
+          Copy-Item config/toss_settings.env.example "dist/토스측정/config/toss_settings.env.example"
+          Compress-Archive -Path "dist/토스측정" -DestinationPath $name
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: zip에 secret/·설정 파일이 없는지 검사
+        if: steps.zip.outputs.name != ''
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("${{ steps.zip.outputs.name }}")
+          $bad = $zip.Entries | Where-Object { $_.FullName -match '(^|/|\\)secret(/|\\)' -or $_.FullName -match '\.env$' -or $_.FullName -match 'kis_token' -or $_.FullName -match 'toss_token' }
+          $zip.Dispose()
+          if ($bad) { $bad | ForEach-Object { $_.FullName }; throw "배포본에 넣으면 안 되는 파일이 있습니다." }
+
+      - name: 태그·Release 생성, zip 첨부 (main 병합 + 새 버전일 때만)
+        if: github.event_name == 'push' && steps.ver.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: 토스측정 ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          make_latest: false
+          files: ${{ steps.zip.outputs.name }}
