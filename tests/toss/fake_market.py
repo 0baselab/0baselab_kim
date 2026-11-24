@@ -14,12 +14,14 @@ def iso(day: str, hm: str) -> str:
 
 
 class FakeMarket:
-    def __init__(self, days, symbols, list_dates=None, prev_day=None, fail=None):
+    def __init__(self, days, symbols, list_dates=None, prev_day=None, fail=None, nxt=None, split=None):
         self.days = sorted(days)                      # YYYY-MM-DD 거래일
         self.symbols = symbols                        # {code: market}
         self.list_dates = list_dates or {}
         self.prev_day = prev_day or self.days[-1]
         self.fail = fail or set()                     # 분봉 조회가 실패할 (code)
+        self.nxt = nxt or set()                       # NXT 거래 가능 종목
+        self.split = split or {}                      # {code: 날짜} 이 날 2:1 액면분할 (수정주가는 그 전 가격이 절반)
         self.calls = []
         self.token = "TOKEN-xyz-12345678"
 
@@ -64,15 +66,21 @@ class FakeMarket:
                    for c, m in self.symbols.items() if m == q["market"]]
             return httpx.Response(200, json={"result": res})
         if path == "/api/v1/stocks":
-            return httpx.Response(200, json={"result": [{"symbol": s, "listDate": self.list_dates.get(s, "2000-01-01")}
+            return httpx.Response(200, json={"result": [{"symbol": s, "listDate": self.list_dates.get(s, "2000-01-01"),
+                                                         "koreanMarketDetail": {"nxtSupported": s in self.nxt}}
                                                         for s in q["symbols"].split(",")]})
-        if path == "/api/v1/market-indicators/KOSPI/candles":
+        if path in ("/api/v1/market-indicators/KOSPI/candles", "/api/v1/market-indicators/KOSDAQ/candles"):
+            base = 2500 if "KOSPI" in path else 800
             return httpx.Response(200, json=self._page(
-                [{"timestamp": iso(d, "00:00"), "closePrice": "1"} for d in self.days[::-1]], q))
+                [{"timestamp": iso(d, "00:00"), "openPrice": str(base), "highPrice": str(base + 10),
+                  "lowPrice": str(base - 10), "closePrice": str(base + 5), "volume": "1"} for d in self.days[::-1]], q))
         if path == "/api/v1/candles":
             code = q["symbol"]
             if q["interval"] == "1d":
-                return httpx.Response(200, json=self._page(self.daily(code), q))
+                bars = self.daily(code)
+                if q.get("adjusted") == "true" and code in self.split:
+                    bars = [dict(b, closePrice="52.5") if b["timestamp"][:10] < self.split[code] else b for b in bars]
+                return httpx.Response(200, json=self._page(bars, q))
             if code in self.fail:
                 return httpx.Response(500, json={"error": {"code": "internal-error", "message": "x"}})
             src = []

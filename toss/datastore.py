@@ -33,6 +33,16 @@ CREATE TABLE IF NOT EXISTS progress (
     kind TEXT NOT NULL, code TEXT NOT NULL, last_date TEXT NOT NULL, updated_at TEXT NOT NULL,
     PRIMARY KEY (kind, code)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS index_daily (
+    symbol TEXT NOT NULL, date TEXT NOT NULL,       -- KOSPI / KOSDAQ
+    open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume INTEGER,
+    PRIMARY KEY (symbol, date)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS adj_daily (
+    code TEXT NOT NULL, date TEXT NOT NULL,
+    adj_close NUMERIC,           -- 수정주가 종가 (as_of 시점 기준으로 소급 조정된 값)
+    adj_factor REAL,             -- adj_close / daily_bar.close. 날짜 사이에 값이 바뀌면 분할·병합·권리락 등
+    as_of TEXT NOT NULL,         -- 수정주가를 받은 날
+    PRIMARY KEY (code, date)) WITHOUT ROWID;
 """
 
 MINUTE_SCHEMA = """
@@ -61,6 +71,9 @@ def connect_daily(store_dir: Path) -> sqlite3.Connection:
     con = sqlite3.connect(str(store_dir / "daily.sqlite"))
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(DAILY_SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(universe)")}
+    if "nxt_supported" not in cols:  # 0.2.3: NXT 거래 가능 여부 (토스 stocks.koreanMarketDetail.nxtSupported)
+        con.execute("ALTER TABLE universe ADD COLUMN nxt_supported INTEGER")
     return con
 
 

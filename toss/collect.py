@@ -39,11 +39,13 @@ def refresh_universe(client: TossClient, dcon, log: Log, now) -> int:
         items += [dict(i, market=market) for i in got if i.get("symbol")]
     if not items:
         raise SystemExit("종목 목록이 비어 있습니다 (stocks/all). 잠시 후 다시 실행하세요.")
-    list_dates = {}
+    list_dates, nxt = {}, {}
     syms = [i["symbol"] for i in items]
-    for k in range(0, len(syms), 200):  # stocks/all에는 상장일이 없어 stocks로 조회
+    for k in range(0, len(syms), 200):  # stocks/all에는 상장일·NXT 여부가 없어 stocks로 조회
         for s in client.get("/api/v1/stocks", {"symbols": ",".join(syms[k:k + 200])}).get("result") or []:
             list_dates[s.get("symbol")] = s.get("listDate")
+            v = (s.get("koreanMarketDetail") or {}).get("nxtSupported")
+            nxt[s.get("symbol")] = None if v is None else int(bool(v))
     with dcon:
         dcon.execute("UPDATE universe SET active=0")
         for i in items:
@@ -54,9 +56,11 @@ def refresh_universe(client: TossClient, dcon, log: Log, now) -> int:
                 " list_date=COALESCE(excluded.list_date, universe.list_date), last_seen=excluded.last_seen, active=1",
                 (i["symbol"], i.get("name"), i["market"], i.get("securityType"), int(bool(i.get("isCommonShare"))),
                  list_dates.get(i["symbol"]), today, today))
+            dcon.execute("UPDATE universe SET nxt_supported=? WHERE code=?", (nxt.get(i["symbol"]), i["symbol"]))
         dcon.execute("INSERT OR REPLACE INTO meta VALUES ('universe_refreshed', ?)", (today,))
     gone = dcon.execute("SELECT COUNT(*) FROM universe WHERE active=0").fetchone()[0]
-    log(f"[universe] 주식 보통주 {len(items):,}종목 (KOSPI·KOSDAQ), 목록에서 빠진 종목 누적 {gone}")
+    n_nxt = sum(1 for v in nxt.values() if v)
+    log(f"[universe] 주식 보통주 {len(items):,}종목 (KOSPI·KOSDAQ, NXT 거래 가능 {n_nxt:,}), 목록에서 빠진 종목 누적 {gone}")
     return len(items)
 
 
@@ -84,18 +88,25 @@ def previous_business_day(client) -> str:
 
 
 def refresh_trading_days(client, dcon, log: Log, since: str) -> int:
-    """KOSPI 지수 일봉 날짜 = 거래일. since(YYYY-MM-DD)까지 과거로."""
-    have = dcon.execute("SELECT MIN(date), MAX(date) FROM trading_day").fetchone()
-    stop_at = datetime.fromisoformat(_kst(since, "00:00:00"))
-    if have[0] and have[0] <= since:  # 과거는 이미 있음 → 최근 것만
-        stop_at = datetime.fromisoformat(_kst(have[1], "00:00:00"))
-    r = page_candles(client, "/api/v1/market-indicators/KOSPI/candles", {"interval": "1d", "count": 200}, 20,
-                     stop_when=lambda t: t < stop_at)
-    days = sorted({parse_ts(b["timestamp"]).date().isoformat() for b in r.bars})
-    with dcon:
-        dcon.executemany("INSERT OR IGNORE INTO trading_day VALUES (?, 'KOSPI_1d')", [(d,) for d in days])
+    """KOSPI·KOSDAQ 지수 일봉을 저장하고(index_daily), KOSPI 지수 일봉 날짜 = 거래일. since(YYYY-MM-DD)까지 과거로.
+    지수 캔들 timestamp는 봉 시작 시각이라 날짜 부분만 쓴다."""
+    calls = 0
+    for sym in ("KOSPI", "KOSDAQ"):
+        have = dcon.execute("SELECT MIN(date), MAX(date) FROM index_daily WHERE symbol=?", (sym,)).fetchone()
+        stop_at = datetime.fromisoformat(_kst(since, "00:00:00"))
+        if have[0] and have[0] <= since:  # 과거는 이미 있음 → 마지막 날(진행 중이었을 수 있음)부터 다시
+            stop_at = datetime.fromisoformat(_kst(have[1], "00:00:00"))
+        r = page_candles(client, f"/api/v1/market-indicators/{sym}/candles", {"interval": "1d", "count": 200}, 20,
+                         stop_when=lambda t: t < stop_at)
+        calls += r.calls
+        rows = [(sym, parse_ts(b["timestamp"]).date().isoformat(), ds.num(b.get("openPrice")), ds.num(b.get("highPrice")),
+                 ds.num(b.get("lowPrice")), ds.num(b.get("closePrice")), ds.num(b.get("volume"))) for b in r.bars]
+        with dcon:
+            dcon.executemany("INSERT OR REPLACE INTO index_daily VALUES (?,?,?,?,?,?,?)", rows)
+            if sym == "KOSPI":
+                dcon.executemany("INSERT OR IGNORE INTO trading_day VALUES (?, 'KOSPI_1d')", [(x[1],) for x in rows])
     n = dcon.execute("SELECT COUNT(*) FROM trading_day").fetchone()[0]
-    log(f"[trading-day] KOSPI 지수 일봉으로 거래일 갱신 (호출 {r.calls}회, 누적 {n}일)")
+    log(f"[trading-day] KOSPI·KOSDAQ 지수 일봉 저장, 거래일 갱신 (호출 {calls}회, 누적 {n}일)")
     return n
 
 
@@ -199,6 +210,52 @@ def daily_update(client, dcon, store_dir: Path, log: Log, now, history_days: int
     el = time.monotonic() - t0
     log(f"[daily-update] 완료: 갱신 {done}건, 저장 {rows:,}행, 실패 {fails}, 호출 {client.calls - c0}회, {el:.0f}초")
     return {"end": end, "done": done, "rows": rows, "fails": fails, "calls": client.calls - c0}
+
+
+# ---------------------------------------------------------------- 수정주가 (처음 1회 + 주 1회)
+def adjust_due(dcon, now, every_days: int) -> bool:
+    r = dcon.execute("SELECT value FROM meta WHERE key='adj_refreshed'").fetchone()
+    return not r or (now().date() - Date.fromisoformat(r[0])).days >= every_days
+
+
+def adjust_update(client, dcon, log: Log, now, history_days: int = 365, end: str | None = None,
+                  max_minutes: float = 0, clock: Callable[[], float] = time.monotonic) -> dict:
+    """수정주가(adjusted=true) 일봉 종가를 1년치 다시 받아 adj_daily를 통째로 갱신한다.
+    수정주가는 분할·병합 등이 생기면 과거 값이 소급해 바뀌므로 매번 전체를 받는다(종목당 약 2회 호출)."""
+    end = end or previous_business_day(client)
+    first = (now().date() - timedelta(days=history_days)).isoformat()
+    codes = active_codes(dcon)
+    log(f"[adjust] 수정주가 종가 갱신: {len(codes):,}종목, {first}~{end} (주 1회)")
+    t0, c0, n = clock(), client.calls, 0
+    today = now().date().isoformat()
+    for i, code in enumerate(codes, 1):
+        if max_minutes and clock() - t0 > max_minutes * 60:
+            log(f"[adjust] 실행 시간 제한으로 중단 ({i - 1}/{len(codes)}). 다음 실행 때 처음부터 다시 함")
+            return {"done": False, "codes": i - 1}
+        stop = datetime.fromisoformat(_kst(first, "00:00:00"))
+        r = page_candles(client, CANDLES, {"symbol": code, "interval": "1d", "count": 200, "adjusted": "true",
+                                           "before": _kst(end, "23:59:59")}, 10, stop_when=lambda t: t < stop)
+        rows = []
+        for b in r.bars:
+            d = parse_ts(b["timestamp"]).date().isoformat()
+            if first <= d <= end:
+                rows.append((code, d, ds.num(b.get("closePrice")), today))
+        with dcon:
+            dcon.execute("DELETE FROM adj_daily WHERE code=?", (code,))
+            dcon.executemany("INSERT INTO adj_daily(code, date, adj_close, as_of) VALUES (?,?,?,?)", rows)
+            dcon.execute("UPDATE adj_daily SET adj_factor = adj_close * 1.0 / (SELECT close FROM daily_bar b"
+                         " WHERE b.code=adj_daily.code AND b.date=adj_daily.date AND b.close > 0) WHERE code=?", (code,))
+        n += len(rows)
+        if i % 300 == 0:
+            el = clock() - t0
+            log(f"  진행 {i}/{len(codes)}, 호출 {client.calls - c0}, 남은 예상 {timedelta(seconds=int(el / i * (len(codes) - i)))}")
+    with dcon:
+        dcon.execute("INSERT OR REPLACE INTO meta VALUES ('adj_refreshed', ?)", (today,))
+    events = dcon.execute(
+        "SELECT COUNT(*) FROM (SELECT code, date, adj_factor, LAG(adj_factor) OVER (PARTITION BY code ORDER BY date) p"
+        " FROM adj_daily) WHERE p IS NOT NULL AND ABS(adj_factor / p - 1) > 0.001").fetchone()[0]
+    log(f"[adjust] 완료: {n:,}행, 호출 {client.calls - c0}회, 수정계수가 바뀐 날(분할·병합·권리락 등 추정) {events}건")
+    return {"done": True, "rows": n, "events": events}
 
 
 # ---------------------------------------------------------------- 분봉

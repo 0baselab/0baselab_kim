@@ -30,7 +30,8 @@ DEFAULTS: dict[str, str] = {
     "HISTORY_DAYS": "365",   # 분봉·일봉을 처음 받을 때 과거 범위 (달력일)
     "INVESTOR_DAILY": "N",   # Y면 daily-update에서 종목별 투자자 순매수 거래량도 수집
     "MAX_RETRY": "3",
-    "BACKFILL_CHUNK_DAYS": "20",  # 빨리 채우기 구간 크기(거래일). 최근 구간부터 완성        # 같은 (종목, 날짜) 분봉이 연속 이 횟수만큼 실패하면 그날은 건너뜀
+    "BACKFILL_CHUNK_DAYS": "20",
+    "ADJ_REFRESH_DAYS": "7",      # 수정주가 갱신 주기(일). minute-update 시작 때 주기가 됐으면 먼저 갱신  # 빨리 채우기 구간 크기(거래일). 최근 구간부터 완성        # 같은 (종목, 날짜) 분봉이 연속 이 횟수만큼 실패하면 그날은 건너뜀
 }
 
 
