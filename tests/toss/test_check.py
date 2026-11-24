@@ -63,6 +63,7 @@ def test_cmd_candles_check(tmp_path):
     out = commands.cmd_candles_check(c, con, logs.append, NOW, "20261120", n=4)
     assert [x["symbol"] for x in out["symbols"]] == ["A", "B", "E", "F"]     # 상위 2 + 100위 쪽 2
     assert out["regular_completeness"] == 1.0 and out["close_match_regular"] == 4 and out["daily_checked"] == 4
+    assert out["ohlc_match_all"] == 4
     assert any("KIS 데이터는 쓰지 않음" in l for l in logs)
     assert store.get_result(con, "candles_check")[0]["close_match_regular"] == 4
     out2 = commands.cmd_candles_check(c, con, lambda m: None, NOW, "20261120", symbols=["005930"])
@@ -71,11 +72,14 @@ def test_cmd_candles_check(tmp_path):
 
 def test_judge_with_check():
     depth = {"m1": {"trading_days": 729}}
-    ok = {"regular_completeness": 1.0, "daily_checked": 10, "close_match_regular": 10}
+    ok = {"regular_completeness": 1.0, "daily_checked": 10, "close_match_regular": 4, "ohlc_match_all": 10}
     v, why = commands.judge(depth, None, ok)
     assert v == "대체 가능 (자체 점검 기준)" and any("KIS 분봉과 같은 값인지는 비교하지 않았" in w for w in why)
     assert commands.judge(depth, None, dict(ok, regular_completeness=0.95))[0] == "대체 불가"
-    assert commands.judge(depth, None, dict(ok, close_match_regular=8))[0] == "대체 불가"
+    assert commands.judge(depth, None, dict(ok, ohlc_match_all=8))[0] == "대체 불가"
+    # 0.1.1 결과(ohlc_match_all 없음)는 전체 세션 종가 일치 수로 판정
+    old = {"regular_completeness": 0.999, "daily_checked": 10, "close_match_regular": 4, "close_match_all": 10}
+    assert commands.judge(depth, None, old)[0] == "대체 가능 (자체 점검 기준)"
     assert commands.judge(depth, None, None)[0] == "판정 불가"
     # KIS 비교가 있으면 그것이 우선
     assert commands.judge(depth, {"overall_close_rate": 0.5}, ok)[0] == "대체 불가"
@@ -120,3 +124,12 @@ def test_check_defaults_to_previous_business_day(tmp_path):
     logs = []
     out = commands.cmd_candles_check(c, store.connect(tmp_path / "t.sqlite"), logs.append, NOW, None, ["A"])
     assert out["date"] == "20261120" and any("전 영업일 20261120" in l for l in logs)
+
+
+def test_etf_auction_bar_at_1529_is_not_missing():
+    bars = [b for b in minute_bars("20261120") if not b["timestamp"].startswith("2026-11-20T15:31")]  # 15:30 시작 봉 없음
+    c = check_day(bars, daily_for(bars))
+    assert c["regular_missing"] == 0 and c["auction_at_1529"] is True
+    bars2 = [b for b in bars if not b["timestamp"].startswith("2026-11-20T15:30")]   # 15:29 봉도 없음 → 진짜 누락
+    c2 = check_day(bars2, None)
+    assert "1530" in c2["missing_examples"] and c2["auction_at_1529"] is False
