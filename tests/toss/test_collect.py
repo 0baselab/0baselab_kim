@@ -222,3 +222,29 @@ def test_adjust_update_weekly_and_split_detection(tmp_path):
     assert not collect.adjust_due(d, NOW, 7)
     later = lambda: datetime(2026, 12, 1, 8, 0, tzinfo=KST)
     assert collect.adjust_due(d, later, 7)
+
+
+def test_focus_first_then_full(tmp_path, monkeypatch):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    monkeypatch.setattr(collect, "FOCUS_TOP_VALUE", 1)   # 거래대금 1위만 (값이 같으면 코드 순 → 000001)
+    monkeypatch.setattr(collect, "FOCUS_TOP_CHANGE", 0)
+    t = {"now": 0.0}
+
+    def clock():
+        t["now"] += 5
+        return t["now"]
+    logs = []
+    # 우선 수집(4일 × 1종목)은 끝나고 전 종목 채우기 도중에 멈출 만큼의 시간
+    r = collect.minute_backfill(c, d, store, logs.append, NOW, history_days=30, max_minutes=0.5, clock=clock)
+    assert any("[focus] 우선 수집: 4일" in l for l in logs)
+    for day in DAYS:
+        assert collect.focus_done(store, day)
+        con = sqlite3.connect(ds.minute_path(store, day))
+        assert "000001" in {x for (x,) in con.execute("SELECT code FROM code_done")}
+        con.close()
+    assert ds.minute_status(store, "2026-11-18") != "complete"
+    r = collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30)
+    assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
+    s = collect.status(d, store, lambda x: None, NOW, history_days=30)
+    assert s["focus"] == 4
