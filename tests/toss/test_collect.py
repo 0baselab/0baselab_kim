@@ -144,7 +144,7 @@ def test_backfill_same_result_as_daywise_with_fewer_calls(tmp_path):
         assert ds.minute_status(b_store, day) == "complete"
         assert _dump(b_store, day) == _dump(a_store, day)           # 날짜 단위 결과와 똑같음
     assert back_calls < daywise_calls
-    assert any("종목 단위 연속 수집" in l for l in logs)
+    assert any("구간 1/1" in l for l in logs)
 
 
 def test_backfill_resume_after_time_limit(tmp_path):
@@ -170,3 +170,20 @@ def test_backfill_failure_counts_per_day(tmp_path):
     con = sqlite3.connect(ds.minute_path(store, "2026-11-18"))
     assert con.execute("SELECT fail_count FROM code_fail WHERE code='000002'").fetchone()[0] == 3
     assert con.execute("SELECT value FROM file_meta WHERE key='n_given_up'").fetchone()[0] == "1"
+
+
+def test_backfill_chunks_complete_recent_first(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    t = {"now": 0.0}
+
+    def clock():
+        t["now"] += 10
+        return t["now"]
+    logs = []
+    # 구간 크기 1일: 23일(날짜 단위) → 20일 → 19일 → 18일 순서. 시간 제한으로 중간에 멈춤
+    r = collect.minute_backfill(c, d, store, logs.append, NOW, history_days=30, chunk_days=1, max_minutes=3, clock=clock)
+    assert r["days_done"][:2] == ["2026-11-23", "2026-11-20"]
+    assert ds.minute_status(store, "2026-11-18") != "complete" and "실행 시간 제한" in r["stop"]
+    assert any("구간 1/3: 2026-11-20~2026-11-20" in l for l in logs)
+    r = collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30, chunk_days=2)
+    assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
