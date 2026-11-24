@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from datetime import datetime
 
@@ -50,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
     sub.add_parser("adjust-update", help="[수집] 수정주가 종가 1년치 갱신 (보통은 minute-update가 주 1회 자동으로 함)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
+    tr = sub.add_parser("trade", help="[매매] 1단계: replay(저장된 분봉 재생, 가상 체결)만 가능. 실주문 없음")
+    tr.add_argument("--mode", choices=["replay"], default="replay")
+    tr.add_argument("--from", dest="d_from", help="YYYYMMDD (기본: 완성된 분봉이 있는 첫 날)")
+    tr.add_argument("--to", dest="d_to", help="YYYYMMDD (기본: 완성된 분봉이 있는 마지막 날)")
     sub.add_parser("auth", help="토큰 발급, 계좌 목록 조회")
     d = sub.add_parser("candles-depth", help="1분봉·일봉을 과거로 넘기며 가장 오래된 날짜 측정")
     d.add_argument("--symbol", default="005930")
@@ -73,6 +78,36 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def run_trade(args, cfg, install, log) -> None:
+    from .trade import engine, store as tstore
+    from .trade.settings import TradeSettings
+    s = TradeSettings.load(install / "config" / "trade_settings.env")
+    dcon = sqlite3.connect(f"{(cfg.store_dir / 'daily.sqlite').resolve().as_uri()}?mode=ro", uri=True)
+    all_days = [r[0] for r in dcon.execute("SELECT date FROM trading_day ORDER BY date")]
+    iso = lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}" if x else None
+    lo, hi = iso(args.d_from), iso(args.d_to)
+    days = [d for d in all_days if (not lo or d >= lo) and (not hi or d <= hi)
+            and datastore.minute_status(cfg.store_dir, d) == "complete"]
+    if not days:
+        raise SystemExit("재생할 날짜가 없습니다 (완성된 분봉 파일이 없음). status로 분봉 완성 날짜를 확인하세요.")
+    tcon = tstore.connect(cfg.data_dir / "trade.sqlite")
+    started = now_kst()
+    run_id = f"replay-{started.strftime('%Y%m%d-%H%M%S')}"
+    tstore.start_run(tcon, run_id, "replay", started.isoformat(timespec="seconds"), days[0], days[-1], vars(s))
+    log(f"[trade replay] {run_id}: {days[0]}~{days[-1]} {len(days)}일, 시드 {s.SEED_KRW:,}원, 1회 {s.ORDER_KRW:,}원, "
+        f"동시 {s.MAX_POSITIONS}종목, 하루 손실 한도 {s.DAILY_LOSS_KRW:,}원, 누적 {s.TOTAL_LOSS_KRW:,}원")
+    log(f"  전략: 시가 범위 09:00~09:29 돌파, 손절 {s.STOP_PCT * 100:g}%(또는 범위 저가), 익절 "
+        f"{s.TAKE_PROFIT_PCT * 100:g}%, 15:19 청산, 비용 매수 {s.BUY_COST_RATE * 100:g}% 매도 {s.SELL_COST_RATE * 100:g}%, "
+        f"슬리피지 {s.SLIPPAGE_TICKS}호가")
+    summ = engine.replay(dcon, cfg.store_dir, days, s, tcon, run_id, log, all_days)
+    if summ.get("disabled"):
+        log(f"  누적 손실 한도 도달: {summ['disabled']}")
+    engine.report(tcon, run_id, log)
+    with tcon:
+        tcon.execute("UPDATE run SET ended_at=? WHERE run_id=?", (now_kst().isoformat(timespec="seconds"), run_id))
+    log(f"  기록: {cfg.data_dir / 'trade.sqlite'} (run_id {run_id})")
+
+
 def run(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -89,14 +124,16 @@ def run(argv: list[str]) -> int:
     try:
         log(f"토스단타 {__version__} / {args.cmd} / 데이터 폴더 {cfg.data_dir}")
         rf = cfg.num("RATE_FACTOR")
-        if args.cmd not in ("limits", "report", "status"):  # 토큰은 1개뿐이라 동시에 두 개 실행하지 않는다
+        if args.cmd not in ("limits", "report", "status", "trade"):  # 토큰은 1개뿐이라 동시에 두 개 실행하지 않는다
             from collector.lock import AlreadyRunning, Lock
             lock = Lock(cfg.lock_path)
             try:
                 lock.acquire()
             except AlreadyRunning as exc:
                 raise SystemExit(f"토스단타가 이미 실행 중입니다. ({exc})")
-        if args.cmd == "status":
+        if args.cmd == "trade":  # replay는 API를 부르지 않고 파일만 읽으므로 수집 중에도 실행 가능
+            run_trade(args, cfg, install, log)
+        elif args.cmd == "status":
             collect.status(datastore.connect_daily(cfg.store_dir), cfg.store_dir, log, now_kst, int(cfg.num("HISTORY_DAYS")))
         elif args.cmd == "limits":
             commands.cmd_limits(con, log, rf)
