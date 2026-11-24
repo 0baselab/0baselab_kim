@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--symbol", default="005930")
     m = sub.add_parser("market", help="장 운영 시간, 지수 1분봉 깊이, 섹터")
     m.add_argument("--max-calls", type=int, help="지수별 호출 상한 (기본 설정 MAX_CALLS)")
+    k = sub.add_parser("candles-check", help="KIS 없이 토스 1분봉을 같은 날 토스 일봉과 대조 (자체 점검)")
+    k.add_argument("--date", help="YYYYMMDD. 비우면 전 영업일 (아침에 전일자 점검)")
+    k.add_argument("--symbols", help="콤마로 구분한 종목코드. 비우면 오늘 거래대금 순위 상위 n/2 + 100위 쪽 n/2")
+    k.add_argument("--n", type=int, default=10)
     sub.add_parser("limits", help="기록된 그룹별 호출 한도 헤더 요약")
     sub.add_parser("report", help="측정 결과 요약(마크다운)과 KIS 분봉 대체 판정")
     return p
@@ -94,9 +98,13 @@ def run(argv: list[str]) -> int:
                 from danta.source import SourceDbError, open_ro
                 try:
                     danta = open_ro(cfg.danta_db)
-                except SourceDbError as exc:
-                    raise SystemExit(str(exc).replace("기존 수집기 DB", "danta.sqlite"))
+                except SourceDbError:
+                    raise SystemExit(f"danta.sqlite가 없습니다: {cfg.danta_db} (config/toss_settings.env의 DANTA_DB로 위치 지정). "
+                                     "KIS 분봉 없이 점검하려면 candles-check를 쓰세요.")
                 commands.cmd_candles_compare(client, con, danta, log, now_kst, args.date, args.n)
+            elif args.cmd == "candles-check":
+                syms = [x.strip() for x in (args.symbols or "").split(",") if x.strip()] or None
+                commands.cmd_candles_check(client, con, log, now_kst, args.date, syms, args.n)
             elif args.cmd == "rankings":
                 commands.cmd_rankings(client, con, log, now_kst, args.watch, args.times)
             elif args.cmd == "stock-info":

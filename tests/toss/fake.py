@@ -31,8 +31,10 @@ def minute_bars(day: str, start="09:00", end="15:30", extra=()):
 
 
 class FakeToss:
-    def __init__(self, bars=None, expires_in=86400):
+    def __init__(self, bars=None, expires_in=86400, daily=None, rankings=None):
         self.bars = bars or []                # 최신순
+        self.daily = daily or []              # 1d 봉 (최신순)
+        self.rankings = rankings or []
         self.expires_in = expires_in
         self.issued = 0
         self.valid = None
@@ -56,13 +58,16 @@ class FakeToss:
         if req.url.path == "/api/v1/candles":
             before = params.get("before")
             count = int(params.get("count", 100))
-            sel = [b for b in self.bars if before is None or
+            src = self.daily if params.get("interval") == "1d" else self.bars
+            sel = [b for b in src if before is None or
                    datetime.fromisoformat(b["timestamp"]) <= datetime.fromisoformat(before)]
             page = sel[:count]
             nb = None
             if len(sel) > count:
                 nb = (datetime.fromisoformat(page[-1]["timestamp"]) - timedelta(seconds=1)).isoformat()
             return httpx.Response(200, json={"result": {"candles": page, "nextBefore": nb}}, headers=hdr)
+        if req.url.path == "/api/v1/rankings":
+            return httpx.Response(200, json={"result": {"rankedAt": "x", "rankings": self.rankings}}, headers=hdr)
         if req.url.path == "/api/v1/accounts":
             return httpx.Response(200, json={"result": [
                 {"accountNo": "12345678901", "accountSeq": 7, "accountType": "BROKERAGE"}]}, headers=hdr)
