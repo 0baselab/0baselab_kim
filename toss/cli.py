@@ -162,6 +162,8 @@ def run(argv: list[str]) -> int:
             elif args.cmd == "minute-update":
                 if args.rate:
                     client.set_group_rate("MARKET_DATA_CHART", args.rate)
+                if not args.date:
+                    collect.index_minute_update(client, dcon, log, now_kst, hd)
                 if not args.date and collect.adjust_due(dcon, now_kst, int(cfg.num("ADJ_REFRESH_DAYS"))):
                     collect.ensure_universe(client, dcon, log, now_kst)
                     log("수정주가 갱신 주기가 되어 먼저 갱신합니다 (약 25분, 주 1회)")

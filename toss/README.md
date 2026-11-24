@@ -58,6 +58,7 @@
 |---|---|---|
 | `daily.sqlite` | `universe` | 주식(STOCK) 보통주 목록. 상장일, 마지막으로 목록에 있던 날, 현재 목록에 있는지(active), **NXT 거래 가능 여부(nxt_supported, 현재 기준)** |
 | | `index_daily` | KOSPI·KOSDAQ 지수 일봉 symbol, date, open, high, low, close, volume |
+| | `index_minute` | KOSPI·KOSDAQ 지수 1분봉 symbol, date, t(봉 **시작** 시각, 09:00=540), open, high, low, close, volume. 처음 1년치는 minute-update 시작 때(약 7분), 이후 daily-update·minute-update가 덧붙임 |
 | | `adj_daily` | 수정주가 종가(adj_close), 수정계수(adj_factor = adj_close / 일봉 close), 받은 날(as_of). **수정계수가 날짜 사이에 바뀌면 분할·병합·권리락 등이 있었던 것** |
 | | `trading_day` | 거래일 = KOSPI 지수 일봉이 있는 날 (평일을 거래일로 가정하지 않음) |
 | | `daily_bar` | 일봉 code, date, open, high, low, close, volume, `value_est_krw`, `value_est_src` |

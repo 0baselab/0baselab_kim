@@ -209,6 +209,12 @@ def daily_update(client, dcon, store_dir: Path, log: Log, now, history_days: int
                 f"429 {client.n429}, 남은 예상 {timedelta(seconds=int(el / i * (len(codes) - i)))}")
     el = time.monotonic() - t0
     log(f"[daily-update] 완료: 갱신 {done}건, 저장 {rows:,}행, 실패 {fails}, 호출 {client.calls - c0}회, {el:.0f}초")
+    try:
+        index_minute_update(client, dcon, log, now, history_days, end)
+    except (NotAllowedError, TossAuthError):
+        raise
+    except Exception as exc:  # noqa: BLE001  지수 분봉 실패가 아침 일봉 보충을 막지 않게
+        log(f"[index-minute] 실패 (다음 실행 때 다시 시도): {exc}")
     return {"end": end, "done": done, "rows": rows, "fails": fails, "calls": client.calls - c0}
 
 
@@ -379,6 +385,8 @@ def status(dcon, store_dir: Path, log: Log, now, history_days: int = 365) -> dic
     log(f"[status] 종목 목록 {uni[1] or 0:,}종목 (누적 {uni[0]:,})")
     log(f"[status] 일봉 {dmin}~{dmax}, {drows:,}행, 전 거래일({last})까지 안 받은 종목 {lag}")
     log(f"[status] 수급 {inv[0]}~{inv[1]}, {inv[2]:,}행")
+    for sym, lo, hi, n in dcon.execute("SELECT symbol, MIN(date), MAX(date), COUNT(*) FROM index_minute GROUP BY symbol"):
+        log(f"[status] 지수 분봉 {sym}: {lo}~{hi}, {n:,}봉")
     log(f"[status] 분봉 ({first}~{last}, 거래일 {len(days)}일): 완성 {len(st['complete'])}, 진행 중 {len(st['partial'])}, "
         f"없음 {len(st['missing'])}, 파일 합계 {size / 1024 / 1024:,.1f}MB")
     log(f"[status] 우선 수집(거래대금 상위 100 + 등락률 상위 50 + W7) 끝난 날 {focus_n}/{len(days)}일")
@@ -666,4 +674,41 @@ def focus_phase(client, dcon, store_dir: Path, log: Log, now, days: list[str], a
     out["calls"] = client.calls - c0
     log(f"[focus] 이번 실행 우선 수집 끝난 날 {len(out['days'])}일, 호출 {out['calls']}회"
         + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
+    return out
+
+
+
+# ---------------------------------------------------------------- 지수 분봉 (KOSPI·KOSDAQ)
+INDEX_SYMBOLS = ("KOSPI", "KOSDAQ")
+
+
+def index_minute_update(client, dcon, log: Log, now, history_days: int = 365, end: str | None = None) -> dict:
+    """KOSPI·KOSDAQ 지수 1분봉을 index_minute에 채운다. 처음엔 history_days, 이후엔 마지막 저장일부터.
+    지수 캔들 timestamp는 봉 '시작' 시각이므로 그대로 t로 쓴다(종목 캔들과 다름).
+    호출 한도 그룹이 MARKET_INDICATOR_CHART라 종목 분봉 수집 속도에 영향이 없다."""
+    end = end or previous_business_day(client)
+    first = (now().date() - timedelta(days=history_days)).isoformat()
+    out = {}
+    for sym in INDEX_SYMBOLS:
+        last = dcon.execute("SELECT MAX(date) FROM index_minute WHERE symbol=?", (sym,)).fetchone()[0]
+        start = last if last and last >= first else first   # 마지막 날은 다시 받음(그때 진행 중이었을 수 있음)
+        if last and last >= end:
+            out[sym] = 0
+            continue
+        stop = datetime.fromisoformat(_kst(start, "00:00:00"))
+        r = page_candles(client, f"/api/v1/market-indicators/{sym}/candles",
+                         {"interval": "1m", "count": 200, "before": _kst(end, "23:59:59")}, 3000,
+                         stop_when=lambda t: t < stop)
+        rows = []
+        for b in r.bars:
+            st = parse_ts(b["timestamp"])
+            d = st.date().isoformat()
+            if start <= d <= end:
+                rows.append((sym, d, st.hour * 60 + st.minute, ds.num(b.get("openPrice")), ds.num(b.get("highPrice")),
+                             ds.num(b.get("lowPrice")), ds.num(b.get("closePrice")), ds.num(b.get("volume"))))
+        with dcon:
+            dcon.execute("DELETE FROM index_minute WHERE symbol=? AND date >= ?", (sym, start))
+            dcon.executemany("INSERT OR REPLACE INTO index_minute VALUES (?,?,?,?,?,?,?,?)", rows)
+        out[sym] = r.calls
+        log(f"[index-minute] {sym}: {start}~{end}, {len(rows):,}봉, 호출 {r.calls}회")
     return out
