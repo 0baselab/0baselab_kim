@@ -8,7 +8,7 @@ from datetime import datetime
 from collector.timeutil import now_kst
 from danta.cli import _path_masks, mask_paths
 
-from . import commands, store
+from . import collect, commands, datastore, store
 from .client import IpNotAllowedError, NotAllowedError, TossApiError, TossAuthError, TossClient, redact
 from .config import install_dir, load_config, load_keys
 from .version import __version__
@@ -37,9 +37,16 @@ class Logger:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="토스측정", description="토스증권 Open API 조회 전용 측정 (주문 기능 없음)")
+    p = argparse.ArgumentParser(prog="토스단타", description="토스증권 Open API 조회 전용 수집·측정 (주문 기능 없음)")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("universe", help="[수집] 주식 보통주 목록 갱신 (KOSPI·KOSDAQ)")
+    sub.add_parser("daily-update", help="[수집·아침용] 일봉(+설정 시 수급)을 전 영업일까지 보충")
+    mu = sub.add_parser("minute-update", help="[수집·검증용] 분봉 날짜 파일 채우기 (최근 날짜부터, 이어받기)")
+    mu.add_argument("--max-minutes", type=float, default=0, help="이번 실행 최대 시간(분). 0=제한 없음")
+    mu.add_argument("--rate", type=float, help="캔들 초당 호출 수 (기본: 설정 CHART_RATE=5)")
+    mu.add_argument("--date", help="YYYYMMDD 하루만")
+    sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
     sub.add_parser("auth", help="토큰 발급, 계좌 목록 조회")
     d = sub.add_parser("candles-depth", help="1분봉·일봉을 과거로 넘기며 가장 오래된 날짜 측정")
     d.add_argument("--symbol", default="005930")
@@ -75,10 +82,20 @@ def run(argv: list[str]) -> int:
     log = Logger(cfg.log_dir, args.cmd, now)
     con = store.connect(cfg.db_path)
     rate_buf = []
+    lock = None
     try:
-        log(f"토스측정 {__version__} / {args.cmd} / 데이터 폴더 {cfg.data_dir}")
+        log(f"토스단타 {__version__} / {args.cmd} / 데이터 폴더 {cfg.data_dir}")
         rf = cfg.num("RATE_FACTOR")
-        if args.cmd == "limits":
+        if args.cmd not in ("limits", "report", "status"):  # 토큰은 1개뿐이라 동시에 두 개 실행하지 않는다
+            from collector.lock import AlreadyRunning, Lock
+            lock = Lock(cfg.lock_path)
+            try:
+                lock.acquire()
+            except AlreadyRunning as exc:
+                raise SystemExit(f"토스단타가 이미 실행 중입니다. ({exc})")
+        if args.cmd == "status":
+            collect.status(datastore.connect_daily(cfg.store_dir), cfg.store_dir, log, now_kst, int(cfg.num("HISTORY_DAYS")))
+        elif args.cmd == "limits":
             commands.cmd_limits(con, log, rf)
         elif args.cmd == "report":
             path = commands.cmd_report(con, log, now_kst, cfg.data_dir)
@@ -87,10 +104,25 @@ def run(argv: list[str]) -> int:
             keys = load_keys(install)
             client = TossClient(cfg.get("BASE_URL"), keys["TOSS_CLIENT_ID"], keys["TOSS_CLIENT_SECRET"],
                                 cfg.token_path, rate_factor=rf, retry_429=int(cfg.num("RETRY_429")),
+                                group_rates={"MARKET_DATA_CHART": cfg.num("CHART_RATE")},
                                 on_rate=lambda rec: rate_buf.append((now_kst().isoformat(timespec="seconds"), rec)))
             mc = int(cfg.num("MAX_CALLS"))
             yrs = cfg.num("MAX_YEARS")
-            if args.cmd == "auth":
+            hd = int(cfg.num("HISTORY_DAYS"))
+            if args.cmd in ("universe", "daily-update", "minute-update"):
+                dcon = datastore.connect_daily(cfg.store_dir)
+            if args.cmd == "universe":
+                collect.refresh_universe(client, dcon, log, now_kst)
+            elif args.cmd == "daily-update":
+                collect.daily_update(client, dcon, cfg.store_dir, log, now_kst, hd,
+                                     investor=cfg.get("INVESTOR_DAILY").upper() in ("Y", "1", "TRUE"))
+            elif args.cmd == "minute-update":
+                if args.rate:
+                    client.set_group_rate("MARKET_DATA_CHART", args.rate)
+                day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
+                collect.minute_update(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
+                                      int(cfg.num("MAX_RETRY")), only_day=day)
+            elif args.cmd == "auth":
                 commands.cmd_auth(client, con, log, now_kst)
             elif args.cmd == "candles-depth":
                 commands.cmd_candles_depth(client, con, log, now_kst, args.symbol, args.max_calls or mc, yrs)
@@ -139,6 +171,8 @@ def run(argv: list[str]) -> int:
         log(f"오류로 중단: {type(exc).__name__}: {exc}")
         return 1
     finally:
+        if lock is not None:
+            lock.release()
         with con:
             for at, rec in rate_buf:
                 store.log_rate(con, at, rec)
