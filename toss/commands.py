@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import store
-from .candles import best_alignment, compare_bars, page_candles, parse_ts, session_counts
+from .candles import best_alignment, check_day, compare_bars, page_candles, parse_ts, session_counts
 from .client import TossClient, sensitive
 
 Log = Callable[[str], None]
@@ -65,7 +65,9 @@ def _adjusted_compare(client, symbol: str, interval: str, log: Log) -> dict:
     b = (client.get(CANDLES, {"symbol": symbol, "interval": interval, "count": 200, "adjusted": "false"})
          .get("result") or {}).get("candles") or []
     bm = {x["timestamp"]: x for x in b}
-    common = [x for x in a if x["timestamp"] in bm]
+    # 가장 최근 봉은 장중에 계속 바뀌므로(두 번 조회 사이에 값이 달라짐) 비교에서 뺀다
+    newest = max([x["timestamp"] for x in a] + [x["timestamp"] for x in b], default=None)
+    common = [x for x in a if x["timestamp"] in bm and x["timestamp"] != newest]
     diff = [x for x in common if any(x.get(f) != bm[x["timestamp"]].get(f)
                                      for f in ("openPrice", "highPrice", "lowPrice", "closePrice", "volume"))]
     out = {"interval": interval, "adjusted_true": len(a), "adjusted_false": len(b), "common": len(common),
@@ -156,6 +158,61 @@ def cmd_candles_compare(client, con, danta: sqlite3.Connection, log: Log, now, d
     return out
 
 
+# ---------------------------------------------------------------- candles-check (KIS 없이 자체 점검)
+def default_symbols(client, n: int = 10) -> list[str]:
+    """오늘 거래대금 순위(1d)에서 상위 n/2 + 100위 쪽 n/2."""
+    rk = (client.get("/api/v1/rankings", {"type": "MARKET_TRADING_AMOUNT", "marketCountry": "KR",
+                                          "duration": "1d", "count": 100}).get("result") or {}).get("rankings") or []
+    syms = [x["symbol"] for x in rk if x.get("symbol")]
+    k = max(1, n // 2)
+    return list(dict.fromkeys(syms[:k] + syms[-k:]))
+
+
+def toss_daily_bar(client, symbol: str, day: str) -> dict | None:
+    r = page_candles(client, CANDLES, {"symbol": symbol, "interval": "1d", "count": 5, "adjusted": "false",
+                                       "before": _iso(day) + "T23:59:59+09:00"}, 1)
+    return next((b for b in r.bars if parse_ts(b["timestamp"]).date().isoformat() == _iso(day)), None)
+
+
+def cmd_candles_check(client, con, log: Log, now, day: str, symbols: list[str] | None = None, n: int = 10) -> dict:
+    syms = symbols or default_symbols(client, n)
+    log(f"[candles-check] 날짜 {day}, 종목 {len(syms)}개: {', '.join(syms)}")
+    log("  토스 1분봉(봉 시작 시각 기준)을 같은 날 토스 일봉과 대조. KIS 데이터는 쓰지 않음")
+    per, miss_tot, exp_tot = [], 0, 0
+    for sym in syms:
+        bars = toss_day_bars(client, sym, day)
+        store.save_candles(con, sym, "1m", False, bars)
+        d1 = toss_daily_bar(client, sym, day)
+        c = check_day(bars, d1)
+        c["symbol"] = sym
+        per.append(c)
+        miss_tot += c["regular_missing"]
+        exp_tot += c["regular_expected"]
+        yn = lambda m: "-" if m is None else " ".join(f"{k[0].upper()}{'O' if v else 'X'}" for k, v in m.items())
+        v = c["volume"]
+        f = lambda x: "-" if x is None else f"{x:+.2f}%"
+        log(f"  {sym}: 봉 {c['bars']}개 ({c['first_start']}~{c['last_start']} 시작), 정규장 누락 {c['regular_missing']}분"
+            + (f" 예 {c['missing_examples']}" if c["regular_missing"] else "")
+            + f", 15:20~15:29 봉 {c['auction_1520_1529_bars']}, 거래량 0인 봉 {c['zero_volume_bars']}")
+        log(f"     일봉 {c['daily']}")
+        log(f"     일봉과 같은가 (O 시가 H 고가 L 저가 C 종가): 정규장 분봉 {yn(c['match_regular'])} / "
+            f"전체 세션 분봉 {yn(c['match_all_sessions'])}")
+        log(f"     거래량: 정규장 분봉 합 {v['regular']} ({f(v['regular_vs_daily_pct'])}), 전체 분봉 합 {v['all']} "
+            f"({f(v['all_vs_daily_pct'])}), 일봉 {v['daily']}")
+    with_daily = [c for c in per if c["match_regular"] is not None]
+    close_reg = sum(1 for c in with_daily if c["match_regular"]["close"])
+    close_all = sum(1 for c in with_daily if c["match_all_sessions"] and c["match_all_sessions"]["close"])
+    out = {"date": day, "symbols": per, "regular_completeness": (1 - miss_tot / exp_tot) if exp_tot else None,
+           "daily_checked": len(with_daily), "close_match_regular": close_reg, "close_match_all": close_all}
+    comp = out["regular_completeness"]
+    log(f"[candles-check] 정규장 분봉 완전성 {'-' if comp is None else f'{comp * 100:.2f}%'} "
+        f"(누락 {miss_tot}분 / 기대 {exp_tot}분)")
+    log(f"[candles-check] 일봉 종가 = 정규장 마지막 분봉 종가: {close_reg}/{len(with_daily)}, "
+        f"= 전체 세션 마지막 분봉 종가: {close_all}/{len(with_daily)}")
+    store.put_result(con, "candles_check", out, _now_s(now))
+    return out
+
+
 # ---------------------------------------------------------------- rankings
 RANK_COMBOS = [("MARKET_TRADING_AMOUNT", "realtime"), ("MARKET_TRADING_AMOUNT", "1d"),
                ("MARKET_TRADING_VOLUME", "realtime"), ("MARKET_TRADING_VOLUME", "1d"), ("TOP_GAINERS", "1d")]
@@ -239,8 +296,12 @@ def cmd_stock_info(client, con, log: Log, now, symbol: str = "005930", max_calls
         for status in ("ACTIVE", "DELISTED"):
             items = client.get("/api/v1/stocks/all", {"market": market, "status": status}).get("result") or []
             common = sum(1 for i in items if i.get("isCommonShare"))
-            out["universe"][f"{market}_{status}"] = {"total": len(items), "common": common}
-            log(f"[stocks/all] {market} {status}: {len(items):,}종목, 보통주(isCommonShare) {common:,}")
+            stock_common = sum(1 for i in items if i.get("isCommonShare") and i.get("securityType") == "STOCK")
+            types = Counter(i.get("securityType") for i in items)
+            out["universe"][f"{market}_{status}"] = {"total": len(items), "common": common,
+                                                     "stock_common": stock_common, "by_type": dict(types)}
+            log(f"[stocks/all] {market} {status}: {len(items):,}종목, isCommonShare {common:,}, "
+                f"그중 주식(STOCK) 보통주 {stock_common:,} / 유형별 {dict(types)}")
             if status == "DELISTED":
                 delisted += [i["symbol"] for i in items if i.get("symbol")]
     # stocks/all 응답에는 delistDate가 없어 stocks(최대 200건씩)로 조회
@@ -317,17 +378,31 @@ def cmd_limits(con, log: Log, rate_factor: float) -> list[tuple]:
 
 
 # ---------------------------------------------------------------- report
-def judge(depth: dict | None, compare: dict | None) -> tuple[str, list[str]]:
-    """KIS 분봉 매일 수집 대체 가능 여부. 기준: 토스 1분봉 30거래일 이상 + 정규장 종가 일치율 99% 이상."""
-    why = []
-    if not depth or not compare or compare.get("overall_close_rate") is None:
-        miss = [n for n, v in (("candles-depth", depth), ("candles-compare", compare)) if not v]
-        return "판정 불가", [f"측정 안 됨: {', '.join(miss) or 'candles-compare 비교 봉 없음'}"]
+def judge(depth: dict | None, compare: dict | None, check: dict | None = None) -> tuple[str, list[str]]:
+    """KIS 분봉 매일 수집을 토스로 대체할 수 있는지.
+
+    - KIS 비교(candles-compare)가 있으면: 1분봉 30거래일 이상 + 정규장 종가 일치율 99% 이상
+    - 없으면 자체 점검(candles-check): 1분봉 30거래일 이상 + 정규장 분봉 완전성 99% 이상
+      + 일봉 종가가 정규장 마지막 분봉 종가와 같은 종목 99% 이상. (KIS와 같은지는 확인하지 않음)
+    """
+    if not depth:
+        return "판정 불가", ["측정 안 됨: candles-depth"]
     days = (depth.get("m1") or {}).get("trading_days") or 0
-    rate = compare["overall_close_rate"]
-    why.append(f"토스 1분봉 과거 깊이 {days}일 ({'충족' if days >= 30 else '미달'}, 기준 30거래일 이상)")
-    why.append(f"정규장 종가 일치율 {rate * 100:.2f}% ({'충족' if rate >= 0.99 else '미달'}, 기준 99% 이상)")
-    return ("대체 가능" if days >= 30 and rate >= 0.99 else "대체 불가"), why
+    why = [f"토스 1분봉 과거 깊이 {days}일 ({'충족' if days >= 30 else '미달'}, 기준 30거래일 이상)"]
+    if compare and compare.get("overall_close_rate") is not None:
+        rate = compare["overall_close_rate"]
+        why.append(f"KIS 대비 정규장 종가 일치율 {rate * 100:.2f}% ({'충족' if rate >= 0.99 else '미달'}, 기준 99% 이상)")
+        return ("대체 가능" if days >= 30 and rate >= 0.99 else "대체 불가"), why
+    if check and check.get("regular_completeness") is not None and check.get("daily_checked"):
+        comp = check["regular_completeness"]
+        cr = check["close_match_regular"] / check["daily_checked"]
+        why.append(f"정규장 분봉 완전성 {comp * 100:.2f}% ({'충족' if comp >= 0.99 else '미달'}, 기준 99% 이상)")
+        why.append(f"일봉 종가 = 정규장 마지막 분봉 종가 {check['close_match_regular']}/{check['daily_checked']}종목 "
+                   f"({'충족' if cr >= 0.99 else '미달'}, 기준 99% 이상)")
+        why.append("KIS 분봉과 같은 값인지는 비교하지 않았습니다 (토스 자체 점검 기준)")
+        ok = days >= 30 and comp >= 0.99 and cr >= 0.99
+        return ("대체 가능 (자체 점검 기준)" if ok else "대체 불가"), why
+    return "판정 불가", ["측정 안 됨: candles-compare 또는 candles-check"]
 
 
 def _yn(cond) -> str:
@@ -336,8 +411,8 @@ def _yn(cond) -> str:
 
 def cmd_report(con, log: Log, now, out_dir: Path) -> Path:
     g = lambda k: store.get_result(con, k)[0]
-    auth, depth, comp, rk, rkw, si, mk = (g("auth"), g("candles_depth"), g("candles_compare"), g("rankings"),
-                                          g("rankings_watch"), g("stock_info"), g("market"))
+    auth, depth, comp, rk, rkw, si, mk, chk = (g("auth"), g("candles_depth"), g("candles_compare"), g("rankings"),
+                                               g("rankings_watch"), g("stock_info"), g("market"), g("candles_check"))
     L = [f"# 토스증권 Open API 측정 요약 ({now().strftime('%Y-%m-%d %H:%M')})", "",
          "| 항목 | 판정 | 숫자 | KIS와의 차이 |", "|---|---|---|---|"]
     if auth:
@@ -359,6 +434,17 @@ def cmd_report(con, log: Log, now, out_dir: Path) -> Path:
             v = b["volume_diff_pct"]
             L.append(f"|  - {s['group']} {s['code']} | | 토스 {s['toss_bars_all']}봉 / KIS {s['kis_bars']}봉, "
                      f"종가 {(b['match_rate']['close'] or 0) * 100:.1f}% | 거래량 {'-' if v is None else f'{v:+.2f}%'} |")
+    if chk:
+        c = chk["regular_completeness"]
+        L.append(f"| 분봉 자체 점검 ({chk['date']}) | {_yn(c is not None and c >= 0.99)} | 정규장 완전성 "
+                 f"{'-' if c is None else f'{c * 100:.2f}%'}, 일봉 종가 = 정규장 마지막 분봉 {chk['close_match_regular']}/"
+                 f"{chk['daily_checked']}, = 전체 세션 마지막 분봉 {chk['close_match_all']}/{chk['daily_checked']} | KIS 비교 안 함 |")
+        for x in chk["symbols"]:
+            v = x["volume"]
+            pr = "-" if v["regular_vs_daily_pct"] is None else f"{v['regular_vs_daily_pct']:+.2f}%"
+            pa = "-" if v["all_vs_daily_pct"] is None else f"{v['all_vs_daily_pct']:+.2f}%"
+            L.append(f"|  - {x['symbol']} | | 봉 {x['bars']}, 정규장 누락 {x['regular_missing']}분, "
+                     f"거래량 0 봉 {x['zero_volume_bars']} | 거래량 정규장/일봉 {pr}, 전체/일봉 {pa} |")
     if rk:
         for x in rk["rankings"]:
             L.append(f"| 순위 {x['type']} {x['duration']} | {_yn(x['n'] > 0)} | {x['n']}종목, rankedAt {x['rankedAt']} | - |")
@@ -368,7 +454,8 @@ def cmd_report(con, log: Log, now, out_dir: Path) -> Path:
         L.append(f"| 실시간 순위 반복 조회 | 가능 | {len(rkw['watch'])}회 | - |")
     if si:
         for k, v in si["universe"].items():
-            L.append(f"| 종목 목록 {k} | 가능 | {v['total']:,} (보통주 {v['common']:,}) | KIS·KRX 대비 확인 필요 |")
+            L.append(f"| 종목 목록 {k} | 가능 | {v['total']:,} (isCommonShare {v['common']:,}, 주식 보통주 "
+                     f"{v.get('stock_common', '-')}) | 기존 수집기 보통주 범위와 비교 필요 |")
         d = si["delisted"]
         L.append(f"| 상장폐지 종목 delistDate | 조건부 | {d['with_delist_date']}/{d['symbols']}, 최근 1년 {d['last_1y']} | - |")
         L.append(f"| 매수 유의사항 | 가능 | 상위 {si['warnings']['checked']} 중 {si['warnings']['with_active']}, "
@@ -380,7 +467,7 @@ def cmd_report(con, log: Log, now, out_dir: Path) -> Path:
             L.append(f"| 지수 1분봉 {s} | {_yn(v['trading_days'] > 0)} | {v['oldest']} 부터, {v['trading_days']}일 | "
                      "지수 봉 시각은 '시작' 시각 |")
         L.append(f"| 섹터 | 가능 | {mk['sectors']['total']}개 {mk['sectors']['by_depth']} | - |")
-    verdict, why = judge(depth, comp)
+    verdict, why = judge(depth, comp, chk)
     L += ["", f"## KIS 분봉 매일 수집 대체 가능 여부: **{verdict}**", ""] + [f"- {w}" for w in why]
     text = "\n".join(L) + "\n"
     out_dir.mkdir(parents=True, exist_ok=True)

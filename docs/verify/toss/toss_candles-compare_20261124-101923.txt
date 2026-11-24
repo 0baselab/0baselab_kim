@@ -1,0 +1,2 @@
+10:19:23 토스측정 0.1.0 / candles-compare / 데이터 폴더 <바탕화면>\단타분석
+10:19:23 중단: danta.sqlite가 없습니다: <바탕화면>\단타분석\danta.sqlite (설정 SOURCE_DB로 지정 가능)

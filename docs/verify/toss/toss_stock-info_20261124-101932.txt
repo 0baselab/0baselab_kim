@@ -1,0 +1,11 @@
+10:19:32 토스측정 0.1.0 / stock-info / 데이터 폴더 <바탕화면>\단타분석
+10:19:33 [stocks/all] KOSPI ACTIVE: 2,495종목, 보통주(isCommonShare) 2,388
+10:19:35 [stocks/all] KOSPI DELISTED: 0종목, 보통주(isCommonShare) 0
+10:19:37 [stocks/all] KOSDAQ ACTIVE: 1,837종목, 보통주(isCommonShare) 1,835
+10:19:39 [stocks/all] KOSDAQ DELISTED: 0종목, 보통주(isCommonShare) 0
+10:19:39 [delisted] 0종목 중 delistDate 있음 0, 최근 1년 0, 연도별 {}
+10:19:50 [warnings] 거래대금 상위 30종목 중 활성 경고 있음 0, 유형별 {}
+10:19:54 [/api/v1/stocks/005930/investor-trading] 가장 오래된 날짜 2019-04-01, 기록 1879일, 호출 19회, 멈춘 이유: 더 과거 데이터 없음
+10:19:58 [/api/v1/stocks/005930/program-trades] 가장 오래된 날짜 2019-04-01, 기록 1879일, 호출 19회, 멈춘 이유: 더 과거 데이터 없음
+10:19:58 이번 실행 호출 73회 (토큰 발급 0회 포함), 429 응답 0회
+10:19:58 로그 파일: <바탕화면>\단타분석\logs\toss_stock-info_20261124-101932.txt

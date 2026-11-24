@@ -137,3 +137,58 @@ def session_counts(toss_bars: list[dict]) -> dict:
         else:
             other += 1
     return {"pre_0800_0900": pre, "regular_0900_1530": reg, "after_1531_2000": post, "other": other}
+
+
+# ---------------------------------------------------------------- 자체 점검 (KIS 없이 토스 1분봉 ↔ 토스 일봉)
+def _expected_regular() -> set[str]:
+    """KRX 정규장에서 봉이 있어야 하는 분 (봉 시작 HHMM): 09:00~15:19 연속매매 + 15:30 종가 단일가.
+    15:20~15:29는 종가 단일가 접수 시간이라 체결이 없을 수 있어 기대값에서 뺀다."""
+    out = set()
+    for m in range(9 * 60, 15 * 60 + 20):
+        out.add(f"{m // 60:02d}{m % 60:02d}")
+    out.add("1530")
+    return out
+
+
+EXPECTED_REG = _expected_regular()
+
+
+def check_day(m1: list[dict], d1: dict | None) -> dict:
+    """그날 토스 1분봉(m1, timestamp=종료 시각)을 같은 날 토스 일봉(d1)과 대조한다.
+
+    - 정규장 분봉 누락: EXPECTED_REG 중 봉이 없는 분
+    - 거래량 0인 봉 수 (세션별): 거래가 없는 시간을 채운 봉인지 판단용
+    - 일봉 시가·고가·저가·종가가 정규장 분봉에서 나온 값과 같은지, 전체 세션 분봉 값과 같은지
+    - 거래량 합계: 정규장 분봉 합 / 전체 분봉 합 / 일봉 거래량
+    """
+    bars = sorted(((parse_ts(b["timestamp"]) - timedelta(minutes=1)).strftime("%H%M"), b) for b in m1)
+    present = {s for s, _ in bars}
+    reg = [(s, b) for s, b in bars if "0900" <= s <= "1530"]
+    zero = {"pre": 0, "regular": 0, "after": 0}
+    for s, b in bars:
+        if (dec(b.get("volume")) or 0) == 0:
+            zero["pre" if s < "0900" else ("regular" if s <= "1530" else "after")] += 1
+    vol = lambda xs: sum((dec(b.get("volume")) or 0) for _, b in xs)
+
+    def ohlc(xs):
+        if not xs:
+            return None
+        return {"open": dec(xs[0][1].get("openPrice")), "high": max(dec(b.get("highPrice")) for _, b in xs),
+                "low": min(dec(b.get("lowPrice")) for _, b in xs), "close": dec(xs[-1][1].get("closePrice"))}
+    traded = lambda xs: [(s, b) for s, b in xs if (dec(b.get("volume")) or 0) > 0]
+    r_ohlc, a_ohlc = ohlc(traded(reg)), ohlc(traded(bars))
+    d = {k: dec(d1.get(k + "Price")) for k in ("open", "high", "low", "close")} if d1 else None
+    eq = lambda x: ({k: (x[k] == d[k]) for k in d} if (x and d) else None)
+    missing = sorted(EXPECTED_REG - present)
+    dv = dec(d1.get("volume")) if d1 else None
+    pct = lambda v: (float((v - dv) / dv * 100) if dv else None)
+    return {
+        "bars": len(bars), "first_start": bars[0][0] if bars else None, "last_start": bars[-1][0] if bars else None,
+        "regular_expected": len(EXPECTED_REG), "regular_missing": len(missing), "missing_examples": missing[:10],
+        "auction_1520_1529_bars": sum(1 for s in present if "1520" <= s <= "1529"),
+        "zero_volume_bars": zero,
+        "daily": {k: (str(v) if v is not None else None) for k, v in d.items()} if d else None,
+        "match_regular": eq(r_ohlc), "match_all_sessions": eq(a_ohlc),
+        "volume": {"regular": str(vol(reg)), "all": str(vol(bars)), "daily": str(dv) if dv is not None else None,
+                   "regular_vs_daily_pct": pct(vol(reg)), "all_vs_daily_pct": pct(vol(bars))},
+    }
