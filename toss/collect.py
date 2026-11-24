@@ -399,8 +399,9 @@ def _backfill_code(client, code: str, need: set, conns: dict, store_dir: Path, n
 
 def minute_backfill(client, dcon, store_dir: Path, log: Log, now, history_days: int = 365,
                     max_minutes: float = 0, max_retry: int = 3, end: str | None = None,
-                    clock: Callable[[], float] = time.monotonic) -> dict:
-    """빨리 채우기: 가장 최근 미완성 날짜는 날짜 단위로 먼저 완성하고, 나머지 과거 날짜는 종목 단위로 연속 수집."""
+                    clock: Callable[[], float] = time.monotonic, chunk_days: int = 20) -> dict:
+    """빨리 채우기: 가장 최근 미완성 날짜는 날짜 단위로 먼저 완성하고, 나머지 과거 날짜는
+    최근 구간(chunk_days 거래일)부터 종목 단위로 연속 수집한다. 구간 하나가 끝나면 그 구간 날짜들이 완성된다."""
     t0 = clock()
     ensure_universe(client, dcon, log, now)
     end = end or previous_business_day(client)
@@ -424,49 +425,59 @@ def minute_backfill(client, dcon, store_dir: Path, log: Log, now, history_days: 
     rest = [d for d in days if d != newest]
     if not rest:
         return out
-    per_code, targets = _needed(dcon, store_dir, rest, max_retry)
-    codes = sorted(per_code)
-    log(f"[minute-backfill] 과거 {len(rest)}일 ({rest[0]}~{rest[-1]}), 종목 단위 연속 수집 대상 {len(codes)}종목")
-    conns: dict = {}
+    # 최근 구간부터: 20거래일(chunk_days) 단위로 나눠, 한 구간을 종목 단위로 끝까지 채워 완성한 뒤 이전 구간으로
+    rest_desc = list(reversed(rest))
+    chunks = [sorted(rest_desc[k:k + chunk_days]) for k in range(0, len(rest_desc), chunk_days)]
+    log(f"[minute-backfill] 과거 미완성 {len(rest)}일을 {chunk_days}거래일 구간 {len(chunks)}개로 나눠 최근 구간부터 채웁니다")
     c0, t1 = client.calls, clock()
-    try:
-        for i, code in enumerate(codes, 1):
-            if max_minutes and clock() - t0 > max_minutes * 60:
-                out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
-                break
-            try:
-                _backfill_code(client, code, per_code[code], conns, store_dir, now)
-            except (NotAllowedError, TossAuthError):
-                raise
-            except Exception as exc:  # noqa: BLE001  이 종목의 남은 날짜마다 실패 1회 기록
-                log(f"  실패 {code}: {exc}")
-                for d in per_code[code]:
-                    con = conns.get(d) or conns.setdefault(d, ds.connect_minute(store_dir, d))
-                    with con:
-                        if not con.execute("SELECT 1 FROM code_done WHERE code=?", (code,)).fetchone():
-                            con.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
-                                        " fail_count=fail_count+1, last_error=excluded.last_error,"
-                                        " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
-            if i % 50 == 0:
-                el = clock() - t1
-                n = client.calls - c0
-                log(f"  진행 {i}/{len(codes)}종목, 호출 {n}, {n / el if el else 0:.1f}/초, 429 {client.n429}, "
-                    f"남은 예상 {timedelta(seconds=int(el / i * (len(codes) - i)))}")
-        for day in rest:  # 다 모인 날짜는 완성 처리
-            con = conns.get(day) or (ds.connect_minute(store_dir, day) if ds.minute_path(store_dir, day).exists() else None)
-            if con is None:
-                continue
-            conns[day] = con
-            with con:
-                con.execute("INSERT OR REPLACE INTO file_meta VALUES ('max_retry', ?)", (str(max_retry),))
-            done = {r[0] for r in con.execute("SELECT code FROM code_done")}
-            dead = {r[0] for r in con.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
-            if all(c in done or c in dead for c in targets[day]):
-                _finish_day(con, dcon, store_dir, day, len(targets[day]), now, log)
-                out["days_done"].append(day)
-    finally:
-        for con in conns.values():
-            con.close()
+    for ci, chunk in enumerate(chunks, 1):
+        per_code, targets = _needed(dcon, store_dir, chunk, max_retry)
+        codes = sorted(per_code)
+        log(f"[minute-backfill] 구간 {ci}/{len(chunks)}: {chunk[0]}~{chunk[-1]} ({len(chunk)}일), 대상 {len(codes)}종목")
+        conns: dict = {}
+        tc, cc = clock(), client.calls
+        try:
+            for i, code in enumerate(codes, 1):
+                if max_minutes and clock() - t0 > max_minutes * 60:
+                    out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
+                    break
+                try:
+                    _backfill_code(client, code, per_code[code], conns, store_dir, now)
+                except (NotAllowedError, TossAuthError):
+                    raise
+                except Exception as exc:  # noqa: BLE001  이 종목의 남은 날짜마다 실패 1회 기록
+                    log(f"  실패 {code}: {exc}")
+                    for d in per_code[code]:
+                        con = conns.get(d) or conns.setdefault(d, ds.connect_minute(store_dir, d))
+                        with con:
+                            if not con.execute("SELECT 1 FROM code_done WHERE code=?", (code,)).fetchone():
+                                con.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
+                                            " fail_count=fail_count+1, last_error=excluded.last_error,"
+                                            " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
+                if i % 50 == 0:
+                    el = clock() - tc
+                    n = client.calls - cc
+                    log(f"  구간 {ci} 진행 {i}/{len(codes)}종목, 호출 {n}, {n / el if el else 0:.1f}/초, 429 {client.n429}, "
+                        f"이 구간 남은 예상 {timedelta(seconds=int(el / i * (len(codes) - i)))}")
+            for day in chunk:  # 다 모인 날짜는 완성 처리
+                con = conns.get(day) or (ds.connect_minute(store_dir, day)
+                                         if ds.minute_path(store_dir, day).exists() else None)
+                if con is None:
+                    continue
+                conns[day] = con
+                with con:
+                    con.execute("INSERT OR REPLACE INTO file_meta VALUES ('max_retry', ?)", (str(max_retry),))
+                done = {r[0] for r in con.execute("SELECT code FROM code_done")}
+                dead = {r[0] for r in con.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+                if all(c in done or c in dead for c in targets[day]):
+                    _finish_day(con, dcon, store_dir, day, len(targets[day]), now, log)
+                    out["days_done"].append(day)
+        finally:
+            for con in conns.values():
+                con.close()
+        if out["stop"]:
+            break
+        log(f"[minute-backfill] 구간 {ci} 끝 ({chunk[0]}~{chunk[-1]})")
     out["calls"] += client.calls - c0
     log(f"[minute-backfill] 이번 실행 완성 {len(out['days_done'])}일, 호출 {out['calls']}회"
         + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))

@@ -124,7 +124,7 @@ def run(argv: list[str]) -> int:
                 day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
                 if args.backfill and not day:
                     collect.minute_backfill(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
-                                            int(cfg.num("MAX_RETRY")))
+                                            int(cfg.num("MAX_RETRY")), chunk_days=int(cfg.num("BACKFILL_CHUNK_DAYS")))
                 else:
                     collect.minute_update(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
                                           int(cfg.num("MAX_RETRY")), only_day=day)
