@@ -86,10 +86,10 @@ def run_trade(args, cfg, install, log) -> None:
     all_days = [r[0] for r in dcon.execute("SELECT date FROM trading_day ORDER BY date")]
     iso = lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}" if x else None
     lo, hi = iso(args.d_from), iso(args.d_to)
-    days = [d for d in all_days if (not lo or d >= lo) and (not hi or d <= hi)
-            and datastore.minute_status(cfg.store_dir, d) == "complete"]
+    days = [d for i, d in enumerate(all_days) if (not lo or d >= lo) and (not hi or d <= hi)
+            and engine.replay_ready(dcon, cfg.store_dir, d, all_days[i - 1] if i else None, s)]
     if not days:
-        raise SystemExit("재생할 날짜가 없습니다 (완성된 분봉 파일이 없음). status로 분봉 완성 날짜를 확인하세요.")
+        raise SystemExit("재생할 날짜가 없습니다. 그날 관심종목(W7)과 전날 분봉이 받아진 날이 없음 (minute-update --backfill 진행 필요).")
     tcon = tstore.connect(cfg.data_dir / "trade.sqlite")
     started = now_kst()
     run_id = f"replay-{started.strftime('%Y%m%d-%H%M%S')}"

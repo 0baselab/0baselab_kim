@@ -371,17 +371,20 @@ def status(dcon, store_dir: Path, log: Log, now, history_days: int = 365) -> dic
     inv = dcon.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM investor_daily").fetchone()
     days = trading_days(dcon, first, last) if last else []
     st = {"complete": [], "partial": [], "missing": []}
+    focus_n = 0
     for d in days:
         st[ds.minute_status(store_dir, d)].append(d)
+        focus_n += focus_done(store_dir, d)
     size = sum(p.stat().st_size for p in (store_dir / "minute").rglob("*.sqlite")) if (store_dir / "minute").exists() else 0
     log(f"[status] 종목 목록 {uni[1] or 0:,}종목 (누적 {uni[0]:,})")
     log(f"[status] 일봉 {dmin}~{dmax}, {drows:,}행, 전 거래일({last})까지 안 받은 종목 {lag}")
     log(f"[status] 수급 {inv[0]}~{inv[1]}, {inv[2]:,}행")
     log(f"[status] 분봉 ({first}~{last}, 거래일 {len(days)}일): 완성 {len(st['complete'])}, 진행 중 {len(st['partial'])}, "
         f"없음 {len(st['missing'])}, 파일 합계 {size / 1024 / 1024:,.1f}MB")
+    log(f"[status] 우선 수집(거래대금 상위 100 + 등락률 상위 50 + W7) 끝난 날 {focus_n}/{len(days)}일")
     if st["missing"]:
         log(f"  없는 날짜(최근 5): {st['missing'][-5:]}")
-    return {"last": last, "minute": {k: len(v) for k, v in st.items()}, "minute_mb": size / 1024 / 1024}
+    return {"last": last, "minute": {k: len(v) for k, v in st.items()}, "minute_mb": size / 1024 / 1024, "focus": focus_n}
 
 
 # ---------------------------------------------------------------- 분봉 과거 채우기 (빨리 채우기)
@@ -456,19 +459,26 @@ def _backfill_code(client, code: str, need: set, conns: dict, store_dir: Path, n
 
 def minute_backfill(client, dcon, store_dir: Path, log: Log, now, history_days: int = 365,
                     max_minutes: float = 0, max_retry: int = 3, end: str | None = None,
-                    clock: Callable[[], float] = time.monotonic, chunk_days: int = 20) -> dict:
-    """빨리 채우기: 가장 최근 미완성 날짜는 날짜 단위로 먼저 완성하고, 나머지 과거 날짜는
+                    clock: Callable[[], float] = time.monotonic, chunk_days: int = 20, focus: bool = True) -> dict:
+    """우선 수집(focus=True면 먼저) → 빨리 채우기: 가장 최근 미완성 날짜는 날짜 단위로 먼저 완성하고, 나머지 과거 날짜는
     최근 구간(chunk_days 거래일)부터 종목 단위로 연속 수집한다. 구간 하나가 끝나면 그 구간 날짜들이 완성된다."""
     t0 = clock()
     ensure_universe(client, dcon, log, now)
     end = end or previous_business_day(client)
     first = (now().date() - timedelta(days=history_days)).isoformat()
     refresh_trading_days(client, dcon, log, first)
+    all_days = [r[0] for r in dcon.execute("SELECT date FROM trading_day ORDER BY date")]
     days = [d for d in trading_days(dcon, first, end) if ds.minute_status(store_dir, d) != "complete"]
     out = {"days_done": [], "stop": "", "calls": 0}
     if not days:
         log("[minute-backfill] 채울 날짜 없음")
         return out
+    if focus:  # 먼저 KIS 때와 같은 범위(우선 종목)를 전 기간 받고, 그다음 전 종목 채우기
+        f = focus_phase(client, dcon, store_dir, log, now, days, all_days, max_minutes, max_retry, t0, clock)
+        out["calls"] += f["calls"]
+        if f["stop"]:
+            out["stop"] = f["stop"]
+            return out
     newest = days[-1]
     left = lambda: (max_minutes - (clock() - t0) / 60) if max_minutes else 0
     log(f"[minute-backfill] 미완성 {len(days)}일. 먼저 최근 날짜 {newest}를 날짜 단위로 완성합니다")
@@ -537,5 +547,123 @@ def minute_backfill(client, dcon, store_dir: Path, log: Log, now, history_days: 
         log(f"[minute-backfill] 구간 {ci} 끝 ({chunk[0]}~{chunk[-1]})")
     out["calls"] += client.calls - c0
     log(f"[minute-backfill] 이번 실행 완성 {len(out['days_done'])}일, 호출 {out['calls']}회"
+        + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
+    return out
+
+
+# ---------------------------------------------------------------- 우선 수집 (KIS 때와 같은 범위 먼저)
+FOCUS_TOP_VALUE = 100
+FOCUS_TOP_CHANGE = 50
+
+
+def focus_targets(dcon, days: list[str], all_days: list[str], watch_settings=None) -> dict[str, set]:
+    """날짜별 우선 수집 종목.
+    - 그날 일봉 기준 추정 거래대금 상위 100 + 등락률 상위 50 (거래량 있는 종목)
+    - 그날 W7 관심종목 (전날까지의 일봉으로 고름)
+    - 다음 날 W7 관심종목 (그 종목의 '전날 정규장 종가'를 이 날 분봉에서 구해야 하므로)
+    """
+    from .trade.settings import TradeSettings
+    from .trade.watchlist import build_watchlist
+    ws = watch_settings or TradeSettings()
+    out: dict[str, set] = {}
+    idx = {d: i for i, d in enumerate(all_days)}
+    w7_cache: dict[str, list] = {}
+
+    def w7(day):
+        if day not in w7_cache:
+            w7_cache[day] = [w.code for w in build_watchlist(dcon, day, ws)[0]]
+        return w7_cache[day]
+
+    for day in days:
+        codes = {r[0] for r in dcon.execute(
+            "SELECT code FROM daily_bar WHERE date=? AND volume > 0 ORDER BY value_est_krw DESC, code LIMIT ?",
+            (day, FOCUS_TOP_VALUE))}
+        i = idx.get(day)
+        if i:
+            prev = all_days[i - 1]
+            codes |= {r[0] for r in dcon.execute(
+                "SELECT b.code FROM daily_bar b JOIN daily_bar p ON p.code=b.code AND p.date=?"
+                " WHERE b.date=? AND b.volume > 0 AND p.close > 0 ORDER BY b.close * 1.0 / p.close DESC, b.code LIMIT ?",
+                (prev, day, FOCUS_TOP_CHANGE))}
+        codes |= set(w7(day))
+        if i is not None and i + 1 < len(all_days):
+            codes |= set(w7(all_days[i + 1]))
+        out[day] = codes
+    return out
+
+
+def focus_done(store_dir: Path, day: str) -> bool:
+    p = ds.minute_path(store_dir, day)
+    if not p.exists():
+        return False
+    con = sqlite3.connect(f"{p.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        r = con.execute("SELECT value FROM file_meta WHERE key IN ('focus_done', 'complete') AND value='1'").fetchone()
+        return r is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+def focus_phase(client, dcon, store_dir: Path, log: Log, now, days: list[str], all_days: list[str],
+                max_minutes: float = 0, max_retry: int = 3, t0: float | None = None,
+                clock: Callable[[], float] = time.monotonic) -> dict:
+    """우선 수집: 최근 날짜부터, 날짜마다 우선 종목만 날짜 단위로 받는다. 다 받은 날은 file_meta.focus_done=1."""
+    t0 = clock() if t0 is None else t0
+    todo_days = [d for d in reversed(days) if not focus_done(store_dir, d)]
+    out = {"days": [], "stop": "", "calls": 0}
+    if not todo_days:
+        return out
+    targets = focus_targets(dcon, todo_days, all_days)
+    total = sum(len(v) for v in targets.values())
+    log(f"[focus] 우선 수집: {len(todo_days)}일, 종목·날짜 약 {total:,}건 (거래대금 상위 {FOCUS_TOP_VALUE} + 등락률 상위 "
+        f"{FOCUS_TOP_CHANGE} + W7 관심종목과 다음 날 W7의 전날 분)")
+    c0 = client.calls
+    for k, day in enumerate(todo_days, 1):
+        listed = set(active_codes(dcon, day))
+        codes = sorted(c for c in targets[day] if c in listed)
+        mcon = ds.connect_minute(store_dir, day)
+        try:
+            done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
+            dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+            for code in codes:
+                if code in done or code in dead:
+                    continue
+                if max_minutes and clock() - t0 > max_minutes * 60:
+                    out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
+                    break
+                try:
+                    bars, calls = fetch_minute_day(client, code, day)
+                    with mcon:
+                        mcon.executemany("INSERT OR REPLACE INTO bar VALUES (?,?,?,?,?,?,?)", bars)
+                        mcon.execute("INSERT OR REPLACE INTO code_done VALUES (?,?,?,?)", (code, len(bars), calls, _ts(now)))
+                        mcon.execute("DELETE FROM code_fail WHERE code=?", (code,))
+                except (NotAllowedError, TossAuthError):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    with mcon:
+                        mcon.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
+                                     " fail_count=fail_count+1, last_error=excluded.last_error,"
+                                     " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
+                    log(f"  실패 {day} {code}: {exc}")
+            if out["stop"]:
+                break
+            done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
+            dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+            if all(c in done or c in dead for c in codes):
+                with mcon:
+                    mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('focus_done', '1')")
+                    mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('focus_codes', ?)", (str(len(codes)),))
+                out["days"].append(day)
+        finally:
+            mcon.close()
+        if k % 10 == 0:
+            el = clock() - t0
+            n = client.calls - c0
+            log(f"  [focus] {k}/{len(todo_days)}일 ({day}까지), 호출 {n}, {n / el if el else 0:.1f}/초, 429 {client.n429}, "
+                f"남은 예상 {timedelta(seconds=int(el / k * (len(todo_days) - k)))}")
+    out["calls"] = client.calls - c0
+    log(f"[focus] 이번 실행 우선 수집 끝난 날 {len(out['days'])}일, 호출 {out['calls']}회"
         + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
     return out

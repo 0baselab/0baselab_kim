@@ -194,3 +194,30 @@ def test_replay_daily_loss_limit_flattens(tmp_path):
     reasons = dict(tcon.execute("SELECT code, exit_reason FROM trade"))
     assert reasons == {"B": "stop", "A": "loss_limit"}
     assert tcon.execute("SELECT halted FROM day").fetchone()[0].startswith("하루 손실")
+
+
+def test_focus_targets_include_w7_and_next_day_w7(tmp_path, monkeypatch):
+    from toss import collect
+    store, d = make_store(tmp_path)                       # 마지막 날 전날에 A·B 거래량 급증 → 마지막 날 W7 = A, B
+    monkeypatch.setattr(collect, "FOCUS_TOP_VALUE", 1)
+    monkeypatch.setattr(collect, "FOCUS_TOP_CHANGE", 0)
+    t = collect.focus_targets(d, [DAYS[-2], DAYS[-1]], DAYS)
+    assert t[DAYS[-1]] >= {"A", "B"}                       # 그날 W7
+    assert t[DAYS[-2]] >= {"A", "B"}                       # 다음 날 W7의 전날 분
+    assert "C" not in t[DAYS[-2]] and "D" not in t[DAYS[-1]]
+
+
+def test_replay_ready_with_partial_files(tmp_path):
+    store, d = make_store(tmp_path)
+    day, prev = DAYS[-1], DAYS[-2]
+    one = [Bar(930, 10000, 10000, 10000, 10000, 5)]
+    write_minute(store, prev, {"A": one})                  # 전날 파일에 B가 없음
+    con = ds.connect_minute(store, day)
+    con.executemany("INSERT INTO code_done VALUES (?,1,0,'x')", [("A",), ("B",)])
+    con.commit(); con.close()
+    # complete 표시를 지워 "우선 수집만 된 파일" 상태로
+    for x in (day, prev):
+        c2 = sqlite3.connect(ds.minute_path(store, x)); c2.execute("DELETE FROM file_meta WHERE key='complete'"); c2.commit(); c2.close()
+    assert not engine.replay_ready(d, store, day, prev, TradeSettings())
+    c2 = ds.connect_minute(store, prev); c2.execute("INSERT INTO code_done VALUES ('B',1,0,'x')"); c2.commit(); c2.close()
+    assert engine.replay_ready(d, store, day, prev, TradeSettings())

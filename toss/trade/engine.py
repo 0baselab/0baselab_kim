@@ -41,8 +41,9 @@ def load_day_bars(store_dir: Path, day: str, codes: list[str], t_from: int, t_to
 
 
 def prev_regular_close(store_dir: Path, day: str, codes: list[str]) -> dict[str, float]:
-    """전일 분봉 파일에서 정규장 종가 = 15:30 이전에 시작한 마지막 거래 봉 종가 (보통주 t=930, ETF 등 t=929)."""
-    if ds.minute_status(store_dir, day) != "complete":
+    """전일 분봉 파일에서 정규장 종가 = 15:30 이전에 시작한 마지막 거래 봉 종가 (보통주 t=930, ETF 등 t=929).
+    그 종목이 받아져 있는(code_done) 경우만 쓴다."""
+    if not ds.minute_path(store_dir, day).exists():
         return {}
     con = _ro(ds.minute_path(store_dir, day))
     try:
@@ -50,11 +51,34 @@ def prev_regular_close(store_dir: Path, day: str, codes: list[str]) -> dict[str,
         out = {}
         for code, c in con.execute(
                 f"SELECT code, close FROM bar b WHERE code IN ({q}) AND t = (SELECT MAX(t) FROM bar b2 WHERE"
-                " b2.code=b.code AND b2.t <= 930 AND b2.volume > 0)", codes):
+                " b2.code=b.code AND b2.t <= 930 AND b2.volume > 0)"
+                " AND code IN (SELECT code FROM code_done)", codes):
             out[code] = c
         return out
     finally:
         con.close()
+
+
+def _done_codes(store_dir: Path, day: str) -> set:
+    p = ds.minute_path(store_dir, day)
+    if not p.exists():
+        return set()
+    con = _ro(p)
+    try:
+        return {r[0] for r in con.execute("SELECT code FROM code_done")}
+    finally:
+        con.close()
+
+
+def replay_ready(dcon, store_dir: Path, day: str, prev_day: str | None, s: TradeSettings) -> bool:
+    """재생 가능한 날: 그날 분봉 파일이 완성됐거나, 그날 W7 관심종목이 그날·전날 파일에 모두 받아져 있음.
+    (전 종목 완성을 기다리지 않고 우선 수집만으로 재생하기 위함)"""
+    if ds.minute_status(store_dir, day) == "complete" and (not prev_day or ds.minute_status(store_dir, prev_day) == "complete"):
+        return True
+    wl = [w.code for w in build_watchlist(dcon, day, s)[0]]
+    if not wl or not prev_day:
+        return False
+    return set(wl) <= _done_codes(store_dir, day) and set(wl) <= _done_codes(store_dir, prev_day)
 
 
 def _cost(s: TradeSettings, side: str, px: int, qty: int) -> float:
