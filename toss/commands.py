@@ -214,14 +214,18 @@ def cmd_candles_check(client, con, log: Log, now, day: str | None = None, symbol
             f"({f(v['all_vs_daily_pct'])}), 일봉 {v['daily']}")
     with_daily = [c for c in per if c["match_regular"] is not None]
     close_reg = sum(1 for c in with_daily if c["match_regular"]["close"])
+    ohlc_all = sum(1 for c in with_daily if c["match_all_sessions"] and all(c["match_all_sessions"].values()))
     close_all = sum(1 for c in with_daily if c["match_all_sessions"] and c["match_all_sessions"]["close"])
     out = {"date": day, "symbols": per, "regular_completeness": (1 - miss_tot / exp_tot) if exp_tot else None,
-           "daily_checked": len(with_daily), "close_match_regular": close_reg, "close_match_all": close_all}
+           "daily_checked": len(with_daily), "close_match_regular": close_reg, "close_match_all": close_all,
+           "ohlc_match_all": ohlc_all}
     comp = out["regular_completeness"]
     log(f"[candles-check] 정규장 분봉 완전성 {'-' if comp is None else f'{comp * 100:.2f}%'} "
         f"(누락 {miss_tot}분 / 기대 {exp_tot}분)")
     log(f"[candles-check] 일봉 종가 = 정규장 마지막 분봉 종가: {close_reg}/{len(with_daily)}, "
         f"= 전체 세션 마지막 분봉 종가: {close_all}/{len(with_daily)}")
+    log(f"[candles-check] 일봉 시·고·저·종가 = 전체 세션 분봉 합성: {ohlc_all}/{len(with_daily)} "
+        "(토스 일봉은 KRX+NXT 통합 기준)")
     store.put_result(con, "candles_check", out, _now_s(now))
     return out
 
@@ -408,10 +412,13 @@ def judge(depth: dict | None, compare: dict | None, check: dict | None = None) -
         return ("대체 가능" if days >= 30 and rate >= 0.99 else "대체 불가"), why
     if check and check.get("regular_completeness") is not None and check.get("daily_checked"):
         comp = check["regular_completeness"]
-        cr = check["close_match_regular"] / check["daily_checked"]
+        n = check["daily_checked"]
+        # 토스 일봉은 KRX+NXT 통합 기준이므로 전체 세션 분봉으로 합성한 시·고·저·종가와 비교한다.
+        # (0.1.1 이전 결과에는 ohlc_match_all이 없어 전체 세션 종가 일치 수로 대신한다)
+        hit = check.get("ohlc_match_all", check.get("close_match_all", 0))
+        cr = hit / n
         why.append(f"정규장 분봉 완전성 {comp * 100:.2f}% ({'충족' if comp >= 0.99 else '미달'}, 기준 99% 이상)")
-        why.append(f"일봉 종가 = 정규장 마지막 분봉 종가 {check['close_match_regular']}/{check['daily_checked']}종목 "
-                   f"({'충족' if cr >= 0.99 else '미달'}, 기준 99% 이상)")
+        why.append(f"일봉 = 전체 세션 분봉 합성 {hit}/{n}종목 ({'충족' if cr >= 0.99 else '미달'}, 기준 99% 이상)")
         why.append("KIS 분봉과 같은 값인지는 비교하지 않았습니다 (토스 자체 점검 기준)")
         ok = days >= 30 and comp >= 0.99 and cr >= 0.99
         return ("대체 가능 (자체 점검 기준)" if ok else "대체 불가"), why
@@ -450,8 +457,9 @@ def cmd_report(con, log: Log, now, out_dir: Path) -> Path:
     if chk:
         c = chk["regular_completeness"]
         L.append(f"| 분봉 자체 점검 ({chk['date']}) | {_yn(c is not None and c >= 0.99)} | 정규장 완전성 "
-                 f"{'-' if c is None else f'{c * 100:.2f}%'}, 일봉 종가 = 정규장 마지막 분봉 {chk['close_match_regular']}/"
-                 f"{chk['daily_checked']}, = 전체 세션 마지막 분봉 {chk['close_match_all']}/{chk['daily_checked']} | KIS 비교 안 함 |")
+                 f"{'-' if c is None else f'{c * 100:.2f}%'}, 일봉 = 전체 세션 분봉 합성 "
+                 f"{chk.get('ohlc_match_all', '-')}/{chk['daily_checked']}, 일봉 종가 = 정규장 마지막 분봉 "
+                 f"{chk['close_match_regular']}/{chk['daily_checked']} | KIS 비교 안 함 |")
         for x in chk["symbols"]:
             v = x["volume"]
             pr = "-" if v["regular_vs_daily_pct"] is None else f"{v['regular_vs_daily_pct']:+.2f}%"

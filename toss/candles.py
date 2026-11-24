@@ -179,12 +179,18 @@ def check_day(m1: list[dict], d1: dict | None) -> dict:
     r_ohlc, a_ohlc = ohlc(traded(reg)), ohlc(traded(bars))
     d = {k: dec(d1.get(k + "Price")) for k in ("open", "high", "low", "close")} if d1 else None
     eq = lambda x: ({k: (x[k] == d[k]) for k in d} if (x and d) else None)
-    missing = sorted(EXPECTED_REG - present)
+    missing = set(EXPECTED_REG - present)
+    # ETF 등은 종가 단일가 체결이 15:29 시작(15:30 종료) 봉에 들어가고 15:30 시작 봉이 없다 → 누락이 아님
+    auction_at_1529 = "1530" in missing and any(s == "1529" and (dec(b.get("volume")) or 0) > 0 for s, b in bars)
+    if auction_at_1529:
+        missing.discard("1530")
+    missing = sorted(missing)
     dv = dec(d1.get("volume")) if d1 else None
     pct = lambda v: (float((v - dv) / dv * 100) if dv else None)
     return {
         "bars": len(bars), "first_start": bars[0][0] if bars else None, "last_start": bars[-1][0] if bars else None,
         "regular_expected": len(EXPECTED_REG), "regular_missing": len(missing), "missing_examples": missing[:10],
+        "auction_at_1529": auction_at_1529,
         "auction_1520_1529_bars": sum(1 for s in present if "1520" <= s <= "1529"),
         "zero_volume_bars": zero,
         "daily": {k: (str(v) if v is not None else None) for k, v in d.items()} if d else None,
