@@ -108,3 +108,15 @@ def test_report_uses_check(tmp_path):
     p = commands.cmd_report(con, lambda m: None, NOW, tmp_path)
     t = p.read_text(encoding="utf-8")
     assert "대체 가능 (자체 점검 기준)" in t and "분봉 자체 점검" in t
+
+
+def test_check_defaults_to_previous_business_day(tmp_path):
+    bars = day_with_nxt() + minute_bars("20261119")
+    srv = FakeToss(bars, daily=[daily_for(day_with_nxt())], rankings=[{"symbol": "A"}])
+    c, _ = srv.client(tmp_path)
+    c.token()
+    srv.valid = c._token
+    srv.script = [(200, {"result": {"previousBusinessDay": {"date": "2026-11-20"}}}, {})]
+    logs = []
+    out = commands.cmd_candles_check(c, store.connect(tmp_path / "t.sqlite"), logs.append, NOW, None, ["A"])
+    assert out["date"] == "20261120" and any("전 영업일 20261120" in l for l in logs)

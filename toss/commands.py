@@ -160,7 +160,7 @@ def cmd_candles_compare(client, con, danta: sqlite3.Connection, log: Log, now, d
 
 # ---------------------------------------------------------------- candles-check (KIS 없이 자체 점검)
 def default_symbols(client, n: int = 10) -> list[str]:
-    """오늘 거래대금 순위(1d)에서 상위 n/2 + 100위 쪽 n/2."""
+    """거래대금 순위(1d)에서 상위 n/2 + 100위 쪽 n/2. 점검 표본일 뿐이라 순위 기준일이 점검 날짜와 달라도 된다."""
     rk = (client.get("/api/v1/rankings", {"type": "MARKET_TRADING_AMOUNT", "marketCountry": "KR",
                                           "duration": "1d", "count": 100}).get("result") or {}).get("rankings") or []
     syms = [x["symbol"] for x in rk if x.get("symbol")]
@@ -174,7 +174,20 @@ def toss_daily_bar(client, symbol: str, day: str) -> dict | None:
     return next((b for b in r.bars if parse_ts(b["timestamp"]).date().isoformat() == _iso(day)), None)
 
 
-def cmd_candles_check(client, con, log: Log, now, day: str, symbols: list[str] | None = None, n: int = 10) -> dict:
+def previous_business_day(client) -> str:
+    """장 운영 정보(market-calendar/KR)의 previousBusinessDay → YYYYMMDD."""
+    cal = client.get("/api/v1/market-calendar/KR").get("result") or {}
+    d = (cal.get("previousBusinessDay") or {}).get("date")
+    if not d:
+        raise SystemExit("전 영업일을 알 수 없습니다. --date로 지정하세요.")
+    return d.replace("-", "")
+
+
+def cmd_candles_check(client, con, log: Log, now, day: str | None = None, symbols: list[str] | None = None,
+                      n: int = 10) -> dict:
+    if not day:
+        day = previous_business_day(client)
+        log(f"[candles-check] --date 없음 → 전 영업일 {day}")
     syms = symbols or default_symbols(client, n)
     log(f"[candles-check] 날짜 {day}, 종목 {len(syms)}개: {', '.join(syms)}")
     log("  토스 1분봉(봉 시작 시각 기준)을 같은 날 토스 일봉과 대조. KIS 데이터는 쓰지 않음")

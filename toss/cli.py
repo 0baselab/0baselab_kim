@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     m = sub.add_parser("market", help="장 운영 시간, 지수 1분봉 깊이, 섹터")
     m.add_argument("--max-calls", type=int, help="지수별 호출 상한 (기본 설정 MAX_CALLS)")
     k = sub.add_parser("candles-check", help="KIS 없이 토스 1분봉을 같은 날 토스 일봉과 대조 (자체 점검)")
-    k.add_argument("--date", required=True, help="YYYYMMDD (장 마감 후, NXT까지 보려면 20시 이후)")
+    k.add_argument("--date", help="YYYYMMDD. 비우면 전 영업일 (아침에 전일자 점검)")
     k.add_argument("--symbols", help="콤마로 구분한 종목코드. 비우면 오늘 거래대금 순위 상위 n/2 + 100위 쪽 n/2")
     k.add_argument("--n", type=int, default=10)
     sub.add_parser("limits", help="기록된 그룹별 호출 한도 헤더 요약")
