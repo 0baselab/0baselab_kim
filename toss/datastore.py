@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS index_daily (
     symbol TEXT NOT NULL, date TEXT NOT NULL,       -- KOSPI / KOSDAQ
     open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume INTEGER,
     PRIMARY KEY (symbol, date)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS index_minute (
+    symbol TEXT NOT NULL, date TEXT NOT NULL,
+    t INTEGER NOT NULL,          -- 봉 '시작' 시각, 0시부터 분 (09:00 = 540). 지수 캔들 timestamp는 시작 시각
+    open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume INTEGER,
+    PRIMARY KEY (symbol, date, t)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS adj_daily (
     code TEXT NOT NULL, date TEXT NOT NULL,
     adj_close NUMERIC,           -- 수정주가 종가 (as_of 시점 기준으로 소급 조정된 값)

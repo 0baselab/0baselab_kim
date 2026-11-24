@@ -248,3 +248,26 @@ def test_focus_first_then_full(tmp_path, monkeypatch):
     assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
     s = collect.status(d, store, lambda x: None, NOW, history_days=30)
     assert s["focus"] == 4
+
+
+
+def test_index_minute_initial_and_incremental(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-20")
+    logs = []
+    r = collect.index_minute_update(c, d, logs.append, NOW, history_days=30)
+    rows = d.execute("SELECT symbol, COUNT(*), MIN(t), MAX(t), COUNT(DISTINCT date) FROM index_minute GROUP BY symbol").fetchall()
+    assert rows == [("KOSDAQ", 3 * 391, 540, 930, 3), ("KOSPI", 3 * 391, 540, 930, 3)]   # 시작 시각 그대로 (09:00=540)
+    m.prev_day = "2026-11-23"
+    m.calls.clear()
+    collect.index_minute_update(c, d, logs.append, NOW, history_days=30)
+    assert d.execute("SELECT COUNT(DISTINCT date) FROM index_minute WHERE symbol='KOSDAQ'").fetchone()[0] == 4
+    assert d.execute("SELECT COUNT(*) FROM index_minute WHERE symbol='KOSDAQ' AND date='2026-11-20'").fetchone()[0] == 391
+    m.calls.clear()
+    assert collect.index_minute_update(c, d, logs.append, NOW, history_days=30) == {"KOSPI": 0, "KOSDAQ": 0}
+    assert not [p for p, q in m.calls if "candles" in p]                     # 이미 최신이면 캔들 호출 없음 (전 영업일 조회만)
+
+
+def test_daily_update_also_fills_index_minute(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    assert d.execute("SELECT COUNT(DISTINCT date) FROM index_minute").fetchone()[0] == 4

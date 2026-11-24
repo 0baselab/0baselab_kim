@@ -69,6 +69,15 @@ class FakeMarket:
             return httpx.Response(200, json={"result": [{"symbol": s, "listDate": self.list_dates.get(s, "2000-01-01"),
                                                          "koreanMarketDetail": {"nxtSupported": s in self.nxt}}
                                                         for s in q["symbols"].split(",")]})
+        if path in ("/api/v1/market-indicators/KOSPI/candles", "/api/v1/market-indicators/KOSDAQ/candles") \
+                and q.get("interval") == "1m":
+            base = 2500 if "KOSPI" in path else 800
+            src = []
+            for d in self.days[::-1]:   # 지수 분봉: timestamp = 봉 시작 시각, 09:00~15:30
+                b0 = datetime.fromisoformat(f"{d}T09:00:00+09:00")
+                src += [{"timestamp": (b0 + timedelta(minutes=i)).isoformat(), "openPrice": str(base), "highPrice": str(base + 1),
+                         "lowPrice": str(base - 1), "closePrice": str(base + i % 3), "volume": "1"} for i in range(391)][::-1]
+            return httpx.Response(200, json=self._page(src, q))
         if path in ("/api/v1/market-indicators/KOSPI/candles", "/api/v1/market-indicators/KOSDAQ/candles"):
             base = 2500 if "KOSPI" in path else 800
             return httpx.Response(200, json=self._page(
