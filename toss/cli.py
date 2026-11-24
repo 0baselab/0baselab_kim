@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     mu.add_argument("--date", help="YYYYMMDD 하루만")
     mu.add_argument("--backfill", action="store_true",
                     help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
+    sub.add_parser("adjust-update", help="[수집] 수정주가 종가 1년치 갱신 (보통은 minute-update가 주 1회 자동으로 함)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
     sub.add_parser("auth", help="토큰 발급, 계좌 목록 조회")
     d = sub.add_parser("candles-depth", help="1분봉·일봉을 과거로 넘기며 가장 오래된 날짜 측정")
@@ -111,16 +112,23 @@ def run(argv: list[str]) -> int:
             mc = int(cfg.num("MAX_CALLS"))
             yrs = cfg.num("MAX_YEARS")
             hd = int(cfg.num("HISTORY_DAYS"))
-            if args.cmd in ("universe", "daily-update", "minute-update"):
+            if args.cmd in ("universe", "daily-update", "minute-update", "adjust-update"):
                 dcon = datastore.connect_daily(cfg.store_dir)
             if args.cmd == "universe":
                 collect.refresh_universe(client, dcon, log, now_kst)
             elif args.cmd == "daily-update":
                 collect.daily_update(client, dcon, cfg.store_dir, log, now_kst, hd,
                                      investor=cfg.get("INVESTOR_DAILY").upper() in ("Y", "1", "TRUE"))
+            elif args.cmd == "adjust-update":
+                collect.ensure_universe(client, dcon, log, now_kst)
+                collect.adjust_update(client, dcon, log, now_kst, hd)
             elif args.cmd == "minute-update":
                 if args.rate:
                     client.set_group_rate("MARKET_DATA_CHART", args.rate)
+                if not args.date and collect.adjust_due(dcon, now_kst, int(cfg.num("ADJ_REFRESH_DAYS"))):
+                    collect.ensure_universe(client, dcon, log, now_kst)
+                    log("수정주가 갱신 주기가 되어 먼저 갱신합니다 (약 25분, 주 1회)")
+                    collect.adjust_update(client, dcon, log, now_kst, hd, max_minutes=args.max_minutes)
                 day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
                 if args.backfill and not day:
                     collect.minute_backfill(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,

@@ -187,3 +187,38 @@ def test_backfill_chunks_complete_recent_first(tmp_path):
     assert any("구간 1/3: 2026-11-20~2026-11-20" in l for l in logs)
     r = collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30, chunk_days=2)
     assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
+
+
+
+def test_nxt_flag_and_index_daily(tmp_path):
+    m, c, d, store = setup(tmp_path, nxt={"000001"})
+    collect.refresh_universe(c, d, lambda x: None, NOW)
+    assert dict(d.execute("SELECT code, nxt_supported FROM universe")) == {"000001": 1, "000002": 0, "000003": 0}
+    collect.refresh_trading_days(c, d, lambda x: None, "2026-11-01")
+    rows = d.execute("SELECT symbol, COUNT(*), MIN(open), MAX(close) FROM index_daily GROUP BY symbol").fetchall()
+    assert rows == [("KOSDAQ", 4, 800, 805), ("KOSPI", 4, 2500, 2505)]
+
+
+def test_old_db_gets_nxt_column(tmp_path):
+    store = tmp_path / "s"
+    store.mkdir()
+    con = sqlite3.connect(store / "daily.sqlite")
+    con.execute("CREATE TABLE universe (code TEXT PRIMARY KEY, name TEXT, market TEXT, security_type TEXT, is_common INTEGER,"
+                " list_date TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, active INTEGER NOT NULL)")
+    con.commit(); con.close()
+    d = ds.connect_daily(store)
+    assert "nxt_supported" in {r[1] for r in d.execute("PRAGMA table_info(universe)")}
+
+
+def test_adjust_update_weekly_and_split_detection(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23", split={"000002": "2026-11-20"})
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    assert collect.adjust_due(d, NOW, 7)
+    logs = []
+    r = collect.adjust_update(c, d, logs.append, NOW, history_days=30)
+    assert r["done"] and r["events"] == 1
+    f = dict(d.execute("SELECT date, adj_factor FROM adj_daily WHERE code='000002'"))
+    assert f["2026-11-19"] == 0.5 and f["2026-11-20"] == 1.0
+    assert not collect.adjust_due(d, NOW, 7)
+    later = lambda: datetime(2026, 12, 1, 8, 0, tzinfo=KST)
+    assert collect.adjust_due(d, later, 7)

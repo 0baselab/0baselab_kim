@@ -43,6 +43,7 @@
 | `토스단타.exe minute-update --backfill` | **검증용 분봉 (권장).** 회사에 있는 동안 계속 켜 두기 | 먼저 가장 최근 미완성 날짜(보통 어제)를 날짜 단위로 완성하고, 나머지 과거 날짜는 **20거래일(약 1개월) 구간으로 나눠 최근 구간부터** 종목 하나를 여러 날짜 연속으로 받아 채움(날짜 단위보다 약 15% 빠름). 구간이 끝날 때마다 그 구간 날짜들이 완성됨. 중간에 꺼도 이어받음 | 어제 하루 약 50분 / 최근 1개월 약 2일 / 1년 약 3~4주 (하루 8시간 기준) |
 | `토스단타.exe minute-update` | 날짜 단위로만 채우기 | 전 영업일부터 과거 방향으로 날짜 하나씩 완성 | 하루치 약 50분 |
 | `토스단타.exe status` | 확인 | 일봉·분봉이 어디까지 받아졌는지, 빠진 날짜 | 즉시 |
+| `토스단타.exe adjust-update` | 필요할 때 | 수정주가 종가 1년치 갱신. **보통은 minute-update가 시작할 때 주기(7일)가 됐으면 먼저 자동으로 함** | 약 25분 |
 | `토스단타.exe universe` | 필요할 때 | 주식 보통주 목록만 갱신(daily-update가 하루 1번 자동으로 함) | 몇 초 |
 
 - `minute-update` 옵션: `--backfill`(빨리 채우기), `--max-minutes N`(이번 실행 최대 N분, 0=제한 없음), `--rate R`(캔들 초당 호출 수), `--date YYYYMMDD`(하루만).
@@ -55,7 +56,9 @@
 
 | 파일 | 표 | 내용 |
 |---|---|---|
-| `daily.sqlite` | `universe` | 주식(STOCK) 보통주 목록. 상장일, 마지막으로 목록에 있던 날, 현재 목록에 있는지(active) |
+| `daily.sqlite` | `universe` | 주식(STOCK) 보통주 목록. 상장일, 마지막으로 목록에 있던 날, 현재 목록에 있는지(active), **NXT 거래 가능 여부(nxt_supported, 현재 기준)** |
+| | `index_daily` | KOSPI·KOSDAQ 지수 일봉 symbol, date, open, high, low, close, volume |
+| | `adj_daily` | 수정주가 종가(adj_close), 수정계수(adj_factor = adj_close / 일봉 close), 받은 날(as_of). **수정계수가 날짜 사이에 바뀌면 분할·병합·권리락 등이 있었던 것** |
 | | `trading_day` | 거래일 = KOSPI 지수 일봉이 있는 날 (평일을 거래일로 가정하지 않음) |
 | | `daily_bar` | 일봉 code, date, open, high, low, close, volume, `value_est_krw`, `value_est_src` |
 | | `investor_daily` | 순매수 거래량 frgn/orgn/prsn/other_net_vol (설정 시) |
@@ -64,7 +67,8 @@
 | | `code_done`, `code_fail` | 종목별 완료·실패 기록 |
 | | `file_meta` | `complete=1`이면 그날 완성. 수집 여부는 이 기록으로 판단 |
 
-- 가격은 **수정주가 미적용**(실제 체결 가격)입니다. 액면분할 등이 있으면 분석에서 따로 처리해야 합니다.
+- 가격은 **수정주가 미적용**(실제 체결 가격)입니다. 액면분할 등은 `adj_daily.adj_factor`로 찾아 처리하세요(주 1회 갱신이라 최근 며칠은 반영이 늦을 수 있음).
+- `nxt_supported`는 **지금 시점** 값입니다. 과거 날짜에 NXT에서 거래됐는지는 그날 분봉의 장전·장후 봉 유무로 판단하세요.
 - 분봉 저장 범위: 정규장(09:00~15:30 시작) 봉은 모두, 장전·장후 봉은 **거래량이 있을 때만**.
 - 토스 일봉은 KRX+NXT 통합 기준입니다. 정규장 기준 일봉이 필요하면 분봉을 합쳐 만드세요.
 - **거래대금은 API가 주지 않습니다.** `value_est_krw`는 추정값입니다: 그날 분봉 파일이 완성돼 있으면 분봉 (종가×거래량) 합(`minute`),
