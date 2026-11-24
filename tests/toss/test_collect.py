@@ -119,3 +119,54 @@ def test_status(tmp_path):
     s = collect.status(d, store, logs.append, NOW, history_days=30)
     assert s["last"] == "2026-11-23" and s["minute"] == {"complete": 1, "partial": 0, "missing": 3}
     assert any("일봉 2026-11-18~2026-11-23" in l for l in logs)
+
+
+def _dump(store, day):
+    con = sqlite3.connect(ds.minute_path(store, day))
+    try:
+        return (sorted(con.execute("SELECT * FROM bar")), sorted(r[0] for r in con.execute("SELECT code FROM code_done")))
+    finally:
+        con.close()
+
+
+def test_backfill_same_result_as_daywise_with_fewer_calls(tmp_path):
+    a_m, a_c, a_d, a_store = setup(tmp_path / "a", prev_day="2026-11-23", list_dates={"000003": "2026-11-20"})
+    collect.minute_update(a_c, a_d, a_store, lambda x: None, NOW, history_days=30)
+    daywise_calls = len([1 for p, q in a_m.calls if p == "/api/v1/candles"])
+
+    b_m, b_c, b_d, b_store = setup(tmp_path / "b", prev_day="2026-11-23", list_dates={"000003": "2026-11-20"})
+    logs = []
+    r = collect.minute_backfill(b_c, b_d, b_store, logs.append, NOW, history_days=30)
+    back_calls = len([1 for p, q in b_m.calls if p == "/api/v1/candles"])
+    assert r["days_done"][0] == "2026-11-23"                       # 최근 날짜를 먼저 완성
+    assert sorted(r["days_done"]) == DAYS
+    for day in DAYS:
+        assert ds.minute_status(b_store, day) == "complete"
+        assert _dump(b_store, day) == _dump(a_store, day)           # 날짜 단위 결과와 똑같음
+    assert back_calls < daywise_calls
+    assert any("종목 단위 연속 수집" in l for l in logs)
+
+
+def test_backfill_resume_after_time_limit(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    t = {"now": 0.0}
+
+    def clock():
+        t["now"] += 25
+        return t["now"]
+    r = collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30, max_minutes=3, clock=clock)
+    assert "실행 시간 제한" in r["stop"] and ds.minute_status(store, "2026-11-23") == "complete"
+    assert ds.minute_status(store, "2026-11-18") != "complete"
+    r = collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30)
+    assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
+
+
+def test_backfill_failure_counts_per_day(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23", fail={"000002"})
+    c.retry_429 = 0
+    for _ in range(3):
+        collect.minute_backfill(c, d, store, lambda x: None, NOW, history_days=30, max_retry=3)
+    assert all(ds.minute_status(store, day) == "complete" for day in DAYS)
+    con = sqlite3.connect(ds.minute_path(store, "2026-11-18"))
+    assert con.execute("SELECT fail_count FROM code_fail WHERE code='000002'").fetchone()[0] == 3
+    assert con.execute("SELECT value FROM file_meta WHERE key='n_given_up'").fetchone()[0] == "1"

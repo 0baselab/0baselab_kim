@@ -44,8 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daily-update", help="[수집·아침용] 일봉(+설정 시 수급)을 전 영업일까지 보충")
     mu = sub.add_parser("minute-update", help="[수집·검증용] 분봉 날짜 파일 채우기 (최근 날짜부터, 이어받기)")
     mu.add_argument("--max-minutes", type=float, default=0, help="이번 실행 최대 시간(분). 0=제한 없음")
-    mu.add_argument("--rate", type=float, help="캔들 초당 호출 수 (기본: 설정 CHART_RATE=5)")
+    mu.add_argument("--rate", type=float, help="캔들 초당 호출 수 (기본: 설정 CHART_RATE=4)")
     mu.add_argument("--date", help="YYYYMMDD 하루만")
+    mu.add_argument("--backfill", action="store_true",
+                    help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
     sub.add_parser("auth", help="토큰 발급, 계좌 목록 조회")
     d = sub.add_parser("candles-depth", help="1분봉·일봉을 과거로 넘기며 가장 오래된 날짜 측정")
@@ -120,8 +122,12 @@ def run(argv: list[str]) -> int:
                 if args.rate:
                     client.set_group_rate("MARKET_DATA_CHART", args.rate)
                 day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
-                collect.minute_update(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
-                                      int(cfg.num("MAX_RETRY")), only_day=day)
+                if args.backfill and not day:
+                    collect.minute_backfill(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
+                                            int(cfg.num("MAX_RETRY")))
+                else:
+                    collect.minute_update(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
+                                          int(cfg.num("MAX_RETRY")), only_day=day)
             elif args.cmd == "auth":
                 commands.cmd_auth(client, con, log, now_kst)
             elif args.cmd == "candles-depth":

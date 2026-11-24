@@ -26,7 +26,7 @@ DEFAULTS: dict[str, str] = {
     "RETRY_429": "5",        # 429 재시도 횟수
     "MAX_CALLS": "3000",     # 과거 탐색 1회당 호출 상한
     "MAX_YEARS": "3",        # 과거 탐색 중단 기준 (년)
-    "CHART_RATE": "5",       # 캔들(MARKET_DATA_CHART) 초당 호출 수. 실측 지속 속도 약 4.6/초 (헤더 한도 20과 다름)
+    "CHART_RATE": "4",       # 캔들(MARKET_DATA_CHART) 초당 호출 수. 5로 보내면 실제 약 3.6/초 + 429 약 9% (헤더 한도 20과 다름)
     "HISTORY_DAYS": "365",   # 분봉·일봉을 처음 받을 때 과거 범위 (달력일)
     "INVESTOR_DAILY": "N",   # Y면 daily-update에서 종목별 투자자 순매수 거래량도 수집
     "MAX_RETRY": "3",        # 같은 (종목, 날짜) 분봉이 연속 이 횟수만큼 실패하면 그날은 건너뜀
