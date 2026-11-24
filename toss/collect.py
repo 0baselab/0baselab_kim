@@ -325,3 +325,149 @@ def status(dcon, store_dir: Path, log: Log, now, history_days: int = 365) -> dic
     if st["missing"]:
         log(f"  없는 날짜(최근 5): {st['missing'][-5:]}")
     return {"last": last, "minute": {k: len(v) for k, v in st.items()}, "minute_mb": size / 1024 / 1024}
+
+
+# ---------------------------------------------------------------- 분봉 과거 채우기 (빨리 채우기)
+def _needed(dcon, store_dir: Path, days: list[str], max_retry: int) -> tuple[dict, dict]:
+    """종목별로 아직 안 받은 날짜 집합. 반환: ({code: set(day)}, {day: [그날 대상 종목]})"""
+    per_code: dict[str, set] = {}
+    targets: dict[str, list] = {}
+    for day in days:
+        codes = active_codes(dcon, day)
+        targets[day] = codes
+        done, dead = set(), set()
+        if ds.minute_path(store_dir, day).exists():
+            con = sqlite3.connect(f"{ds.minute_path(store_dir, day).resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                done = {r[0] for r in con.execute("SELECT code FROM code_done")}
+                dead = {r[0] for r in con.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+            finally:
+                con.close()
+        for c in codes:
+            if c not in done and c not in dead:
+                per_code.setdefault(c, set()).add(day)
+    return per_code, targets
+
+
+def _backfill_code(client, code: str, need: set, conns: dict, store_dir: Path, now) -> int:
+    """종목 하나를 need 날짜 전체에 걸쳐 연속으로 받는다(200봉씩 과거로).
+    페이지를 받을 때마다, 더 과거 봉이 나온 날짜는 그날 분봉이 다 모인 것이므로 바로 그날 파일에 저장한다."""
+    lo, hi = min(need), max(need)
+    buf: dict[str, list] = {d: [] for d in need}
+    flushed: set = set()
+
+    def flush(d):
+        con = conns.get(d) or conns.setdefault(d, ds.connect_minute(store_dir, d))
+        with con:
+            con.executemany("INSERT OR REPLACE INTO bar VALUES (?,?,?,?,?,?,?)", buf[d])
+            con.execute("INSERT OR REPLACE INTO code_done VALUES (?,?,?,?)", (code, len(buf[d]), 0, _ts(now)))
+            con.execute("DELETE FROM code_fail WHERE code=?", (code,))
+        flushed.add(d)
+        buf[d] = []
+
+    p = {"symbol": code, "interval": "1m", "count": 200, "adjusted": "false", "before": _kst(hi, "20:00:00")}
+    calls, seen = 0, set()
+    while True:
+        body = client.get(CANDLES, p)
+        calls += 1
+        r = body.get("result") or {}
+        bars = r.get("candles") or []
+        oldest = None
+        for b in bars:
+            st = parse_ts(b["timestamp"]) - timedelta(minutes=1)
+            d = st.date().isoformat()
+            oldest = d if oldest is None or d < oldest else oldest
+            if d in buf and d not in flushed:
+                t = st.hour * 60 + st.minute
+                v = ds.num(b.get("volume")) or 0
+                if keep_bar(t, v):
+                    buf[d].append((code, t, ds.num(b.get("openPrice")), ds.num(b.get("highPrice")),
+                                   ds.num(b.get("lowPrice")), ds.num(b.get("closePrice")), int(v)))
+        nb = r.get("nextBefore")
+        end_of_data = not bars or not nb or nb in seen
+        for d in sorted(need - flushed, reverse=True):   # 이 페이지보다 최근인 날짜는 다 모였음
+            if end_of_data or (oldest is not None and d > oldest):
+                flush(d)
+        if end_of_data or (oldest is not None and oldest < lo):
+            for d in need - flushed:
+                flush(d)
+            break
+        seen.add(nb)
+        p["before"] = nb
+    return calls
+
+
+def minute_backfill(client, dcon, store_dir: Path, log: Log, now, history_days: int = 365,
+                    max_minutes: float = 0, max_retry: int = 3, end: str | None = None,
+                    clock: Callable[[], float] = time.monotonic) -> dict:
+    """빨리 채우기: 가장 최근 미완성 날짜는 날짜 단위로 먼저 완성하고, 나머지 과거 날짜는 종목 단위로 연속 수집."""
+    t0 = clock()
+    ensure_universe(client, dcon, log, now)
+    end = end or previous_business_day(client)
+    first = (now().date() - timedelta(days=history_days)).isoformat()
+    refresh_trading_days(client, dcon, log, first)
+    days = [d for d in trading_days(dcon, first, end) if ds.minute_status(store_dir, d) != "complete"]
+    out = {"days_done": [], "stop": "", "calls": 0}
+    if not days:
+        log("[minute-backfill] 채울 날짜 없음")
+        return out
+    newest = days[-1]
+    left = lambda: (max_minutes - (clock() - t0) / 60) if max_minutes else 0
+    log(f"[minute-backfill] 미완성 {len(days)}일. 먼저 최근 날짜 {newest}를 날짜 단위로 완성합니다")
+    r = minute_update(client, dcon, store_dir, log, now, history_days, max(left(), 0.01) if max_minutes else 0,
+                      max_retry, end=end, only_day=newest, clock=clock)
+    out["days_done"] += r["days_done"]
+    out["calls"] += r["calls"]
+    if r["stop"]:
+        out["stop"] = r["stop"]
+        return out
+    rest = [d for d in days if d != newest]
+    if not rest:
+        return out
+    per_code, targets = _needed(dcon, store_dir, rest, max_retry)
+    codes = sorted(per_code)
+    log(f"[minute-backfill] 과거 {len(rest)}일 ({rest[0]}~{rest[-1]}), 종목 단위 연속 수집 대상 {len(codes)}종목")
+    conns: dict = {}
+    c0, t1 = client.calls, clock()
+    try:
+        for i, code in enumerate(codes, 1):
+            if max_minutes and clock() - t0 > max_minutes * 60:
+                out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
+                break
+            try:
+                _backfill_code(client, code, per_code[code], conns, store_dir, now)
+            except (NotAllowedError, TossAuthError):
+                raise
+            except Exception as exc:  # noqa: BLE001  이 종목의 남은 날짜마다 실패 1회 기록
+                log(f"  실패 {code}: {exc}")
+                for d in per_code[code]:
+                    con = conns.get(d) or conns.setdefault(d, ds.connect_minute(store_dir, d))
+                    with con:
+                        if not con.execute("SELECT 1 FROM code_done WHERE code=?", (code,)).fetchone():
+                            con.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
+                                        " fail_count=fail_count+1, last_error=excluded.last_error,"
+                                        " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
+            if i % 50 == 0:
+                el = clock() - t1
+                n = client.calls - c0
+                log(f"  진행 {i}/{len(codes)}종목, 호출 {n}, {n / el if el else 0:.1f}/초, 429 {client.n429}, "
+                    f"남은 예상 {timedelta(seconds=int(el / i * (len(codes) - i)))}")
+        for day in rest:  # 다 모인 날짜는 완성 처리
+            con = conns.get(day) or (ds.connect_minute(store_dir, day) if ds.minute_path(store_dir, day).exists() else None)
+            if con is None:
+                continue
+            conns[day] = con
+            with con:
+                con.execute("INSERT OR REPLACE INTO file_meta VALUES ('max_retry', ?)", (str(max_retry),))
+            done = {r[0] for r in con.execute("SELECT code FROM code_done")}
+            dead = {r[0] for r in con.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+            if all(c in done or c in dead for c in targets[day]):
+                _finish_day(con, dcon, store_dir, day, len(targets[day]), now, log)
+                out["days_done"].append(day)
+    finally:
+        for con in conns.values():
+            con.close()
+    out["calls"] += client.calls - c0
+    log(f"[minute-backfill] 이번 실행 완성 {len(out['days_done'])}일, 호출 {out['calls']}회"
+        + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
+    return out
