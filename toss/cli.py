@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
     mu.add_argument("--targets", help="CSV 파일(date,code)에 적힌 종목·날짜만 받기. 같은 종목의 전 거래일도 함께 받음")
     sub.add_parser("adjust-update", help="[수집] 수정주가 종가 1년치 갱신 (보통은 minute-update가 주 1회 자동으로 함)")
+    sub.add_parser("sector-update", help="[수집] 토스 섹터와 구성 종목 스냅샷 (보통은 daily-update가 주 1회 자동으로 함)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
     tr = sub.add_parser("trade", help="[매매] 1단계: replay(저장된 분봉 재생, 가상 체결)만 가능. 실주문 없음")
     tr.add_argument("--mode", choices=["replay"], default="replay")
@@ -151,13 +152,16 @@ def run(argv: list[str]) -> int:
             mc = int(cfg.num("MAX_CALLS"))
             yrs = cfg.num("MAX_YEARS")
             hd = int(cfg.num("HISTORY_DAYS"))
-            if args.cmd in ("universe", "daily-update", "minute-update", "adjust-update"):
+            if args.cmd in ("universe", "daily-update", "minute-update", "adjust-update", "sector-update"):
                 dcon = datastore.connect_daily(cfg.store_dir)
             if args.cmd == "universe":
                 collect.refresh_universe(client, dcon, log, now_kst)
             elif args.cmd == "daily-update":
                 collect.daily_update(client, dcon, cfg.store_dir, log, now_kst, hd,
                                      investor=cfg.get("INVESTOR_DAILY").upper() in ("Y", "1", "TRUE"))
+            elif args.cmd == "sector-update":
+                collect.ensure_universe(client, dcon, log, now_kst)
+                collect.sector_update(client, dcon, log, now_kst)
             elif args.cmd == "adjust-update":
                 collect.ensure_universe(client, dcon, log, now_kst)
                 collect.adjust_update(client, dcon, log, now_kst, hd)
