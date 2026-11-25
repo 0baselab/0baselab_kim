@@ -39,13 +39,15 @@ def refresh_universe(client: TossClient, dcon, log: Log, now) -> int:
         items += [dict(i, market=market) for i in got if i.get("symbol")]
     if not items:
         raise SystemExit("종목 목록이 비어 있습니다 (stocks/all). 잠시 후 다시 실행하세요.")
-    list_dates, nxt = {}, {}
+    list_dates, nxt, shares = {}, {}, {}
     syms = [i["symbol"] for i in items]
     for k in range(0, len(syms), 200):  # stocks/all에는 상장일·NXT 여부가 없어 stocks로 조회
         for s in client.get("/api/v1/stocks", {"symbols": ",".join(syms[k:k + 200])}).get("result") or []:
             list_dates[s.get("symbol")] = s.get("listDate")
             v = (s.get("koreanMarketDetail") or {}).get("nxtSupported")
             nxt[s.get("symbol")] = None if v is None else int(bool(v))
+            so = ds.num(s.get("sharesOutstanding"))
+            shares[s.get("symbol")] = int(so) if so is not None else None
     with dcon:
         dcon.execute("UPDATE universe SET active=0")
         for i in items:
@@ -57,6 +59,13 @@ def refresh_universe(client: TossClient, dcon, log: Log, now) -> int:
                 (i["symbol"], i.get("name"), i["market"], i.get("securityType"), int(bool(i.get("isCommonShare"))),
                  list_dates.get(i["symbol"]), today, today))
             dcon.execute("UPDATE universe SET nxt_supported=? WHERE code=?", (nxt.get(i["symbol"]), i["symbol"]))
+            so = shares.get(i["symbol"])
+            if so is not None:
+                dcon.execute("UPDATE universe SET shares_outstanding=? WHERE code=?", (so, i["symbol"]))
+                last = dcon.execute("SELECT shares_outstanding FROM shares_hist WHERE code=? ORDER BY as_of DESC LIMIT 1",
+                                    (i["symbol"],)).fetchone()
+                if not last or last[0] != so:
+                    dcon.execute("INSERT OR REPLACE INTO shares_hist VALUES (?,?,?)", (i["symbol"], today, so))
         dcon.execute("INSERT OR REPLACE INTO meta VALUES ('universe_refreshed', ?)", (today,))
     gone = dcon.execute("SELECT COUNT(*) FROM universe WHERE active=0").fetchone()[0]
     n_nxt = sum(1 for v in nxt.values() if v)
@@ -215,7 +224,56 @@ def daily_update(client, dcon, store_dir: Path, log: Log, now, history_days: int
         raise
     except Exception as exc:  # noqa: BLE001  지수 분봉 실패가 아침 일봉 보충을 막지 않게
         log(f"[index-minute] 실패 (다음 실행 때 다시 시도): {exc}")
+    if sector_due(dcon, now):
+        try:
+            sector_update(client, dcon, log, now)
+        except (NotAllowedError, TossAuthError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log(f"[sector] 실패 (다음 실행 때 다시 시도): {exc}")
     return {"end": end, "done": done, "rows": rows, "fails": fails, "calls": client.calls - c0}
+
+
+# ---------------------------------------------------------------- 섹터 (주 1회 스냅샷)
+def sector_due(dcon, now, every_days: int = 7) -> bool:
+    r = dcon.execute("SELECT MAX(as_of) FROM sector").fetchone()[0]
+    return not r or (now().date() - Date.fromisoformat(r)).days >= every_days
+
+
+def sector_update(client, dcon, log: Log, now) -> dict:
+    """토스 섹터 목록과 섹터별 국내 구성 종목을 오늘 날짜 스냅샷으로 저장한다(같은 날 다시 받으면 덮어씀).
+    구성 종목은 하위 섹터 종목을 포함해 돌려주므로, 종목의 가장 세부 섹터는 depth가 가장 큰 것으로 고른다."""
+    today = now().date().isoformat()
+    c0 = client.calls
+    secs = (client.get("/api/v1/sectors").get("result") or {}).get("sectors") or []
+    if not secs:
+        raise SystemExit("섹터 목록이 비어 있습니다 (sectors). 잠시 후 다시 실행하세요.")
+    members, fails = [], 0
+    for sct in secs:
+        sid = sct.get("sectorId")
+        try:
+            got = (client.get(f"/api/v1/sectors/{sid}/stocks", {"marketCountry": "KR"}).get("result") or {}).get("stocks") or []
+        except (NotAllowedError, TossAuthError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            fails += 1
+            log(f"  실패 섹터 {sid}: {exc}")
+            continue
+        for st in got:
+            if st.get("symbol"):
+                mc = ds.num(st.get("marketCapitalization"))
+                members.append((today, sid, st["symbol"], int(mc) if mc is not None else None))
+    with dcon:
+        dcon.execute("DELETE FROM sector WHERE as_of=?", (today,))
+        dcon.execute("DELETE FROM sector_member WHERE as_of=?", (today,))
+        dcon.executemany("INSERT OR REPLACE INTO sector VALUES (?,?,?,?,?)",
+                         [(today, x.get("sectorId"), x.get("name"), x.get("depth"), x.get("parentSectorId")) for x in secs])
+        dcon.executemany("INSERT OR REPLACE INTO sector_member VALUES (?,?,?,?)", members)
+    codes = {m[2] for m in members}
+    uni = {r[0] for r in dcon.execute("SELECT code FROM universe WHERE active=1")}
+    log(f"[sector] 섹터 {len(secs)}개, 구성 종목·섹터 {len(members):,}건, 종목 목록 중 섹터 있는 종목 "
+        f"{len(codes & uni):,}/{len(uni):,}, 실패 {fails}, 호출 {client.calls - c0}회")
+    return {"sectors": len(secs), "members": len(members), "fails": fails, "covered": len(codes & uni)}
 
 
 # ---------------------------------------------------------------- 수정주가 (처음 1회 + 주 1회)
@@ -385,6 +443,10 @@ def status(dcon, store_dir: Path, log: Log, now, history_days: int = 365) -> dic
     log(f"[status] 종목 목록 {uni[1] or 0:,}종목 (누적 {uni[0]:,})")
     log(f"[status] 일봉 {dmin}~{dmax}, {drows:,}행, 전 거래일({last})까지 안 받은 종목 {lag}")
     log(f"[status] 수급 {inv[0]}~{inv[1]}, {inv[2]:,}행")
+    so = dcon.execute("SELECT COUNT(shares_outstanding) FROM universe WHERE active=1").fetchone()[0]
+    sec = dcon.execute("SELECT MAX(as_of) FROM sector").fetchone()[0]
+    nsec = dcon.execute("SELECT COUNT(DISTINCT code) FROM sector_member WHERE as_of=?", (sec,)).fetchone()[0] if sec else 0
+    log(f"[status] 발행주식수 있는 종목 {so:,}, 섹터 기준일 {sec or '없음'} (섹터 있는 종목 {nsec:,})")
     for sym, lo, hi, n in dcon.execute("SELECT symbol, MIN(date), MAX(date), COUNT(*) FROM index_minute GROUP BY symbol"):
         log(f"[status] 지수 분봉 {sym}: {lo}~{hi}, {n:,}봉")
     log(f"[status] 분봉 ({first}~{last}, 거래일 {len(days)}일): 완성 {len(st['complete'])}, 진행 중 {len(st['partial'])}, "

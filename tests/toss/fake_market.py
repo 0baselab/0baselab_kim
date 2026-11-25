@@ -67,6 +67,7 @@ class FakeMarket:
             return httpx.Response(200, json={"result": res})
         if path == "/api/v1/stocks":
             return httpx.Response(200, json={"result": [{"symbol": s, "listDate": self.list_dates.get(s, "2000-01-01"),
+                                                         "sharesOutstanding": "1000000",
                                                          "koreanMarketDetail": {"nxtSupported": s in self.nxt}}
                                                         for s in q["symbols"].split(",")]})
         if path in ("/api/v1/market-indicators/KOSPI/candles", "/api/v1/market-indicators/KOSDAQ/candles") \
@@ -97,6 +98,17 @@ class FakeMarket:
                 if d >= self.list_dates.get(code, "0000"):
                     src += self.minute(code, d)
             return httpx.Response(200, json=self._page(src, q))
+        if path == "/api/v1/sectors":
+            return httpx.Response(200, json={"result": {"sectors": [
+                {"sectorId": "10", "name": "IT", "depth": 0, "parentSectorId": None},
+                {"sectorId": "100", "name": "반도체", "depth": 1, "parentSectorId": "10"}]}})
+        if path.startswith("/api/v1/sectors/") and path.endswith("/stocks"):
+            assert q.get("marketCountry") == "KR"
+            sid = path.split("/")[4]
+            codes = sorted(self.symbols) if sid == "10" else sorted(self.symbols)[:1]
+            return httpx.Response(200, json={"result": {"stocks": [
+                {"symbol": c, "name": c, "volume": "1", "tradingAmount": "1", "marketCapitalization": "5000000000",
+                 "currency": "KRW"} for c in codes]}})
         if path.endswith("/investor-trading"):
             until = q.get("until") or self.days[-1]
             recs = [{"date": d, "foreigner": {"netBuyVolume": "3"}, "institution": {"netBuyVolume": "-2"},

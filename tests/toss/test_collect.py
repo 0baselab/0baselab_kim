@@ -321,3 +321,35 @@ def test_targets_time_limit_resume(tmp_path):
     assert r["stop"]
     r = collect.targets_update(c, d, store, lambda x: None, NOW, p)
     assert sorted(r["days"]) == DAYS
+
+
+def test_shares_outstanding_and_history(tmp_path):
+    m, c, d, store = setup(tmp_path)
+    collect.refresh_universe(c, d, lambda x: None, NOW)
+    assert d.execute("SELECT COUNT(*) FROM universe WHERE shares_outstanding=1000000").fetchone()[0] == 3
+    assert d.execute("SELECT COUNT(*) FROM shares_hist").fetchone()[0] == 3
+    collect.refresh_universe(c, d, lambda x: None, lambda: datetime(2026, 11, 25, 8, 0, tzinfo=KST))
+    assert d.execute("SELECT COUNT(*) FROM shares_hist").fetchone()[0] == 3   # 값이 같으면 이력 추가 안 함
+
+
+def test_sector_snapshot_and_weekly_in_daily_update(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    logs = []
+    collect.daily_update(c, d, store, logs.append, NOW, history_days=30)
+    assert any("[sector] 섹터 2개" in l for l in logs)
+    rows = d.execute("SELECT sector_id, COUNT(*) FROM sector_member GROUP BY sector_id").fetchall()
+    assert dict(rows) == {"10": 3, "100": 1}
+    assert d.execute("SELECT depth FROM sector WHERE sector_id='100'").fetchone()[0] == 1
+    m.calls.clear()
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    assert not [p for p, _ in m.calls if p.startswith("/api/v1/sectors")]   # 7일 안에는 다시 안 받음
+    collect.sector_update(c, d, lambda x: None, NOW)                          # 수동 실행은 같은 날 덮어씀
+    assert d.execute("SELECT COUNT(*) FROM sector_member").fetchone()[0] == 4
+    s = collect.status(d, store, logs.append, NOW, history_days=30)
+    assert any("섹터 기준일 2026-11-24 (섹터 있는 종목 3)" in l for l in logs)
+
+
+def test_sector_paths_allowed():
+    from toss.client import group_of
+    assert group_of("GET", "/api/v1/sectors") == "SECTOR"
+    assert group_of("GET", "/api/v1/sectors/100/stocks") == "SECTOR"

@@ -71,6 +71,21 @@ def num(v):
     return int(d) if d == d.to_integral_value() else float(d)
 
 
+EXTRA_SCHEMA = """
+-- 0.3.4: 발행주식수 이력 (종목 목록 갱신 날마다 값이 바뀐 경우만 한 줄)
+CREATE TABLE IF NOT EXISTS shares_hist (
+    code TEXT NOT NULL, as_of TEXT NOT NULL, shares_outstanding INTEGER,
+    PRIMARY KEY (code, as_of)) WITHOUT ROWID;
+-- 0.3.4: 토스 섹터 (조회한 날 기준 스냅샷. 과거 시점의 구성은 알 수 없음)
+CREATE TABLE IF NOT EXISTS sector (
+    as_of TEXT NOT NULL, sector_id TEXT NOT NULL, name TEXT, depth INTEGER, parent_id TEXT,
+    PRIMARY KEY (as_of, sector_id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS sector_member (
+    as_of TEXT NOT NULL, sector_id TEXT NOT NULL, code TEXT NOT NULL, market_cap_krw INTEGER,
+    PRIMARY KEY (as_of, sector_id, code)) WITHOUT ROWID;
+"""
+
+
 def connect_daily(store_dir: Path) -> sqlite3.Connection:
     store_dir.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(store_dir / "daily.sqlite"))
@@ -79,6 +94,9 @@ def connect_daily(store_dir: Path) -> sqlite3.Connection:
     cols = {r[1] for r in con.execute("PRAGMA table_info(universe)")}
     if "nxt_supported" not in cols:  # 0.2.3: NXT 거래 가능 여부 (토스 stocks.koreanMarketDetail.nxtSupported)
         con.execute("ALTER TABLE universe ADD COLUMN nxt_supported INTEGER")
+    if "shares_outstanding" not in cols:  # 0.3.4: 발행주식수 (토스 stocks.sharesOutstanding, 갱신 시점 값)
+        con.execute("ALTER TABLE universe ADD COLUMN shares_outstanding INTEGER")
+    con.executescript(EXTRA_SCHEMA)
     return con
 
 
