@@ -5,6 +5,7 @@ import argparse
 import sqlite3
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from collector.timeutil import now_kst
 from danta.cli import _path_masks, mask_paths
@@ -49,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     mu.add_argument("--date", help="YYYYMMDD 하루만")
     mu.add_argument("--backfill", action="store_true",
                     help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
+    mu.add_argument("--targets", help="CSV 파일(date,code)에 적힌 종목·날짜만 받기. 같은 종목의 전 거래일도 함께 받음")
     sub.add_parser("adjust-update", help="[수집] 수정주가 종가 1년치 갱신 (보통은 minute-update가 주 1회 자동으로 함)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
     tr = sub.add_parser("trade", help="[매매] 1단계: replay(저장된 분봉 재생, 가상 체결)만 가능. 실주문 없음")
@@ -162,14 +164,17 @@ def run(argv: list[str]) -> int:
             elif args.cmd == "minute-update":
                 if args.rate:
                     client.set_group_rate("MARKET_DATA_CHART", args.rate)
-                if not args.date:
+                if not args.date and not args.targets:
                     collect.index_minute_update(client, dcon, log, now_kst, hd)
-                if not args.date and collect.adjust_due(dcon, now_kst, int(cfg.num("ADJ_REFRESH_DAYS"))):
+                if not args.date and not args.targets and collect.adjust_due(dcon, now_kst, int(cfg.num("ADJ_REFRESH_DAYS"))):
                     collect.ensure_universe(client, dcon, log, now_kst)
                     log("수정주가 갱신 주기가 되어 먼저 갱신합니다 (약 25분, 주 1회)")
                     collect.adjust_update(client, dcon, log, now_kst, hd, max_minutes=args.max_minutes)
                 day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
-                if args.backfill and not day:
+                if args.targets:
+                    collect.targets_update(client, dcon, cfg.store_dir, log, now_kst, Path(args.targets),
+                                           args.max_minutes, int(cfg.num("MAX_RETRY")))
+                elif args.backfill and not day:
                     collect.minute_backfill(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
                                             int(cfg.num("MAX_RETRY")), chunk_days=int(cfg.num("BACKFILL_CHUNK_DAYS")))
                 else:

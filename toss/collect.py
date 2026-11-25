@@ -633,33 +633,10 @@ def focus_phase(client, dcon, store_dir: Path, log: Log, now, days: list[str], a
         codes = sorted(c for c in targets[day] if c in listed)
         mcon = ds.connect_minute(store_dir, day)
         try:
-            done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
-            dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
-            for code in codes:
-                if code in done or code in dead:
-                    continue
-                if max_minutes and clock() - t0 > max_minutes * 60:
-                    out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
-                    break
-                try:
-                    bars, calls = fetch_minute_day(client, code, day)
-                    with mcon:
-                        mcon.executemany("INSERT OR REPLACE INTO bar VALUES (?,?,?,?,?,?,?)", bars)
-                        mcon.execute("INSERT OR REPLACE INTO code_done VALUES (?,?,?,?)", (code, len(bars), calls, _ts(now)))
-                        mcon.execute("DELETE FROM code_fail WHERE code=?", (code,))
-                except (NotAllowedError, TossAuthError):
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    with mcon:
-                        mcon.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
-                                     " fail_count=fail_count+1, last_error=excluded.last_error,"
-                                     " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
-                    log(f"  실패 {day} {code}: {exc}")
+            complete = _fetch_codes(client, mcon, day, codes, log, now, max_minutes, max_retry, t0, clock, out)
             if out["stop"]:
                 break
-            done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
-            dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
-            if all(c in done or c in dead for c in codes):
+            if complete:
                 with mcon:
                     mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('focus_done', '1')")
                     mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('focus_codes', ?)", (str(len(codes)),))
@@ -673,6 +650,118 @@ def focus_phase(client, dcon, store_dir: Path, log: Log, now, days: list[str], a
                 f"남은 예상 {timedelta(seconds=int(el / k * (len(todo_days) - k)))}")
     out["calls"] = client.calls - c0
     log(f"[focus] 이번 실행 우선 수집 끝난 날 {len(out['days'])}일, 호출 {out['calls']}회"
+        + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
+    return out
+
+
+def _fetch_codes(client, mcon, day: str, codes, log: Log, now, max_minutes: float, max_retry: int,
+                 t0: float, clock, out: dict) -> bool:
+    """그날 파일에 codes를 받는다(이미 받은 것·포기한 것은 건너뜀). 시간 제한이면 out['stop']을 채운다.
+    반환: codes가 모두 받아졌거나 포기됐는지."""
+    done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
+    dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+    for code in codes:
+        if code in done or code in dead:
+            continue
+        if max_minutes and clock() - t0 > max_minutes * 60:
+            out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
+            return False
+        try:
+            bars, calls = fetch_minute_day(client, code, day)
+            with mcon:
+                mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('max_retry', ?)", (str(max_retry),))
+                mcon.executemany("INSERT OR REPLACE INTO bar VALUES (?,?,?,?,?,?,?)", bars)
+                mcon.execute("INSERT OR REPLACE INTO code_done VALUES (?,?,?,?)", (code, len(bars), calls, _ts(now)))
+                mcon.execute("DELETE FROM code_fail WHERE code=?", (code,))
+        except (NotAllowedError, TossAuthError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            with mcon:
+                mcon.execute("INSERT INTO code_fail VALUES (?,1,?,?) ON CONFLICT(code) DO UPDATE SET"
+                             " fail_count=fail_count+1, last_error=excluded.last_error,"
+                             " updated_at=excluded.updated_at", (code, str(exc)[:300], _ts(now)))
+            log(f"  실패 {day} {code}: {exc}")
+    done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
+    dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
+    return all(c in done or c in dead for c in codes)
+
+
+# ---------------------------------------------------------------- 지정 목록 수집 (--targets CSV)
+def read_targets(path: Path) -> dict[str, set]:
+    """CSV(date,code)를 읽는다. 머리글은 있어도 없어도 된다. 날짜는 YYYY-MM-DD 또는 YYYYMMDD,
+    종목코드는 앞자리 0이 빠졌으면 6자리로 채운다. 잘못된 줄은 오류로 멈춘다(조용히 건너뛰지 않음)."""
+    import csv
+    out: dict[str, set] = {}
+    with Path(path).open(encoding="utf-8-sig", newline="") as f:
+        for n, row in enumerate(csv.reader(f), 1):
+            row = [x.strip() for x in row]
+            if not row or not any(row):
+                continue
+            if n == 1 and not row[0][:1].isdigit():
+                continue  # 머리글
+            if len(row) < 2:
+                raise ValueError(f"{n}번째 줄: date,code 두 칸이 필요합니다: {row}")
+            d, c = row[0].replace("-", ""), row[1]
+            if not (len(d) == 8 and d.isdigit()) or not c.isalnum() or len(c) > 6:
+                raise ValueError(f"{n}번째 줄 형식 오류: {row}")
+            out.setdefault(f"{d[:4]}-{d[4:6]}-{d[6:]}", set()).add(c.zfill(6) if c.isdigit() else c)
+    return out
+
+
+def targets_update(client, dcon, store_dir: Path, log: Log, now, path: Path, max_minutes: float = 0,
+                   max_retry: int = 3, with_prev: bool = True, clock: Callable[[], float] = time.monotonic) -> dict:
+    """지정 목록(날짜·종목)만 분봉을 받는다. with_prev면 같은 종목의 전 거래일도 받는다(전일 정규장 종가 계산용).
+    목록 순서와 관계없이 최근 날짜부터 받는다. 완성 표시(complete·focus_done)는 바꾸지 않는다."""
+    ensure_universe(client, dcon, log, now)
+    want = read_targets(path)
+    if not want:
+        log("[targets] 목록이 비어 있습니다")
+        return {"days": [], "stop": "", "calls": 0, "pairs": 0}
+    first = min(want)
+    end = previous_business_day(client)
+    refresh_trading_days(client, dcon, log, first)
+    all_days = trading_days(dcon, "2000-01-01", end)
+    idx = {d: i for i, d in enumerate(all_days)}
+    plan: dict[str, set] = {}
+    skipped = {"not_trading_day": 0, "future": 0}
+    for d, codes in want.items():
+        if d > end:
+            skipped["future"] += len(codes)
+            continue
+        if d not in idx:
+            skipped["not_trading_day"] += len(codes)
+            continue
+        plan.setdefault(d, set()).update(codes)
+        if with_prev and idx[d] > 0:
+            plan.setdefault(all_days[idx[d] - 1], set()).update(codes)
+    pairs = sum(len(v) for v in plan.values())
+    log(f"[targets] 목록 {sum(len(v) for v in want.values()):,}건 ({len(want)}일)"
+        + (", 전 거래일 포함" if with_prev else "") + f" → 받을 종목·날짜 {pairs:,}건, {len(plan)}일"
+        + (f", 제외 {skipped}" if any(skipped.values()) else ""))
+    t0, c0 = clock(), client.calls
+    out = {"days": [], "stop": "", "calls": 0, "pairs": pairs, "skipped": skipped}
+    days = sorted(plan, reverse=True)
+    for k, day in enumerate(days, 1):
+        listed = set(active_codes(dcon, day))
+        codes = sorted(plan[day])
+        unknown = [c for c in codes if c not in listed]
+        if unknown:  # 목록에 없는 종목도 일단 받아 본다(그날 거래 종목일 수 있음). 수만 알린다.
+            log(f"  {day}: 종목 목록에 없는 코드 {len(unknown)}개 (예: {unknown[:3]})")
+        mcon = ds.connect_minute(store_dir, day)
+        try:
+            if _fetch_codes(client, mcon, day, codes, log, now, max_minutes, max_retry, t0, clock, out):
+                out["days"].append(day)
+        finally:
+            mcon.close()
+        if out["stop"]:
+            break
+        if k % 10 == 0:
+            el = clock() - t0
+            n = client.calls - c0
+            log(f"  [targets] {k}/{len(days)}일 ({day}까지), 호출 {n}, {n / el if el else 0:.1f}/초, 429 {client.n429}, "
+                f"남은 예상 {timedelta(seconds=int(el / k * (len(days) - k)))}")
+    out["calls"] = client.calls - c0
+    log(f"[targets] 끝난 날 {len(out['days'])}/{len(days)}일, 호출 {out['calls']}회"
         + (f", 멈춘 이유: {out['stop']}" if out["stop"] else ""))
     return out
 

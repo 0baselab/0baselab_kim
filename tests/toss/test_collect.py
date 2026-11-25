@@ -271,3 +271,53 @@ def test_daily_update_also_fills_index_minute(tmp_path):
     m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
     collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
     assert d.execute("SELECT COUNT(DISTINCT date) FROM index_minute").fetchone()[0] == 4
+
+
+def test_read_targets_formats(tmp_path):
+    p = tmp_path / "t.csv"
+    p.write_text("date,code\n20261123,1\n2026-11-20,000002\n\n", encoding="utf-8")
+    assert collect.read_targets(p) == {"2026-11-23": {"000001"}, "2026-11-20": {"000002"}}
+    p.write_text("2026-11-23\n", encoding="utf-8")
+    import pytest
+    with pytest.raises(ValueError):
+        collect.read_targets(p)
+
+
+def test_targets_only_listed_with_prev_day(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    p = tmp_path / "t.csv"
+    p.write_text("date,code\n2026-11-23,000002\n2026-11-20,000001\n2026-11-21,000001\n2026-12-01,000001\n",
+                 encoding="utf-8")
+    logs = []
+    r = collect.targets_update(c, d, store, logs.append, NOW, p)
+    assert r["skipped"] == {"not_trading_day": 1, "future": 1}
+    got = {}
+    for day in DAYS:
+        if ds.minute_path(store, day).exists():
+            con = sqlite3.connect(ds.minute_path(store, day))
+            got[day] = {x for (x,) in con.execute("SELECT code FROM code_done")}
+            con.close()
+    # 23일 000002 + 전 거래일(20일) 000002, 20일 000001 + 전 거래일(19일) 000001
+    assert got == {"2026-11-23": {"000002"}, "2026-11-20": {"000001", "000002"}, "2026-11-19": {"000001"}}
+    assert ds.minute_status(store, "2026-11-23") != "complete" and not collect.focus_done(store, "2026-11-23")
+    m.calls.clear()
+    r = collect.targets_update(c, d, store, lambda x: None, NOW, p)   # 다시 돌리면 받을 것 없음
+    assert not [q for q, _ in m.calls if q == "/api/v1/candles"] and len(r["days"]) == 3
+
+
+def test_targets_time_limit_resume(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    p = tmp_path / "t.csv"
+    p.write_text("".join(f"{day},{code}\n" for day in DAYS[1:] for code in ("000001", "000002", "000003")),
+                 encoding="utf-8")
+    t = {"now": 0.0}
+
+    def clock():
+        t["now"] += 5
+        return t["now"]
+    r = collect.targets_update(c, d, store, lambda x: None, NOW, p, max_minutes=0.2, clock=clock)
+    assert r["stop"]
+    r = collect.targets_update(c, d, store, lambda x: None, NOW, p)
+    assert sorted(r["days"]) == DAYS
