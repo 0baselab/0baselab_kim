@@ -71,6 +71,10 @@ def num(v):
     return int(d) if d == d.to_integral_value() else float(d)
 
 
+# 다른 프로그램(분석 스크립트 등)이 파일을 읽는 동안 쓰기를 기다리는 최대 시간(초).
+# 기본 5초면 읽기가 길 때 'database is locked'로 수집이 멈춘다 (0.3.5).
+LOCK_WAIT_SEC = 300
+
 EXTRA_SCHEMA = """
 -- 0.3.4: 발행주식수 이력 (종목 목록 갱신 날마다 값이 바뀐 경우만 한 줄)
 CREATE TABLE IF NOT EXISTS shares_hist (
@@ -88,7 +92,7 @@ CREATE TABLE IF NOT EXISTS sector_member (
 
 def connect_daily(store_dir: Path) -> sqlite3.Connection:
     store_dir.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(store_dir / "daily.sqlite"))
+    con = sqlite3.connect(str(store_dir / "daily.sqlite"), timeout=LOCK_WAIT_SEC)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(DAILY_SCHEMA)
     cols = {r[1] for r in con.execute("PRAGMA table_info(universe)")}
@@ -108,7 +112,7 @@ def minute_path(store_dir: Path, day: str) -> Path:
 def connect_minute(store_dir: Path, day: str) -> sqlite3.Connection:
     p = minute_path(store_dir, day)
     p.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(p))
+    con = sqlite3.connect(str(p), timeout=LOCK_WAIT_SEC)
     con.executescript(MINUTE_SCHEMA)
     con.execute("INSERT OR IGNORE INTO file_meta VALUES ('date', ?)", (day,))
     con.commit()

@@ -353,3 +353,19 @@ def test_sector_paths_allowed():
     from toss.client import group_of
     assert group_of("GET", "/api/v1/sectors") == "SECTOR"
     assert group_of("GET", "/api/v1/sectors/100/stocks") == "SECTOR"
+
+
+def test_writer_waits_for_reader_lock(tmp_path):
+    import threading
+    import time as _t
+    store = tmp_path / "toss_data"
+    con = ds.connect_minute(store, "2026-11-23")
+    con.close()
+    reader = sqlite3.connect(str(ds.minute_path(store, "2026-11-23")), check_same_thread=False)
+    reader.execute("BEGIN EXCLUSIVE")        # 다른 프로그램이 잠근 상황
+    threading.Timer(0.5, reader.rollback).start()
+    t0 = _t.monotonic()
+    w = ds.connect_minute(store, "2026-11-23")
+    with w:
+        w.execute("INSERT OR REPLACE INTO file_meta VALUES ('x', '1')")
+    assert _t.monotonic() - t0 >= 0.3      # 실패하지 않고 풀릴 때까지 기다림
