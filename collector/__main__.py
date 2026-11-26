@@ -202,8 +202,32 @@ def cmd_status(args) -> int:
         app.close()
 
 
+def cmd_verify_history() -> int:
+    """과거 데이터 조회 가능 기간 실측. 수집 DB가 없어도 돌고, 데이터 폴더·DB를 새로 만들지 않는다."""
+    from .verify.history import run_history
+
+    install = paths.install_dir()
+    settings = load_settings(install)
+    root = paths.data_dir(settings)
+    # 데이터 폴더가 이미 있으면 system/verify에, 없으면 설치 폴더 verify_history에 보고서를 둔다
+    out_dir = root / "system" / "verify" if root.exists() else install / "verify_history"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    now = now_kst()
+    log_path = setup_logging(out_dir, stamp(now))
+    keys = ensure_keys(install)
+    print(f"주식데이터수집기 {__version__} / 과거 데이터 조회 가능 기간 실측")
+    print("키: " + ", ".join(f"{k}={mask(v)}" for k, v in keys.items()))
+    report = run_history(now=now, settings=settings, keys=keys, out_dir=out_dir,
+                         db_path=root / "db" / "market.sqlite")
+    print(f"\n보고서: {report}\n로그: {log_path}")
+    return 0
+
+
 def cmd_verify(args=None) -> int:
     from .verify.runner import run_verify
+
+    if args is not None and getattr(args, "sub", None) == "history":
+        return cmd_verify_history()
 
     install = paths.install_dir()
     settings = load_settings(install)
@@ -253,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
                         help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
                              "unclassified(미분류 반복 등장 CSV) / dart(DART 수집) / dart-export(구글 시트용 CSV) / verify(실측 검증)")
+    parser.add_argument("sub", nargs="?", help="verify의 세부 항목 (history: 과거 데이터 조회 가능 기간 실측)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
     parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")
