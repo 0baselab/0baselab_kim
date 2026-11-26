@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS code_done (
 CREATE TABLE IF NOT EXISTS code_fail (
     code TEXT PRIMARY KEY, fail_count INTEGER NOT NULL, last_error TEXT, updated_at TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS file_meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+-- 0.3.6: 정규장 봉만 받은 종목 (minute-update --targets --regular-only). code_done과 따로 둬서
+-- 하루 전체 수집(backfill 등)은 이 종목을 아직 안 받은 것으로 보고 나중에 하루 전체를 다시 받는다.
+CREATE TABLE IF NOT EXISTS code_done_reg (
+    code TEXT PRIMARY KEY, n_bars INTEGER NOT NULL, n_calls INTEGER NOT NULL, fetched_at TEXT NOT NULL) WITHOUT ROWID;
 """
 
 

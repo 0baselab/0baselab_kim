@@ -369,3 +369,37 @@ def test_writer_waits_for_reader_lock(tmp_path):
     with w:
         w.execute("INSERT OR REPLACE INTO file_meta VALUES ('x', '1')")
     assert _t.monotonic() - t0 >= 0.3      # 실패하지 않고 풀릴 때까지 기다림
+
+
+def test_targets_regular_only_half_calls_and_separate_done(tmp_path):
+    m, c, d, store = setup(tmp_path, prev_day="2026-11-23")
+    collect.daily_update(c, d, store, lambda x: None, NOW, history_days=30)
+    p = tmp_path / "t.csv"
+    p.write_text("date,code\n2026-11-23,000001\n", encoding="utf-8")
+    m.calls.clear()
+    r = collect.targets_update(c, d, store, lambda x: None, NOW, p, regular_only=True, with_prev=False)
+    n_reg = len([q for q, _ in m.calls if q == "/api/v1/candles"])
+    con = sqlite3.connect(ds.minute_path(store, "2026-11-23"))
+    ts = sorted(t for (t,) in con.execute("SELECT t FROM bar WHERE code='000001'"))
+    assert ts[0] == 540 and ts[-1] == 930 and len(ts) == 391          # 정규장 봉만
+    assert con.execute("SELECT COUNT(*) FROM code_done").fetchone()[0] == 0
+    assert con.execute("SELECT code FROM code_done_reg").fetchone()[0] == "000001"
+    con.close()
+    assert n_reg == 2                                                   # 하루 전체는 4회
+    m.calls.clear()
+    collect.targets_update(c, d, store, lambda x: None, NOW, p, regular_only=True, with_prev=False)
+    assert not [q for q, _ in m.calls if q == "/api/v1/candles"]        # 다시 돌리면 건너뜀
+    collect.targets_update(c, d, store, lambda x: None, NOW, p, with_prev=False)   # 하루 전체로 다시 받음
+    con = sqlite3.connect(ds.minute_path(store, "2026-11-23"))
+    assert con.execute("SELECT code FROM code_done").fetchone()[0] == "000001"
+    assert con.execute("SELECT MAX(t) FROM bar").fetchone()[0] == 945  # 장후 봉까지
+    con.close()
+
+
+def test_regular_end_late_close_day(tmp_path):
+    m, c, d, store = setup(tmp_path)
+    with d:
+        d.execute("INSERT INTO index_minute VALUES ('KOSDAQ','2026-11-19',990,1,1,1,1,1)")
+        d.execute("INSERT INTO index_minute VALUES ('KOSDAQ','2026-11-20',930,1,1,1,1,1)")
+    assert collect.regular_end(d, "2026-11-19") == "16:31:00"
+    assert collect.regular_end(d, "2026-11-20") == "15:31:00"
