@@ -19,6 +19,8 @@ from .http import ApiError
 from .krx_collect import to_int
 from .rawstore import save_raw
 
+_save_raw_file = save_raw
+
 log = logging.getLogger("collector")
 
 PERIODIC_RE = re.compile(r"(분기보고서|반기보고서|사업보고서)\s*\((\d{4})\.(\d{2})\)")
@@ -85,7 +87,20 @@ def _days(a: str, b: str):
 
 
 def run(con, dart: DartClient, root, now_fn: Callable[[], datetime], limit: int, target_codes: set[str],
-        progress: Callable[[str], None] = lambda s: None) -> DartStats:
+        progress: Callable[[str], None] = lambda s: None, list_start: str | None = None,
+        titles: bool = True, min_year: str | None = None, save_raw_files: bool = True) -> DartStats:
+    """list_start: 첫 실행의 정기공시 목록 시작일(기본 3년 전). titles=False면 전체 공시 제목은 받지 않음.
+    min_year: 이보다 이른 사업연도 보고서는 재무를 받지 않음. save_raw_files=False면 원본 응답 파일을 남기지 않음."""
+    global save_raw
+    if not save_raw_files:
+        save_raw = lambda *a, **k: None  # noqa: E731 (백필: 원본은 검증·저장 후 버린다)
+    try:
+        return _run(con, dart, root, now_fn, limit, target_codes, progress, list_start, titles, min_year)
+    finally:
+        save_raw = _save_raw_file
+
+
+def _run(con, dart, root, now_fn, limit, target_codes, progress, list_start, titles, min_year) -> DartStats:
     st = DartStats()
     now = now_fn()
     today = now.strftime("%Y%m%d")
@@ -93,8 +108,8 @@ def run(con, dart: DartClient, root, now_fn: Callable[[], datetime], limit: int,
     touched: set[tuple[str, str]] = set()
     try:
         _update_corps(con, dart, root, now, budget, st)
-        _update_filings(con, dart, root, now_fn, budget, st, target_codes, progress)
-        _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched)
+        _update_filings(con, dart, root, now_fn, budget, st, target_codes, progress, list_start, titles)
+        _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched, min_year)
     except (DartBudgetExhausted, DartLimitError) as exc:
         st.stopped = str(exc)
     finally:
@@ -124,15 +139,18 @@ def _update_corps(con, dart, root, now, budget, st) -> None:
         db.set_status(con, "DART", "corp_code", today, "success", ts)
 
 
-def _update_filings(con, dart, root, now_fn, budget, st, target_codes, progress) -> None:
+def _update_filings(con, dart, root, now_fn, budget, st, target_codes, progress, list_start=None, titles=True) -> None:
     now = now_fn()
     today = now.strftime("%Y%m%d")
     last = con.execute("SELECT value FROM meta WHERE key='dart_list_until'").fetchone()
     first_run = last is None
-    start_periodic = (now - timedelta(days=365 * INITIAL_YEARS + 120)).strftime("%Y%m%d") if first_run else last[0]
+    start_periodic = (list_start or (now - timedelta(days=365 * INITIAL_YEARS + 120)).strftime("%Y%m%d")) \
+        if first_run else last[0]
     start_titles = (now - timedelta(days=TITLES_INITIAL_DAYS)).strftime("%Y%m%d") if first_run else last[0]
     # 정기공시(A)는 3년치(+보고서 제출 기한 여유), 전체 공시 제목은 첫 실행 30일, 이후 마지막 실행일부터
-    jobs = [("A", a, b) for a, b in _days(start_periodic, today)] + [(None, a, b) for a, b in _days(start_titles, today)]
+    jobs = [("A", a, b) for a, b in _days(start_periodic, today)]
+    if titles:
+        jobs += [(None, a, b) for a, b in _days(start_titles, today)]
     for ty, a, b in jobs:
         key = f"{ty or 'ALL'}|{a}|{b}"
         if b < today and db.get_status(con, "DART", "list", key) == "success":
@@ -182,7 +200,8 @@ def _save_filing(con, r, ty, ts, raw, st) -> None:
             st.periodic_new += 1
 
 
-def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched: set) -> None:
+def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progress, touched: set,
+                      min_year: str | None = None) -> None:
     rows = con.execute("SELECT * FROM dart_filings WHERE is_periodic=1 ORDER BY rcept_dt DESC, rcept_no DESC").fetchall()
     # fnlttSinglAcntAll은 (회사, 연도, 보고서 코드)만 받으므로 같은 기간의 정정본은 응답이 같다.
     # 아직 안 받은 접수번호가 있는 기간만 한 번 부르고, 그 기간의 미수집 접수번호를 모두 같은 결과로 기록한다.
@@ -193,6 +212,8 @@ def _fetch_statements(con, dart, root, now_fn, budget, st, target_codes, progres
             continue
         if f["reprt_code"] is None:
             st.skipped_fy += 1
+            continue
+        if min_year and (f["fiscal_year"] or "") < min_year:
             continue
         if db.get_status(con, "DART", "fs", f["rcept_no"]) in ("success", "empty"):
             continue

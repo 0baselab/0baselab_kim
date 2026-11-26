@@ -247,12 +247,74 @@ def cmd_verify(args=None) -> int:
     return 0
 
 
+def cmd_backfill(args) -> int:
+    """백테스트용 10년 과거 데이터 백필 (명세서 16장). backfill krx | kis | dart | status"""
+    from . import backfill as B
+    from .dart import DartClient
+    from .http import ApiClient
+    from .kis import KisClient
+    from .krx import KrxClient
+    from .lock import AlreadyRunning, Lock
+
+    sub = getattr(args, "sub", None)
+    if sub not in ("krx", "kis", "dart", "status"):
+        print("사용법: backfill krx | backfill kis | backfill dart | backfill status")
+        return 1
+    install = paths.install_dir()
+    settings = load_settings(install)
+    root = paths.data_dir(settings)
+    for sub_dir in ("backtest", "system", "logs"):
+        (root / sub_dir).mkdir(parents=True, exist_ok=True)
+    now = now_kst()
+    log_path = setup_logging(root / "logs", "backfill_" + stamp(now))
+    lock = Lock(root / "system" / "collector.lock")  # 정기 수집과 같은 잠금
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(f"{exc} 정기 수집이나 다른 백필이 끝난 뒤 다시 실행하세요.")
+        return 1
+    con = B.open_bt(root)
+    collect_con = B.open_collect_ro(root)
+    try:
+        today = now.strftime("%Y%m%d")
+        if sub == "status":
+            print("\n".join(B.status_lines(con, collect_con, settings, today)))
+            return 0
+        keys = ensure_keys(install)
+        print(f"주식데이터수집기 {__version__} / 백필 {sub} (저장: {B.bt_path(root)})")
+        if sub == "krx":
+            krx = KrxClient(ApiClient("KRX", float(settings.get("KRX_CALLS_PER_SEC") or 2)), settings["KRX_BASE_URL"],
+                            keys["KRX_AUTH_KEY"])
+            rep = B.krx_backfill(con, krx, settings, now_kst, print)
+        elif sub == "kis":
+            kis = KisClient(ApiClient("KIS", float(settings.get("KIS_CALLS_PER_SEC") or 10)), settings["KIS_BASE_URL"],
+                            keys["KIS_APP_KEY"], keys["KIS_APP_SECRET"], root / "system" / "kis_token.json")
+            rep = B.kis_backfill(con, kis, now_kst, print)
+        else:
+            dart = DartClient(ApiClient("DART", float(settings.get("DART_CALLS_PER_SEC") or 5)),
+                              settings["DART_BASE_URL"], keys["DART_API_KEY"])
+            rep = B.dart_backfill(con, dart, root, collect_con, settings, now_kst, print)
+        path = B.write_report(rep, con, root / "system" / "verify", now_kst())
+        print("\n".join(rep.lines + ([f"멈춤: {rep.stopped}"] if rep.stopped else [])))
+        print(f"\n보고서: {path}\n로그: {log_path}")
+        return 0
+    except B.BackfillStop as exc:
+        print(f"중단: {exc}")
+        return 2
+    finally:
+        con.close()
+        if collect_con is not None:
+            collect_con.close()
+        lock.release()
+
+
 def cmd_menu(args) -> int:
     return menu()
 
 
 COMMANDS = {"menu": cmd_menu, "daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
-            "unclassified": cmd_unclassified, "dart": cmd_dart, "dart-export": cmd_dart_export, "verify": cmd_verify}
+            "unclassified": cmd_unclassified, "dart": cmd_dart, "dart-export": cmd_dart_export, "verify": cmd_verify,
+            "backfill": cmd_backfill}
 
 
 def menu() -> int:
@@ -277,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
                         help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
                              "unclassified(미분류 반복 등장 CSV) / dart(DART 수집) / dart-export(구글 시트용 CSV) / verify(실측 검증)")
-    parser.add_argument("sub", nargs="?", help="verify의 세부 항목 (history: 과거 데이터 조회 가능 기간 실측)")
+    parser.add_argument("sub", nargs="?", help="세부 항목 (verify history / backfill krx|kis|dart|status)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
     parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")
