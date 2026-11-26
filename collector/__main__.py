@@ -257,8 +257,8 @@ def cmd_backfill(args) -> int:
     from .lock import AlreadyRunning, Lock
 
     sub = getattr(args, "sub", None)
-    if sub not in ("krx", "kis", "dart", "status"):
-        print("사용법: backfill krx | backfill kis | backfill dart | backfill status")
+    if sub not in ("krx", "kis", "dart", "status", "auto"):
+        print("사용법: backfill krx | kis | dart | status | auto [--shutdown]")
         return 1
     install = paths.install_dir()
     settings = load_settings(install)
@@ -282,6 +282,35 @@ def cmd_backfill(args) -> int:
             return 0
         keys = ensure_keys(install)
         print(f"주식데이터수집기 {__version__} / 백필 {sub} (저장: {B.bt_path(root)})")
+        make_krx = lambda: KrxClient(ApiClient("KRX", float(settings.get("KRX_CALLS_PER_SEC") or 2)),
+                                     settings["KRX_BASE_URL"], keys["KRX_AUTH_KEY"])
+        make_kis = lambda: KisClient(ApiClient("KIS", float(settings.get("KIS_CALLS_PER_SEC") or 10)),
+                                     settings["KIS_BASE_URL"], keys["KIS_APP_KEY"], keys["KIS_APP_SECRET"],
+                                     root / "system" / "kis_token.json")
+        make_dart = lambda: DartClient(ApiClient("DART", float(settings.get("DART_CALLS_PER_SEC") or 5)),
+                                       settings["DART_BASE_URL"], keys["DART_API_KEY"])
+        if sub == "auto":
+            import subprocess
+            import time
+            try:
+                res = B.run_auto(con, root, collect_con, settings, now_kst, print, make_krx, make_kis, make_dart,
+                                 root / "system" / "verify")
+            except KeyboardInterrupt:
+                print("\n사용자가 중단했습니다. 받은 것은 저장되었고 다음 실행 때 이어받습니다.")
+                return 130
+            print("\n=== 요약 ===")
+            for name, result in res.stages:
+                print(f"{name}: {result}")
+            for f in res.failed:
+                print(f"실패 단계: {f}")
+            print("\n".join(B.status_lines(con, collect_con, settings, now_kst().strftime("%Y%m%d"))))
+            for p in res.reports:
+                print(f"보고서: {p}")
+            if getattr(args, "shutdown", False):
+                con.close()
+                lock.release()
+                B.shutdown_countdown(lambda cmd: subprocess.run(cmd, check=False), print, time.sleep)
+            return 0
         if sub == "krx":
             krx = KrxClient(ApiClient("KRX", float(settings.get("KRX_CALLS_PER_SEC") or 2)), settings["KRX_BASE_URL"],
                             keys["KRX_AUTH_KEY"])
@@ -346,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="브리핑을 JSON으로도 저장")
     parser.add_argument("--days", type=int, help="미분류 반복 등장 집계 거래일 수 (기본 20)")
     parser.add_argument("--force", action="store_true", help="이미 성공한 단위도 다시 받기")
+    parser.add_argument("--shutdown", action="store_true", help="backfill auto가 끝나면 60초 뒤 Windows 종료")
     parser.add_argument("--yes", action="store_true", help="확인 질문을 모두 '예'로 처리")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
