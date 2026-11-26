@@ -56,7 +56,8 @@ def load_fonts() -> bool:
         FONT = "Malgun Gothic" if sys.platform == "win32" else "TkDefaultFont"
     return ok
 
-PAGES = [("collect", "수집"), ("brief", "브리핑 데이터 가공"), ("theme", "테마 관리"), ("settings", "설정")]
+PAGES = [("collect", "수집"), ("brief", "브리핑 데이터 가공"), ("theme", "테마 관리"), ("backtest", "백테스트"),
+         ("settings", "설정")]
 
 # 저녁 시간 띠 (분 단위)
 BAND_START, BAND_END = 15 * 60, 24 * 60
@@ -143,6 +144,8 @@ class MainWindow:
         self._build_briefing()
         self._build_theme()
         self._build_settings()
+        self.tab_backtest = self.pages["backtest"]
+        self._build_backtest()
         self.show("collect")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(100, self._poll)
@@ -259,6 +262,9 @@ class MainWindow:
                 msg = self.q.get_nowait()
                 if msg[0] == "log":
                     self._log(msg[1])
+                elif msg[0] == "bt":
+                    self.bt_progress.set(msg[2])
+                    self.bt_status.configure(text=msg[1], text_color=NAVY)
                 elif msg[0] == "ask":
                     _, question, ev, holder = msg
                     holder["answer"] = messagebox.askyesno("확인", question)
@@ -288,15 +294,12 @@ class MainWindow:
         self.root.destroy()
 
     def _startup_checks(self):
+        """키가 없어도 막지 않는다(백테스트만 쓰는 PC). 왼쪽 메뉴 아래에 상태만 알린다."""
         changed = L.version_changed(self.install)
         miss = L.missing_keys(self.install)
-        if miss:
-            head = "업데이트 후 첫 실행입니다. " if changed else ""
-            messagebox.showwarning("API 키 확인", head + "다음 키가 없습니다: " + ", ".join(miss) +
-                                   "\n[설정]에서 입력해 주세요.")
-            self.show("settings")
-        elif changed:
-            self._log(f"업데이트 확인: 버전 {__version__}, API 키 4개 모두 있음")
+        if changed:
+            self._log(f"업데이트 확인: 버전 {__version__}, " + ("API 키 4개 모두 있음" if not miss else
+                      "없는 키: " + ", ".join(miss) + " (수집하려면 [설정]에서 입력)"))
         self._refresh_nav_note()
 
     def _refresh_nav_note(self):
@@ -748,6 +751,127 @@ class MainWindow:
                 paths.data_dir(load_settings(self.install)) / "logs"))
 
         self._run_worker(work, show)
+
+
+# ---------------- [백테스트] ----------------
+# 수집·백필 잠금을 잡지 않고 백테스트 DB를 읽기 전용으로만 연다. API 키가 필요 없다.
+def _bt_build(self):
+    from .bt.cli import resolve_db
+    t = self.tab_backtest
+    self._title(t, "백테스트", "10년 과거 데이터로 추세추종 규칙을 계산만 합니다. 주문·매매는 하지 않습니다. "
+                             "백필이 도는 중에도 실행할 수 있습니다.")
+    row = ctk.CTkFrame(t, fg_color=WHITE)
+    row.pack(fill="x", pady=(16, 0))
+    self.bt_db = tk.StringVar(value=str(resolve_db(self.install, load_settings(self.install), None)))
+    ctk.CTkLabel(row, text="DB", font=F(13, "bold"), text_color=NAVY, width=40, anchor="w").pack(side="left")
+    ctk.CTkLabel(row, textvariable=self.bt_db, font=F(12), text_color=GRAY, anchor="w").pack(side="left", fill="x", expand=True)
+    self._secondary(row, "DB 파일 선택", self._bt_pick_db, width=120).pack(side="right")
+    self._section(t, "데이터 확보 현황")
+    self.bt_cov = ctk.CTkLabel(t, text="", font=F(12), text_color=NAVY, anchor="w", justify="left", wraplength=760)
+    self.bt_cov.pack(fill="x")
+    vrow = ctk.CTkFrame(t, fg_color=WHITE)
+    vrow.pack(fill="x", pady=(14, 0))
+    ctk.CTkLabel(vrow, text="변형", font=F(13, "bold"), text_color=NAVY, width=40, anchor="w").pack(side="left")
+    self.bt_var = tk.StringVar(value="all")
+    for val, lbl in (("A", "A 시세"), ("B", "B +수급"), ("C", "C +재무"), ("D", "D +지수"), ("all", "전체")):
+        ctk.CTkRadioButton(vrow, text=lbl, value=val, variable=self.bt_var, font=F(13), text_color=NAVY, fg_color=COBALT,
+                           hover_color=COBALT_DARK, border_color=GRAY, radiobutton_width=18,
+                           radiobutton_height=18).pack(side="left", padx=(0, 18))
+    brow = ctk.CTkFrame(t, fg_color=WHITE)
+    brow.pack(fill="x", pady=(16, 0))
+    self.btn_bt = self._primary(brow, "실행", self._bt_run, width=140)
+    self.btn_bt.pack(side="left")
+    self._secondary(brow, "결과 폴더 열기", lambda: L.open_folder(Path(self.bt_db.get()).parent / "results"), width=130).pack(side="left", padx=(10, 0))
+    b1 = self._secondary(brow, "최근 데이터 합치기", lambda: self._bt_sync(False), width=150)
+    b1.pack(side="left", padx=(10, 0))
+    b2 = self._secondary(brow, "업로드용 내보내기", lambda: self._bt_sync(True), width=150)
+    b2.pack(side="left", padx=(10, 0))
+    self._action_buttons += [b1, b2]
+    self.bt_progress = ctk.CTkProgressBar(t, height=8, corner_radius=4, fg_color=SURFACE, progress_color=COBALT)
+    self.bt_progress.set(0)
+    self.bt_progress.pack(fill="x", pady=(14, 0))
+    self.bt_status = ctk.CTkLabel(t, text="", font=F(12), text_color=GRAY, anchor="w")
+    self.bt_status.pack(fill="x", pady=(4, 0))
+    self.bt_result = ctk.CTkTextbox(t, fg_color=SURFACE, text_color=NAVY, corner_radius=8, font=F(12), wrap="none")
+    self.bt_result.pack(fill="both", expand=True, pady=(8, 0))
+    self.bt_result.configure(state="disabled")
+    self._bt_refresh_cov()
+
+
+def _bt_refresh_cov(self):
+    from .bt.data import coverage, coverage_lines, open_ro
+    p = Path(self.bt_db.get())
+    try:
+        con = open_ro(p)
+        try:
+            self.bt_cov.configure(text="\n".join(coverage_lines(coverage(con))))
+        finally:
+            con.close()
+    except Exception as exc:
+        self.bt_cov.configure(text=f"DB를 읽지 못했습니다: {exc}\n[DB 파일 선택]으로 backtest.sqlite를 고르세요.")
+
+
+def _bt_pick_db(self):
+    f = filedialog.askopenfilename(title="백테스트 DB 선택", filetypes=[("SQLite", "*.sqlite"), ("모든 파일", "*.*")])
+    if f:
+        set_setting(self.install, "BACKTEST_DB_PATH", f)
+        self.bt_db.set(f)
+        self._bt_refresh_cov()
+
+
+def _bt_set_result(self, text):
+    self.bt_result.configure(state="normal")
+    self.bt_result.delete("1.0", "end")
+    self.bt_result.insert("end", text)
+    self.bt_result.configure(state="disabled")
+
+
+def _bt_run(self):
+    from .bt import config as C
+    from .bt.cli import themes_csv_for
+    from .bt.run import run_backtest
+    v = self.bt_var.get()
+    variants = ["A", "B", "C", "D"] if v == "all" else [v]
+    db_path = Path(self.bt_db.get())
+    self.bt_progress.set(0)
+
+    def work(put):
+        cfg = C.load(self.install)
+        return run_backtest(db_path, cfg, variants, now_kst(), progress=lambda s, x: put(("bt", s, x)),
+                            themes_csv=themes_csv_for(db_path, load_settings(self.install)))
+
+    def done(out):
+        self.bt_progress.set(1)
+        self.bt_status.configure(text=f"완료: {out}", text_color=NAVY)
+        self._bt_set_result((out / "summary.md").read_text(encoding="utf-8"))
+        self._bt_refresh_cov()
+    self._run_worker(work, done)
+
+
+def _bt_sync(self, export: bool):
+    from . import paths as P
+    from .bt.sync import export as do_export, sync
+    db_path = Path(self.bt_db.get())
+    settings = load_settings(self.install)
+
+    def work(put):
+        root = P.data_dir(settings)
+        lines, rep = sync(db_path, root / "db" / "market.sqlite",
+                          (root if root.exists() else db_path.parent) / "system" / "verify", now_kst())
+        if export:
+            lines.append(f"내보내기: {do_export(db_path, P.desktop_dir(), now_kst())}")
+        return lines
+
+    def done(lines):
+        self._bt_set_result("\n".join(lines))
+        self.bt_status.configure(text="내보내기를 마쳤습니다." if export else "합치기를 마쳤습니다.", text_color=NAVY)
+        self._bt_refresh_cov()
+    self.bt_status.configure(text="합치는 중" + (" (끝나면 내보내기)" if export else ""), text_color=NAVY)
+    self._run_worker(work, done)
+
+
+for _n in ("_bt_build", "_bt_refresh_cov", "_bt_pick_db", "_bt_set_result", "_bt_run", "_bt_sync"):
+    setattr(MainWindow, "_build_backtest" if _n == "_bt_build" else _n, globals()[_n])
 
 
 def run_gui() -> int:

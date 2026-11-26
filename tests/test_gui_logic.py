@@ -96,7 +96,7 @@ def test_gui_smoke(install, monkeypatch):
     assert gui.load_fonts() and gui.FONT == "Pretendard"
     root = ctk.CTk()
     w = gui.MainWindow(root)
-    for key in ("collect", "brief", "theme", "settings"):
+    for key in ("collect", "brief", "theme", "backtest", "settings"):
         w.show(key)
         root.update()
     assert "theme_master" in w.t_info.cget("text") or "테마 마스터" in w.t_info.cget("text")
