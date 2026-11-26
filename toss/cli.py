@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     mu.add_argument("--backfill", action="store_true",
                     help="빨리 채우기: 최근 미완성 날짜를 먼저 완성하고, 과거 날짜는 종목 단위로 연속 수집 (약 16%% 빠름)")
     mu.add_argument("--targets", help="CSV 파일(date,code)에 적힌 종목·날짜만 받기. 같은 종목의 전 거래일도 함께 받음")
+    mu.add_argument("--regular-only", action="store_true",
+                    help="--targets와 함께: 정규장(09:00~15:30) 봉만 받기. 호출 약 절반. code_done_reg에 기록")
     sub.add_parser("adjust-update", help="[수집] 수정주가 종가 1년치 갱신 (보통은 minute-update가 주 1회 자동으로 함)")
     sub.add_parser("sector-update", help="[수집] 토스 섹터와 구성 종목 스냅샷 (보통은 daily-update가 주 1회 자동으로 함)")
     sub.add_parser("status", help="[수집] 일봉·분봉이 어디까지 받아졌는지")
@@ -177,7 +179,7 @@ def run(argv: list[str]) -> int:
                 day = f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}" if args.date else None
                 if args.targets:
                     collect.targets_update(client, dcon, cfg.store_dir, log, now_kst, Path(args.targets),
-                                           args.max_minutes, int(cfg.num("MAX_RETRY")))
+                                           args.max_minutes, int(cfg.num("MAX_RETRY")), regular_only=args.regular_only)
                 elif args.backfill and not day:
                     collect.minute_backfill(client, dcon, cfg.store_dir, log, now_kst, hd, args.max_minutes,
                                             int(cfg.num("MAX_RETRY")), chunk_days=int(cfg.num("BACKFILL_CHUNK_DAYS")))

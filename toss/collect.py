@@ -328,11 +328,17 @@ def keep_bar(t: int, volume) -> bool:
     return REG_START <= t <= REG_END or (volume or 0) > 0
 
 
-def fetch_minute_day(client, code: str, day: str) -> tuple[list[tuple], int]:
-    """그날(day, YYYY-MM-DD) 분봉 → [(code, t, o, h, l, c, v)], 호출 수. timestamp(종료 시각) - 1분 = 시작 시각."""
-    first_end = datetime.fromisoformat(_kst(day, "08:01:00"))
+def fetch_minute_day(client, code: str, day: str, regular_until: str | None = None) -> tuple[list[tuple], int]:
+    """그날(day, YYYY-MM-DD) 분봉 → [(code, t, o, h, l, c, v)], 호출 수. timestamp(종료 시각) - 1분 = 시작 시각.
+    regular_until(HH:MM:SS, 마지막 봉의 종료 시각)을 주면 09:00 시작 봉부터 그 시각까지만 받는다(정규장만, 호출 약 절반)."""
+    if regular_until:
+        first_end = datetime.fromisoformat(_kst(day, "09:01:00"))
+        before = _kst(day, regular_until)
+    else:
+        first_end = datetime.fromisoformat(_kst(day, "08:01:00"))
+        before = _kst(day, "20:00:00")
     r = page_candles(client, CANDLES, {"symbol": code, "interval": "1m", "count": 200, "adjusted": "false",
-                                       "before": _kst(day, "20:00:00")}, 10, stop_when=lambda t: t <= first_end)
+                                       "before": before}, 10, stop_when=lambda t: t <= first_end)
     out = []
     for b in r.bars:
         st = parse_ts(b["timestamp"]) - timedelta(minutes=1)
@@ -340,6 +346,8 @@ def fetch_minute_day(client, code: str, day: str) -> tuple[list[tuple], int]:
             continue
         t = st.hour * 60 + st.minute
         v = ds.num(b.get("volume")) or 0
+        if regular_until and t < REG_START:
+            continue
         if keep_bar(t, v):
             out.append((code, t, ds.num(b.get("openPrice")), ds.num(b.get("highPrice")), ds.num(b.get("lowPrice")),
                         ds.num(b.get("closePrice")), int(v)))
@@ -717,10 +725,13 @@ def focus_phase(client, dcon, store_dir: Path, log: Log, now, days: list[str], a
 
 
 def _fetch_codes(client, mcon, day: str, codes, log: Log, now, max_minutes: float, max_retry: int,
-                 t0: float, clock, out: dict) -> bool:
+                 t0: float, clock, out: dict, regular_until: str | None = None) -> bool:
     """그날 파일에 codes를 받는다(이미 받은 것·포기한 것은 건너뜀). 시간 제한이면 out['stop']을 채운다.
+    regular_until을 주면 정규장 봉만 받고 code_done_reg에 기록한다(code_done이나 code_done_reg에 있으면 건너뜀).
     반환: codes가 모두 받아졌거나 포기됐는지."""
-    done = {r[0] for r in mcon.execute("SELECT code FROM code_done")}
+    done_sql = "SELECT code FROM code_done" + (" UNION SELECT code FROM code_done_reg" if regular_until else "")
+    done_tbl = "code_done_reg" if regular_until else "code_done"
+    done = {r[0] for r in mcon.execute(done_sql)}
     dead = {r[0] for r in mcon.execute("SELECT code FROM code_fail WHERE fail_count >= ?", (max_retry,))}
     for code in codes:
         if code in done or code in dead:
@@ -729,11 +740,11 @@ def _fetch_codes(client, mcon, day: str, codes, log: Log, now, max_minutes: floa
             out["stop"] = f"실행 시간 제한 {max_minutes:g}분"
             return False
         try:
-            bars, calls = fetch_minute_day(client, code, day)
+            bars, calls = fetch_minute_day(client, code, day, regular_until)
             with mcon:
                 mcon.execute("INSERT OR REPLACE INTO file_meta VALUES ('max_retry', ?)", (str(max_retry),))
                 mcon.executemany("INSERT OR REPLACE INTO bar VALUES (?,?,?,?,?,?,?)", bars)
-                mcon.execute("INSERT OR REPLACE INTO code_done VALUES (?,?,?,?)", (code, len(bars), calls, _ts(now)))
+                mcon.execute(f"INSERT OR REPLACE INTO {done_tbl} VALUES (?,?,?,?)", (code, len(bars), calls, _ts(now)))
                 mcon.execute("DELETE FROM code_fail WHERE code=?", (code,))
         except (NotAllowedError, TossAuthError):
             raise
@@ -770,8 +781,16 @@ def read_targets(path: Path) -> dict[str, set]:
     return out
 
 
+def regular_end(dcon, day: str) -> str:
+    """정규장 마지막 봉의 종료 시각. 평소 15:31(15:30 시작 봉까지). 지수 분봉에 15:30 이후 봉이 있으면(수능일 등
+    마감이 늦은 날) 16:31. 지수 분봉 t는 봉 종료 시각이라 평소 마지막 값이 930이다."""
+    r = dcon.execute("SELECT MAX(t) FROM index_minute WHERE date=?", (day,)).fetchone()
+    return "16:31:00" if r and r[0] and r[0] > 931 else "15:31:00"
+
+
 def targets_update(client, dcon, store_dir: Path, log: Log, now, path: Path, max_minutes: float = 0,
-                   max_retry: int = 3, with_prev: bool = True, clock: Callable[[], float] = time.monotonic) -> dict:
+                   max_retry: int = 3, with_prev: bool = True, regular_only: bool = False,
+                   clock: Callable[[], float] = time.monotonic) -> dict:
     """지정 목록(날짜·종목)만 분봉을 받는다. with_prev면 같은 종목의 전 거래일도 받는다(전일 정규장 종가 계산용).
     목록 순서와 관계없이 최근 날짜부터 받는다. 완성 표시(complete·focus_done)는 바꾸지 않는다."""
     ensure_universe(client, dcon, log, now)
@@ -798,7 +817,7 @@ def targets_update(client, dcon, store_dir: Path, log: Log, now, path: Path, max
             plan.setdefault(all_days[idx[d] - 1], set()).update(codes)
     pairs = sum(len(v) for v in plan.values())
     log(f"[targets] 목록 {sum(len(v) for v in want.values()):,}건 ({len(want)}일)"
-        + (", 전 거래일 포함" if with_prev else "") + f" → 받을 종목·날짜 {pairs:,}건, {len(plan)}일"
+        + (", 전 거래일 포함" if with_prev else "") + (", 정규장만" if regular_only else "") + f" → 받을 종목·날짜 {pairs:,}건, {len(plan)}일"
         + (f", 제외 {skipped}" if any(skipped.values()) else ""))
     t0, c0 = clock(), client.calls
     out = {"days": [], "stop": "", "calls": 0, "pairs": pairs, "skipped": skipped}
@@ -811,7 +830,8 @@ def targets_update(client, dcon, store_dir: Path, log: Log, now, path: Path, max
             log(f"  {day}: 종목 목록에 없는 코드 {len(unknown)}개 (예: {unknown[:3]})")
         mcon = ds.connect_minute(store_dir, day)
         try:
-            if _fetch_codes(client, mcon, day, codes, log, now, max_minutes, max_retry, t0, clock, out):
+            if _fetch_codes(client, mcon, day, codes, log, now, max_minutes, max_retry, t0, clock, out,
+                            regular_end(dcon, day) if regular_only else None):
                 out["days"].append(day)
         finally:
             mcon.close()
