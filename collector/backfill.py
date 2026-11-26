@@ -514,17 +514,20 @@ def dart_remaining_limit(collect_con, settings, today: str) -> tuple[int, int]:
     return max(0, limit - used), used
 
 
-def dart_backfill(con, dart, root, collect_con, settings, now_fn, out) -> Report:
+def dart_backfill(con, dart, root, collect_con, settings, now_fn, out, reserve: int = 0) -> Report:
+    """reserve: 정기 DART 수집용으로 남겨 둘 호출 수 (backfill auto는 BACKFILL_DART_RESERVE)."""
     from .dart_collect import run
     rep = Report("dart", now_fn())
     today = now_fn().strftime("%Y%m%d")
     allowed, used = dart_remaining_limit(collect_con, settings, today)
+    allowed = max(0, allowed - reserve)
     targets = {r[0] for r in con.execute("SELECT code FROM bt_stock WHERE is_common=1")}
     if not targets:
         rep.stopped = "대상 종목이 없습니다. 먼저 backfill krx를 끝내세요."
         rep.add(rep.stopped)
         return rep
-    rep.add(f"DART 오늘 한도: 설정 {settings.get('DART_DAILY_LIMIT') or 18000} − 정기 수집 사용 {used} = 백필 {allowed}회 "
+    rep.add(f"DART 오늘 한도: 설정 {settings.get('DART_DAILY_LIMIT') or 18000} − 정기 수집 사용 {used} − 예비 {reserve}"
+            f" = 백필 {allowed}회 "
             "(백필이 오늘 이미 쓴 호출도 이 안에서 셈)")
     try:
         st = run(con, dart, root, now_fn, allowed, targets, progress=out, list_start=DART_LIST_START,
@@ -610,3 +613,83 @@ def write_report(rep: Report, con, out_dir: Path, now: datetime) -> Path:
     path = out_dir / f"backfill_{rep.kind}_{stamp(now)}.md"
     path.write_text(redact("\n".join(L)) + "\n", encoding="utf-8")
     return path
+
+
+# ------------------------------------------------------------------ 자동 (backfill auto)
+def krx_done(con, today: str) -> bool:
+    """어제까지 모든 평일·4종류가 성공 또는 빈 응답이고, 보통주 판별이 끝났으면 True."""
+    end = (datetime.strptime(today, "%Y%m%d").date() - timedelta(days=1)).strftime("%Y%m%d")
+    need = len(weekdays(START, end)) * 4
+    have = con.execute("SELECT COUNT(*) FROM bt_job WHERE (kind LIKE 'krx_trade_%' OR kind LIKE 'krx_index_%')"
+                       " AND status IN ('success','empty') AND unit_key <= ?", (end,)).fetchone()[0]
+    stocks = con.execute("SELECT COUNT(*) FROM bt_stock").fetchone()[0]
+    return have >= need and stocks > 0
+
+
+SHUTDOWN_CMD = ["shutdown", "/s", "/t", "60"]
+ABORT_CMD = ["shutdown", "/a"]
+
+
+@dataclass
+class AutoResult:
+    stages: list[tuple[str, str]] = field(default_factory=list)  # (단계, 결과)
+    failed: list[str] = field(default_factory=list)
+    reports: list[Path] = field(default_factory=list)
+
+
+def run_auto(con, root, collect_con, settings, now_fn, out, make_krx, make_kis, make_dart,
+             report_dir: Path) -> AutoResult:
+    """KRX(남았으면) -> KIS(15:40~23:59이고 남았으면, 23:59까지) -> DART(예비 한도 남김).
+    한 단계가 오류로 멈춰도 다음 단계를 진행하고 실패 단계를 기록한다."""
+    res = AutoResult()
+    reserve = int(settings.get("BACKFILL_DART_RESERVE") or 3000)
+
+    def stage(name, fn):
+        out(f"\n=== {name} ===")
+        try:
+            rep = fn()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # 인증 실패 등: 이 단계만 실패로 적고 다음으로
+            log.exception("backfill auto %s 실패", name)
+            res.failed.append(f"{name}: {type(exc).__name__}: {redact(str(exc))[:200]}")
+            res.stages.append((name, "실패"))
+            return
+        res.reports.append(write_report(rep, con, report_dir, now_fn()))
+        if rep.stopped and ("인증" in rep.stopped or "오류" in rep.stopped):
+            res.failed.append(f"{name}: {rep.stopped}")
+        res.stages.append((name, rep.stopped or "완료"))
+
+    today = now_fn().strftime("%Y%m%d")
+    if krx_done(con, today):
+        res.stages.append(("KRX", "이미 끝남 (건너뜀)"))
+    else:
+        stage("KRX", lambda: krx_backfill(con, make_krx(), settings, now_fn, out))
+    if not investor_window_ok(now_fn()):
+        res.stages.append(("KIS", f"{now_fn().strftime('%H:%M')}: 15:40~23:59가 아니어서 건너뜀"))
+    elif kis_targets(con) and kis_remaining_calls(con) == 0:
+        res.stages.append(("KIS", "이미 끝남 (건너뜀)"))
+    else:
+        stage("KIS", lambda: kis_backfill(con, make_kis(), now_fn, out))
+    stage("DART", lambda: dart_backfill(con, make_dart(), root, collect_con, settings, now_fn, out, reserve=reserve))
+    return res
+
+
+def shutdown_countdown(run_cmd, out, sleep, seconds: int = 60, is_windows: bool | None = None) -> bool:
+    """Windows 종료 예약(shutdown /s /t 60) 후 60초 카운트다운. Ctrl+C면 취소(shutdown /a). True = 종료 진행."""
+    import sys as _sys
+    is_windows = _sys.platform == "win32" if is_windows is None else is_windows
+    if not is_windows:
+        out("Windows가 아니어서 PC를 끄지 않습니다.")
+        return False
+    run_cmd(SHUTDOWN_CMD)
+    out(f"{seconds}초 뒤 PC를 끕니다. 취소하려면 Ctrl+C를 누르세요.")
+    try:
+        for left in range(seconds, 0, -10):
+            out(f"  {left}초 남음")
+            sleep(min(10, left))
+    except KeyboardInterrupt:
+        run_cmd(ABORT_CMD)
+        out("PC 끄기를 취소했습니다.")
+        return False
+    return True

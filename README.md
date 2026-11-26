@@ -125,7 +125,10 @@ C:\주식데이터수집기\주식데이터수집기-명령.exe backfill krx
 C:\주식데이터수집기\주식데이터수집기-명령.exe backfill kis
 C:\주식데이터수집기\주식데이터수집기-명령.exe backfill dart
 C:\주식데이터수집기\주식데이터수집기-명령.exe backfill status
+C:\주식데이터수집기\주식데이터수집기-명령.exe backfill auto --shutdown
 ```
+
+- `backfill auto`는 남은 KRX → KIS(15:40~23:59) → DART(정기 수집용 예비 3,000회를 남김)를 차례로 하고, `--shutdown`이면 끝난 뒤 60초 카운트다운 후 PC를 끕니다(Ctrl+C로 취소).
 
 - 저장 위치: `주식데이터수집\backtest\backtest.sqlite` (정기 수집 DB와 별도). 순서는 krx → kis(15:40~23:59) → dart(며칠). 자세한 내용은 명세서 16장.
 - 끊겨도 다시 실행하면 이어받습니다. 정기 수집과 동시에는 돌지 않습니다.

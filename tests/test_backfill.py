@@ -210,3 +210,105 @@ def test_dart_backfill_no_raw_files_and_limit(tmp_path):
     rep = B.dart_backfill(con, f.client(), tmp_path, collect, SETTINGS, lambda: NOW, lambda *_: None)
     assert con.execute("SELECT COUNT(*) FROM dart_fs_quarter").fetchone()[0] > 0
     assert not (tmp_path / "raw").exists()  # 원본 응답 파일을 남기지 않음
+
+
+# ----------------------------- backfill auto -----------------------------
+
+def auto_env(tmp_path, f, collect_used=0):
+    from .fake_dart import FakeDart
+    con = B.open_bt(tmp_path)
+    collect = db.connect(tmp_path / "market.sqlite")
+    db.init_db(collect)
+    collect.execute("INSERT INTO meta VALUES('dart_calls_20261126', ?)", (str(collect_used),))
+    fd = FakeDart()
+    makers = dict(make_krx=lambda: KrxClient(f.api(), "https://krx/svc/apis", "KRXKEY123456"),
+                  make_kis=lambda: kis(f, tmp_path, NOW), make_dart=fd.client)
+    return con, collect, fd, makers
+
+
+def run_auto(con, tmp_path, collect, settings, clock, makers, out=None):
+    return B.run_auto(con, tmp_path, collect, settings, clock, out or (lambda *_: None),
+                      report_dir=tmp_path / "rep", **makers)
+
+
+@pytest.fixture
+def krx_end(monkeypatch):
+    real = B.krx_backfill
+    monkeypatch.setattr(B, "krx_backfill", lambda con, krx, s, now_fn, out: real(con, krx, s, now_fn, out, end="20261113"))
+    monkeypatch.setattr(B, "krx_done", lambda con, today: con.execute("SELECT COUNT(*) FROM bt_stock").fetchone()[0] > 0)
+
+
+def test_auto_stage_order_and_reserve(tmp_path, krx_end):
+    f = Fake()
+    con, collect, fd, makers = auto_env(tmp_path, f, collect_used=5000)
+    seen = []
+    res = run_auto(con, tmp_path, collect, dict(SETTINGS, BACKFILL_DART_RESERVE="3000"), lambda: NOW, makers,
+                   out=lambda s: seen.append(s))
+    names = [s for s in seen if s.startswith("\n=== ")]
+    assert names == ["\n=== KRX ===", "\n=== KIS ===", "\n=== DART ==="]
+    assert [n for n, _ in res.stages] == ["KRX", "KIS", "DART"] and not res.failed
+    dart_rep = (tmp_path / "rep").glob("backfill_dart_*.md")
+    text = next(dart_rep).read_text(encoding="utf-8")
+    assert "18000 − 정기 수집 사용 5000 − 예비 3000 = 백필 10000회" in text
+    # 두 번째 실행: KRX·KIS는 끝나 있어 건너뜀
+    res = run_auto(con, tmp_path, collect, SETTINGS, lambda: NOW, makers)
+    assert res.stages[0] == ("KRX", "이미 끝남 (건너뜀)") and res.stages[1] == ("KIS", "이미 끝남 (건너뜀)")
+
+
+def test_auto_kis_stops_at_2359_then_dart(tmp_path, krx_end):
+    f = Fake()
+    con, collect, fd, makers = auto_env(tmp_path, f)
+    t = {"n": 0}
+
+    def clock():
+        t["n"] += 1
+        return NOW.replace(hour=23, minute=58) if f.kis_calls < 6 else NOW.replace(day=27, hour=0, minute=1)
+
+    res = run_auto(con, tmp_path, collect, SETTINGS, clock, makers)
+    stages = dict(res.stages)
+    assert "벗어나 멈춤" in stages["KIS"]
+    assert "DART" in stages and fd.calls > 0  # 23:59가 지나도 DART는 진행
+
+
+def test_auto_outside_window_skips_kis_and_failure_continues(tmp_path, krx_end):
+    f = Fake()
+    con, collect, fd, makers = auto_env(tmp_path, f)
+    makers["make_krx"] = lambda: (_ for _ in ()).throw(RuntimeError("KRX 인증 실패"))
+    res = run_auto(con, tmp_path, collect, SETTINGS, lambda: NOW.replace(hour=10), makers)
+    assert res.stages[0] == ("KRX", "실패") and "KRX 인증 실패" in res.failed[0]
+    assert "건너뜀" in res.stages[1][1] and res.stages[2][0] == "DART"
+    assert f.kis_calls == 0
+
+
+def test_shutdown_countdown():
+    calls, out = [], []
+    assert B.shutdown_countdown(calls.append, out.append, lambda s: None, is_windows=True)
+    assert calls == [B.SHUTDOWN_CMD] == [["shutdown", "/s", "/t", "60"]]
+    # Ctrl+C로 취소
+    calls.clear()
+
+    def interrupt(_):
+        raise KeyboardInterrupt
+
+    assert not B.shutdown_countdown(calls.append, out.append, interrupt, is_windows=True)
+    assert calls == [B.SHUTDOWN_CMD, B.ABORT_CMD]
+    # Linux: 실제 종료 안 함
+    calls.clear()
+    assert not B.shutdown_countdown(calls.append, out.append, lambda s: None, is_windows=False)
+    assert calls == []
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_cli_auto_shutdown_flag(tmp_path, monkeypatch, flag):
+    from collector import __main__ as M, paths
+    from collector.secrets import save_keys
+    inst = tmp_path / "install"
+    (inst / "config").mkdir(parents=True)
+    (inst / "config" / "settings.env").write_text(f"DATA_DIR={tmp_path / 'data'}\n", encoding="utf-8")
+    save_keys(inst, {"KRX_AUTH_KEY": "a" * 10, "KIS_APP_KEY": "b" * 10, "KIS_APP_SECRET": "c" * 10, "DART_API_KEY": "d" * 10})
+    monkeypatch.setattr(paths, "install_dir", lambda: inst)
+    monkeypatch.setattr(B, "run_auto", lambda *a, **k: B.AutoResult(stages=[("KRX", "완료")]))
+    called = []
+    monkeypatch.setattr(B, "shutdown_countdown", lambda *a, **k: called.append(True))
+    assert M.main(["backfill", "auto"] + (["--shutdown"] if flag else [])) == 0
+    assert called == ([True] if flag else [])

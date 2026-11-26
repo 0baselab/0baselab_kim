@@ -704,7 +704,8 @@ KRX 종목기본정보만으로 판단합니다. 아래 세 조건을 모두 만
 
 ### 16.3 실행
 
-- 명령줄만: `주식데이터수집기-명령.exe backfill krx | kis | dart | status`. GUI 버튼은 나중에.
+- 명령줄만: `주식데이터수집기-명령.exe backfill krx | kis | dart | status | auto [--shutdown]`. GUI 버튼은 나중에.
+- `backfill auto`: KRX가 남았으면 먼저 → 15:40~23:59이고 KIS가 남았으면 23:59까지 → DART(하루 한도 = `DART_DAILY_LIMIT` − 정기 수집 오늘 사용량 − 예비 `BACKFILL_DART_RESERVE`(기본 3,000, 정기 DART 수집용)). 한 단계가 오류로 멈춰도 다음 단계를 진행하고 실패 단계를 요약·보고서에 적음. `--shutdown`이면 끝난 뒤 `shutdown /s /t 60`으로 Windows 종료를 예약하고 60초 카운트다운, Ctrl+C면 `shutdown /a`로 취소.
 - 정기 수집과 같은 잠금 파일을 써서 동시에 돌지 않음(동시 실행이면 안내만 내고 종료).
 - Ctrl+C로 멈춰도 받은 단위는 저장되고 다음 실행 때 이어받음.
 - 각 실행 끝에 `system/verify/backfill_<종류>_<시각>.md`: 받은 기간, 행 수, 빈 날짜, 실패 목록, 상장폐지 종목 수급 확인 결과.
