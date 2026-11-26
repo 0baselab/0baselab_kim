@@ -337,13 +337,19 @@ def cmd_backfill(args) -> int:
         lock.release()
 
 
+def cmd_backtest(args) -> int:
+    from .bt.cli import main as bt_main
+    sub = getattr(args, "sub", None)
+    return bt_main(sub, getattr(args, "variant", None), getattr(args, "db", None))
+
+
 def cmd_menu(args) -> int:
     return menu()
 
 
 COMMANDS = {"menu": cmd_menu, "daily": cmd_collect, "range": cmd_collect, "briefing": cmd_briefing, "status": cmd_status,
             "unclassified": cmd_unclassified, "dart": cmd_dart, "dart-export": cmd_dart_export, "verify": cmd_verify,
-            "backfill": cmd_backfill}
+            "backfill": cmd_backfill, "backtest": cmd_backtest}
 
 
 def menu() -> int:
@@ -369,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
                              "unclassified(미분류 반복 등장 CSV) / dart(DART 수집) / dart-export(구글 시트용 CSV) / verify(실측 검증)")
     parser.add_argument("sub", nargs="?", help="세부 항목 (verify history / backfill krx|kis|dart|status)")
+    parser.add_argument("variant", nargs="?", help="backtest run의 변형 A|B|C|D|all")
+    parser.add_argument("--db", help="백테스트 DB 경로 (backtest 명령)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
     parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")

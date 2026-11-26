@@ -133,6 +133,17 @@ C:\주식데이터수집기\주식데이터수집기-명령.exe backfill auto --
 - 저장 위치: `주식데이터수집\backtest\backtest.sqlite` (정기 수집 DB와 별도). 순서는 krx → kis(15:40~23:59) → dart(며칠). 자세한 내용은 명세서 16장.
 - 끊겨도 다시 실행하면 이어받습니다. 정기 수집과 동시에는 돌지 않습니다.
 
+### 백테스트 (`backtest`, GUI [백테스트] 탭)
+
+```bat
+C:\주식데이터수집기\주식데이터수집기-명령.exe backtest coverage
+C:\주식데이터수집기\주식데이터수집기-명령.exe backtest run all
+C:\주식데이터수집기\주식데이터수집기-명령.exe backtest export
+```
+
+- 계산만 하며 주문·매매는 하지 않습니다. API 키가 필요 없고, 백필이 도는 중에도 실행됩니다.
+- 결과: `backtest\results\<시각>\summary.md`(+ trades.csv, equity.csv), 최신은 `results\latest\`. 규칙 값은 `config\backtest.env`. 자세한 내용은 명세서 17장.
+
 ## 6. 실측 보고서를 돌려주는 방법
 
 1. 그날 마지막 `실측보고서_{날짜-시각}.md`를 엽니다(메모장으로 열 수 있습니다).
