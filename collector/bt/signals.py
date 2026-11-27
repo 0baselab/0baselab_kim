@@ -57,6 +57,25 @@ def quintile_same_day(events: list[tuple[int, int]], values: dict) -> dict:
     return q
 
 
+def quintile_all_stocks(events: list[tuple[int, int]], values: np.ndarray, top_pct: float = 20.0):
+    """그날 대상(거르기 통과, 값 있음) 모든 종목 안에서의 순위로 5분위와 상위 top_pct% 여부.
+    상위 여부는 B 조건과 같은 기준(그날 값 >= 백분위 100-top_pct). 값이 없으면 None."""
+    q, top, cache = {}, {}, {}
+    for t, j in events:
+        v = values[t, j]
+        if np.isnan(v):
+            continue
+        if t not in cache:
+            row = values[t][~np.isnan(values[t])]
+            cache[t] = (np.sort(row), float(np.percentile(row, 100 - top_pct)))
+        srt, thr = cache[t]
+        lo, hi = np.searchsorted(srt, v, "left"), np.searchsorted(srt, v, "right")
+        pr = ((lo + hi) / 2) / len(srt)  # 같은 값은 가운데 순위
+        q[(t, j)] = min(5, int(pr * 5) + 1)
+        top[(t, j)] = bool(v >= thr)
+    return q, top
+
+
 def stats(xs: list[float]) -> dict:
     n = len(xs)
     if n == 0:
@@ -88,6 +107,8 @@ def run_signals(db_path: Path, cfg: Config, now: datetime,
     with np.errstate(invalid="ignore", divide="ignore"):
         value_x = p.value / ind.val_prev20
         flow = ind.flow_sum * 1e6 / p.mktcap
+        filt = ok & (p.mktcap >= cfg.f("MIN_MKTCAP_KRW")) & (ind.val20 >= cfg.f("MIN_VALUE20_KRW"))
+        flow_all = np.where(filt, flow, np.nan)  # B 조건과 같은 대상: 그날 거르기 통과 + 수급 자료 있는 모든 종목
     for t, j in events:
         if t + 1 >= T or np.isnan(p.open[t + 1, j]):
             continue
@@ -119,7 +140,13 @@ def run_signals(db_path: Path, cfg: Config, now: datetime,
             "지수 120일선 위" if idx[t] >= im[t] else "지수 120일선 아래")
         rows.append(r)
     keys = [(r["t"], r["j"]) for r in rows]
-    for name in ("value_x", "trend_quality", "flow"):
+    fq, ftop = quintile_all_stocks(keys, flow_all, cfg.f("FLOW_TOP_PCT"))
+    for r in rows:
+        k = (r["t"], r["j"])
+        r["q_flow"], r["flow_top"] = fq.get(k), ftop.get(k)
+        r["combo"] = None if r["flow_top"] is None else (
+            ("수급 상위" if r["flow_top"] else "수급 나머지") + (" & 과열" if r["overheat"] else " & 비과열"))
+    for name in ("value_x", "trend_quality"):
         q = quintile_same_day(keys, {(r["t"], r["j"]): r[name] for r in rows})
         for r in rows:
             r[f"q_{name}"] = q.get((r["t"], r["j"]))
@@ -161,7 +188,7 @@ def _table(rows, group_key, groups, dev_end, label):
 
 def _write(out: Path, p, cfg: Config, rows: list, n_events: int):
     cols = ["date", "code", "name", "market", "overheat", "value_x", "q_value_x", "trend_quality", "q_trend_quality",
-            "flow", "q_flow", "fin", "backdrop"] + [f"{k}{h}" for h in HORIZONS for k in ("ret", "ex")]
+            "flow", "q_flow", "flow_top", "combo", "fin", "backdrop"] + [f"{k}{h}" for h in HORIZONS for k in ("ret", "ex")]
     with (out / "signals.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -175,7 +202,7 @@ def _write(out: Path, p, cfg: Config, rows: list, n_events: int):
          "매매 규칙(손절·종목 수·진입 방식) 없이 신호 자체의 예측력만 봅니다. 초과수익 = 신호 다음 날 시가 기준 수익률 - 같은 기간 해당 시장 지수 수익률.",
          "", f"- 기본 신호: 거르기 통과 + 정배열 + 60일선 상승 + 250일 위치 {cfg.s('POS250_MIN_PCT')}% 이상 (지수 필터 없음)",
          f"- 같은 종목 {cfg.s('SIGNAL_GAP_DAYS')}거래일 안 중복 신호 제외: 원 신호 {n_events}개 -> 측정 {len(rows)}개",
-         f"- 구간 비교는 그날 신호 종목 안에서 나눔. 신호 {MIN_N}개 미만 구간은 '표본 부족'. 개발 ~{dev} / 검증 그 이후",
+         f"- 거래대금·추세 품질 분위는 그날 신호 종목 안에서, 수급 분위는 그날 거르기 통과 + 수급 자료 있는 모든 종목 안에서 나눔(B 조건과 같은 기준). 신호 {MIN_N}개 미만 구간은 '표본 부족'. 개발 ~{dev} / 검증 그 이후",
          "- " + universe_lines(p.universe_note)[0], ""]
     L += _table(rows, "overheat", [("비과열", lambda v: v is False), ("과열", lambda v: v is True)], dev,
                 f"과열 (20일 수익률 ≥ {cfg.s('OVERHEAT_RET20_PCT')}% 또는 20일선 대비 +{cfg.s('OVERHEAT_GAP20_PCT')}% 이상)")
@@ -183,7 +210,13 @@ def _write(out: Path, p, cfg: Config, rows: list, n_events: int):
     L += _table(rows, "q_trend_quality", q, dev, "추세 품질 (60일 수익률 / 변동성) 5분위")
     fr = (f"{min(r['date'] for r in flow_rows)}~{max(r['date'] for r in flow_rows)}, {len(flow_rows)}개 신호"
           if flow_rows else "자료 없음")
-    L += _table(flow_rows, "q_flow", q, dev, f"수급 (20일 외국인+기관 순매수 / 시총) 5분위 - 수급 자료 있는 신호만 ({fr})")
+    L += _table(flow_rows, "q_flow", q, dev, f"수급 (20일 외국인+기관 순매수 / 시총) 5분위 - 그날 대상 모든 종목 기준, 수급 자료 있는 신호만 ({fr})")
+    top = cfg.s("FLOW_TOP_PCT")
+    L += _table(flow_rows, "combo", [("수급 나머지 & 과열", lambda v: v == "수급 나머지 & 과열"),
+                                     ("수급 나머지 & 비과열", lambda v: v == "수급 나머지 & 비과열"),
+                                     ("수급 상위 & 과열", lambda v: v == "수급 상위 & 과열"),
+                                     ("수급 상위 & 비과열", lambda v: v == "수급 상위 & 비과열")], dev,
+                f"수급 상위 {top}% & 비과열 조합 (수급 상위 = 그날 대상 중 상위 {top}%, B 조건과 같은 기준)")
     L += _table(rows, "fin", [("탈락", lambda v: v == "탈락"), ("자료 없음", lambda v: v == "자료 없음"),
                               ("통과", lambda v: v == "통과")], dev,
                 f"재무 (C 조건: 4분기 영업이익 합 > 0, 부채비율 < {cfg.s('DEBT_RATIO_MAX_PCT')}%, 자본 > 0) - 재무 자료 있는 신호 {len(fin_rows)}개")

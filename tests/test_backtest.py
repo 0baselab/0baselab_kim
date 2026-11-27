@@ -396,7 +396,7 @@ def test_signals_report(tmp_path):
     make_db(tmp_path).close()
     out = run_signals(B.bt_path(tmp_path), cfg(), NOW)
     s = (out / "signals.md").read_text(encoding="utf-8")
-    for x in ("### 과열", "### 거래대금 급증", "### 추세 품질", "### 수급", "### 재무", "### 시장 배경", "표본 부족", "최상위", "| 개발 |", "| 검증 |"):
+    for x in ("### 과열", "### 거래대금 급증", "### 추세 품질", "### 수급", "### 재무", "### 시장 배경", "수급 상위 20% & 비과열 조합", "표본 부족", "최상위", "| 개발 |", "| 검증 |"):
         assert x in s, x
     assert (out / "signals.csv").read_text(encoding="utf-8-sig").startswith("date,code,name")
 
@@ -413,3 +413,28 @@ def test_random_comparison_reproducible(tmp_path):
     assert "## 무작위 비교" in s1 and pick(s1) == pick(s2)  # 같은 시드 = 같은 결과
     c = run_backtest(db_path, cfg(RANDOM_SEED="7"), ["A"], NOW.replace(minute=6), random_n=5)
     assert "## 배경 설정" in (c / "summary.md").read_text(encoding="utf-8")
+
+
+def test_b2_drops_value_spike_condition():
+    c = cfg()
+    assert E.spec("B2", c).spike is False and E.spec("B", c).spike is True and E.spec("B2", c).base == "B"
+    assert "B2" in E.ALL_VARIANTS
+
+
+def test_flow_quintile_uses_all_stocks_of_day():
+    from collector.bt.signals import quintile_all_stocks
+    vals = np.array([[float(j) for j in range(10)]])  # 그날 대상 10종목, 신호는 2개뿐
+    q, top = quintile_all_stocks([(0, 9), (0, 0)], vals, 20)
+    assert q[(0, 9)] == 5 and q[(0, 0)] == 1        # 신호가 적어도 가운데로 몰리지 않음
+    assert top[(0, 9)] is True and top[(0, 0)] is False
+    vals[0, 3] = np.nan
+    q, _ = quintile_all_stocks([(0, 3)], vals, 20)
+    assert (0, 3) not in q
+
+
+def test_coverage_dart_by_year(tmp_path):
+    from collector.bt.data import dart_year_lines
+    L = dart_year_lines({"by_year": {"2016": (10, 40), "2024": (100, 400), "2025": (100, 400)}})
+    assert "2016 10개사(40행)" in L[0] and "2017 0개사(0행)" in L[0] and "2026 0개사(0행)" in L[0]
+    assert "진행 중" in L[1] and "2016" in L[1] and "2026" not in L[1]
+    assert "아직 없습니다" in dart_year_lines({})[1]

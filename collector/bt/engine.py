@@ -22,9 +22,9 @@ from .data import Panel, atr, rolling_max, rolling_mean, rolling_min, rolling_su
 ENTRY_METHODS = {"1": "① 다음 날 시가", "2": "② 20일선 지정가", "3": "③ 전일 종가 - 0.5xATR 지정가", "4": "④ 250일 고가 지정가"}
 EXIT_METHODS = {"ga": "(가) 종가 판단 -> 다음 날 시가", "na": "(나) 장중 손절"}
 VARIANTS = {"A": "KRX 시세 추세", "A1": "A + 추세 품질 순위", "A2": "A + 과열 제외", "A3": "A + 지수 필터",
-            "A4": "A + 추세 품질·과열 제외·지수 필터", "B": "A + KIS 수급", "C": "B + DART 재무", "D": "C + 지수 필터",
+            "A4": "A + 추세 품질·과열 제외·지수 필터", "B": "A + KIS 수급", "B2": "B - 거래대금 급증 조건 (수급만)", "C": "B + DART 재무", "D": "C + 지수 필터",
             "A_sameB": "A 규칙을 B가 계산된 종목·날짜에만", "A4_sameB": "A4 규칙을 B가 계산된 종목·날짜에만"}
-ALL_VARIANTS = ["A", "A1", "A2", "A3", "A4", "B", "C", "D", "A_sameB", "A4_sameB"]
+ALL_VARIANTS = ["A", "A1", "A2", "A3", "A4", "B", "B2", "C", "D", "A_sameB", "A4_sameB"]
 
 
 @dataclass
@@ -36,6 +36,7 @@ class VariantSpec:
     overheat: bool
     index_filter: bool
     tiebreak: str
+    spike: bool = True  # B의 거래대금 급증 조건 사용 여부 (B2는 끔)
 
 
 def spec(name: str, cfg: Config) -> VariantSpec:
@@ -51,7 +52,7 @@ def spec(name: str, cfg: Config) -> VariantSpec:
         heat = True
     if core in ("A3", "A4"):
         idx = True
-    return VariantSpec(name, base, "B" if name.endswith("_sameB") else base, rank, heat, idx, cfg.s("RANK_TIEBREAK"))
+    return VariantSpec(name, base, "B" if name.endswith("_sameB") else base, rank, heat, idx, cfg.s("RANK_TIEBREAK"), core != "B2")
 
 
 @dataclass
@@ -161,7 +162,9 @@ def signals(p: Panel, ind: Indicators, cfg: Config, variant, ok: np.ndarray, flo
             thr = np.full(len(p.dates), np.nan)
             has = ~np.all(np.isnan(fs), axis=1)
             thr[has] = np.nanpercentile(fs[has], 100 - flow_top, axis=1)
-            sig &= (flow_score >= thr[:, None]) & (value_x >= cfg.f("VALUE_SPIKE_X"))
+            sig &= flow_score >= thr[:, None]
+            if sp.spike:
+                sig &= value_x >= cfg.f("VALUE_SPIKE_X")
             score = flow_score
             score2 = tq if sp.tiebreak == "trend_quality" else value_x
         if base in "CD":
