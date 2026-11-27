@@ -157,7 +157,7 @@ def test_run_end_to_end_files(tmp_path):
     db_path = B.bt_path(tmp_path)
     out = run_backtest(db_path, cfg(), ["A", "B", "C", "D"], NOW)
     s = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## 계산 범위" in s[:400]
+    assert "## 계산 범위" in s[:1200]
     assert s.index("## 계산 범위") < s.index("## 진입·청산 방식 비교")
     for x in ("연환산%", "최대낙폭%", "지정가체결%", "놓친신호20일%", "## 기간 분할", "## 연도별 수익률", "## 민감도", "코스피"):
         assert x in s
@@ -438,3 +438,54 @@ def test_coverage_dart_by_year(tmp_path):
     assert "2016 10개사(40행)" in L[0] and "2017 0개사(0행)" in L[0] and "2026 0개사(0행)" in L[0]
     assert "진행 중" in L[1] and "2016" in L[1] and "2026" not in L[1]
     assert "아직 없습니다" in dart_year_lines({})[1]
+
+
+# ----------------------------- 0.13.0 -----------------------------
+
+def test_a2_variants_spec():
+    c = cfg()
+    s1, s2, s3 = E.spec("A2-dd1", c), E.spec("A2-dd2", c), E.spec("A2-cap", c)
+    assert s1.overheat and s1.dd_pause and s1.index_filter and s1.base == "A"
+    assert s2.overheat and s2.index60 and not s2.index_filter   # 배경 120일선 대신 60일선
+    assert s3.max_theme == 2 and E.spec("A2", c).max_theme is None
+
+
+def test_emergency_stop_gap_exit():
+    # t=1 시가 100 매수, t=2 장중 저가 70 (최고 종가 100 대비 -30%) -> (가+)는 75에 즉시 매도, (가)는 종가 판단
+    p = tiny_panel(o=[[100], [100], [98], [80]], h=[[100], [100], [99], [81]], l=[[100], [99], [70], [79]],
+                   c=[[100], [100], [95], [80]])
+    sig = np.array([[True], [False], [False], [False]])
+    R = E.simulate(p, _flat_ind(p, ma60=np.full((4, 1), 0.0)), cfg(MAX_POSITIONS="1"), "A", sig, np.ones((4, 1)), "1", "gap", 15, 20, 0)
+    assert R.trades[0]["reason"] == "비상 손절" and R.trades[0]["exit_date"] == p.dates[2]
+    R2 = E.simulate(p, _flat_ind(p, ma60=np.full((4, 1), 0.0)), cfg(MAX_POSITIONS="1"), "A", sig, np.ones((4, 1)), "1", "ga", 15, 20, 0)
+    assert R2.trades[0]["reason"] != "비상 손절"
+
+
+def test_dd_pause_blocks_new_entries():
+    # 종목0 매수 후 -20% 평가손 (총자산 대비 -10% 이하) -> 그날 종목1 신규 매수 안 함
+    o = [[100, 50], [100, 50], [80, 50], [80, 50]]
+    c = [[100, 50], [100, 50], [80, 50], [80, 50]]
+    p = tiny_panel(o=o, h=o, l=c, c=c)
+    sig = np.array([[True, False], [False, False], [False, True], [False, False]])
+    ind = _flat_ind(p, ma60=np.full((4, 2), 0.0))
+    kw = dict(MAX_POSITIONS="1", STOP_PCT="90")
+    R = E.simulate(p, ind, cfg(**kw), "A2-dd1", sig, np.ones((4, 2)), "1", "ga", 90, 20, 0)
+    assert R.paused_days >= 1
+
+
+def test_a2_grid_one_at_a_time():
+    from collector.bt.run import a2_grid
+    g = a2_grid(cfg())
+    assert len(g) == 3 * 9 and {x["entry"] for x in g} == {"1", "3", "4"}
+    assert sum(1 for x in g if x["changed"] == "기본") == 3
+    assert all(x["pos"] == 10 for x in g if x["changed"] != "pos")
+
+
+def test_summary_multi_comparison_and_period_split(tmp_path):
+    from collector.bt.run import run_backtest
+    make_db(tmp_path).close()
+    out = run_backtest(B.bt_path(tmp_path), cfg(SENS_RANDOM_N="2"), ["A", "A2", "A2-cap"], NOW, random_n=0)
+    s = (out / "summary.md").read_text(encoding="utf-8")
+    assert s.index("## 다중 비교 주의") < s.index("## 배경 설정") and "과대평가" in s
+    assert "진입 x 청산 전체 조합" in s and "상위 3개 조합 연도별" in s and "## A2 민감도" in s
+    assert "(가+)" in s and "테마 파일 없음: 제한이 적용되지 않아" in s
