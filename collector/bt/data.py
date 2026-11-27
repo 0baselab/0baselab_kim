@@ -57,6 +57,10 @@ def coverage(con) -> dict:
     r = con.execute("SELECT MIN(date), MAX(date) FROM bt_index WHERE index_name IN ('코스피','코스닥')").fetchone()
     c["index"] = {"from": r[0], "to": r[1]}
     c["variants"] = runnable(c)
+    try:
+        c["universe"] = universe_codes(con)[1]
+    except sqlite3.Error:
+        c["universe"] = {}
     return c
 
 
@@ -78,6 +82,8 @@ def coverage_lines(c) -> list[str]:
          f" (대형 {s['big_done']}/{c['big']})",
          f"DART 재무: {d['from'] or '-'}~{d['to'] or '-'}년, {d['corps']}개사 (종목 연결 {d['codes']}개)",
          f"KRX 지수(코스피·코스닥): {ix['from'] or '-'}~{ix['to'] or '-'}"]
+    if c.get("universe"):
+        L += universe_lines(c["universe"])
     for v, why in c["variants"].items():
         L.append(f"변형 {v}: " + ("실행 가능" if why is None else f"실행 불가 ({why})"))
     return L
@@ -102,6 +108,7 @@ class Panel:
     last_index: np.ndarray | None = None  # 코드별 마지막 데이터 인덱스 (상장폐지 판단)
     themes: dict = field(default_factory=dict)  # code -> [theme]
     kis_complete: bool = True
+    universe_note: dict = field(default_factory=dict)  # 대상 종목 판별 요약
 
 
 DT = np.float32  # 메모리 절약 (10년 x 3,000종목). 누적 합은 float64로 계산한 뒤 저장
@@ -111,9 +118,76 @@ def _mat(T, N):
     return np.full((T, N), NAN, dtype=DT)
 
 
+# ------------------------------------------------------------------ 대상 종목 판별 (0.12.0 정정)
+import re as _re
+
+PREF_RE = _re.compile(r"(우|우[A-C]|[0-9]우|[0-9]우[A-C]|우\(전환\)|\(전환\))$")
+SPAC_WORDS = ("스팩", "기업인수목적")           # 정식 이름은 'OO제N호기업인수목적'이라 '스팩'이 없음
+REIT_WORDS = ("리츠", "REIT", "부동산투자회사", "위탁관리부동산")
+OTHER_WORDS = ("인프라", "선박투자", "투융자", "ETN", "ETF")
+
+
+def classify(code: str, names: set[str], base_rows: list, sect_tps: set[str]) -> tuple[bool, str]:
+    """정기 수집 유니버스 필터와 같은 기준 (14.3): SECUGRP_NM=주권, KIND=보통주, SPAC(소속부없음)·스팩 제외.
+    과거 기준일 기본정보가 하나라도 있으면 그 전부를 보고(한 번이라도 아니면 제외), 종목명·코드 규칙을 항상 함께 적용."""
+    allnames = {n for n in names if n} | {(b["name"] or "") for b in base_rows}
+    if any(any(w in n for w in SPAC_WORDS) for n in allnames) or any((s or "").startswith("SPAC") for s in sect_tps) \
+            or any((b["sect_tp"] or "").startswith("SPAC") for b in base_rows):
+        return False, "spac"
+    if any(any(w.lower() in n.lower() for w in REIT_WORDS) for n in allnames) or \
+            any("부동산" in (b["secugrp"] or "") for b in base_rows):
+        return False, "reits"
+    if base_rows:
+        if any((b["secugrp"] or "") != "주권" for b in base_rows):
+            return False, "not_stock"
+        if any((b["kind"] or "") != "보통주" for b in base_rows):
+            return False, "not_common"
+    if any(PREF_RE.search(n.strip()) for n in allnames):
+        return False, "preferred_name"
+    if any(any(w in n for w in OTHER_WORDS) for n in allnames):
+        return False, "not_stock_name"
+    if code[-1:] != "0":
+        return False, "code_suffix"  # 보통주 단축코드는 끝자리 0 (우선주 5·7·9·K 등)
+    return True, "기본정보" if base_rows else "종목명·코드 규칙"
+
+
+def universe_codes(con) -> tuple[list, dict]:
+    names: dict[str, set] = {}
+    sects: dict[str, set] = {}
+    for r in con.execute("SELECT code, name, sect_tp FROM bt_daily GROUP BY code, name, sect_tp"):
+        names.setdefault(r["code"], set()).add(r["name"] or "")
+        sects.setdefault(r["code"], set()).add(r["sect_tp"] or "")
+    base: dict[str, list] = {}
+    if _table_exists(con, "bt_base_info"):
+        for r in con.execute("SELECT code, name, secugrp, kind, sect_tp FROM bt_base_info"):
+            base.setdefault(r["code"], []).append(r)
+    meta = {r["code"]: r for r in con.execute("SELECT code, name, market, is_common FROM bt_stock")}
+    keep, reasons, method = [], {}, {"기본정보": 0, "종목명·코드 규칙": 0}
+    for code in sorted(set(names) | set(meta)):
+        ok, why = classify(code, names.get(code, set()) | ({meta[code]["name"]} if code in meta else set()),
+                           base.get(code, []), sects.get(code, set()))
+        if ok:
+            m = meta.get(code)
+            keep.append((code, (m["name"] if m else None) or sorted(names.get(code, {""}))[0],
+                         (m["market"] if m else None) or "KOSPI"))
+            method[why] += 1
+        else:
+            reasons[why] = reasons.get(why, 0) + 1
+    before = sum(1 for r in meta.values() if r["is_common"] == 1)
+    return keep, {"before": before, "after": len(keep), "excluded": reasons, "method": method}
+
+
+def universe_lines(note: dict) -> list[str]:
+    ex = ", ".join(f"{k} {v}" for k, v in sorted(note.get("excluded", {}).items())) or "없음"
+    m = note.get("method", {})
+    return [f"대상 보통주: {note.get('after', 0)}개 (정정 전 {note.get('before', 0)}개) / 제외 사유: {ex} / "
+            f"판별: 기본정보 {m.get('기본정보', 0)}, 종목명·코드 규칙 {m.get('종목명·코드 규칙', 0)}"]
+
+
 def load_panel(con, start: str, themes_csv: Path | None = None) -> Panel:
     dates = [r[0] for r in con.execute("SELECT DISTINCT date FROM bt_daily ORDER BY date")]
-    stocks = con.execute("SELECT code, name, market FROM bt_stock WHERE is_common=1 ORDER BY code").fetchall()
+    keep, note = universe_codes(con)
+    stocks = [{"code": c, "name": n, "market": m} for c, n, m in keep]
     codes = [s["code"] for s in stocks]
     di = {d: i for i, d in enumerate(dates)}
     ci = {c: j for j, c in enumerate(codes)}
@@ -154,7 +228,7 @@ def load_panel(con, start: str, themes_csv: Path | None = None) -> Panel:
     except sqlite3.Error:
         pass
     return Panel(dates, codes, np.array([s["market"] for s in stocks]), [s["name"] for s in stocks],
-                 o, h, l, c, v, m, flow, fin, idx, last, load_themes(themes_csv), kis_complete)
+                 o, h, l, c, v, m, flow, fin, idx, last, load_themes(themes_csv), kis_complete, note)
 
 
 def _fin_matrix(con, dates, ci) -> np.ndarray:

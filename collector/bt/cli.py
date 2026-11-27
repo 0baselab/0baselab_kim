@@ -24,14 +24,14 @@ def themes_csv_for(db: Path, settings: dict) -> Path:
     return p if p.exists() else db.parent.parent / "themes" / "theme_master.csv"
 
 
-def main(sub: str | None, variant: str | None, db_arg: str | None, out=print) -> int:
+def main(sub: str | None, variant: str | None, db_arg: str | None, out=print, random_n: int = 100) -> int:
     from . import config as C
     from .data import coverage, coverage_lines, open_ro
     install = paths.install_dir()
     settings = load_settings(install)
     db = resolve_db(install, settings, db_arg)
-    if sub not in ("coverage", "run", "sync", "export"):
-        out("사용법: backtest coverage | run [A|B|C|D|all] | sync | export  [--db <경로>]")
+    if sub not in ("coverage", "run", "sync", "export", "signals"):
+        out("사용법: backtest coverage | run [변형|all] [--random N] | signals | sync | export  [--db <경로>]")
         return 1
     if sub in ("sync", "export"):
         from .sync import export, sync
@@ -58,6 +58,12 @@ def main(sub: str | None, variant: str | None, db_arg: str | None, out=print) ->
     out("\n".join(coverage_lines(cov)))
     if sub == "coverage":
         return 0
+    if sub == "signals":
+        from .signals import run_signals
+        res = run_signals(db, C.load(install), now_kst(), progress=lambda s, x: out(f"  [{x * 100:3.0f}%] {s}"),
+                          themes_csv=themes_csv_for(db, settings))
+        out(f"\n결과: {res / 'signals.md'}")
+        return 0
     from .run import run_backtest
     from .engine import ALL_VARIANTS
     v = (variant or "all").strip()
@@ -68,6 +74,6 @@ def main(sub: str | None, variant: str | None, db_arg: str | None, out=print) ->
         return 1
     cfg = C.load(install)
     res = run_backtest(db, cfg, variants, now_kst(), progress=lambda s, x: out(f"  [{x * 100:3.0f}%] {s}"),
-                       themes_csv=themes_csv_for(db, settings))
+                       themes_csv=themes_csv_for(db, settings), random_n=max(0, random_n))
     out(f"\n결과: {res}\n최신 결과: {res.parent / 'latest'}")
     return 0

@@ -21,7 +21,8 @@ def _f(v, d=2):
 
 
 def run_backtest(db_path: Path, cfg: Config, variants: list[str], now: datetime,
-                 progress: Callable[[str, float], None] = lambda s, x: None, themes_csv: Path | None = None) -> Path:
+                 progress: Callable[[str, float], None] = lambda s, x: None, themes_csv: Path | None = None,
+                 random_n: int = 0) -> Path:
     con = open_ro(db_path)
     try:
         cov = coverage(con)
@@ -69,10 +70,27 @@ def run_backtest(db_path: Path, cfg: Config, variants: list[str], now: datetime,
         sig, score, score2 = sig_cache[(v, ft)]
         R = E.simulate(panel, ind, cfg, v, sig, score, en, ex, sp, ft, start_idx, score2=score2)
         results.append((kind, R))
+    randoms = {}
+    if random_n > 0:
+        base_res = [R for k, R in results if k == "main" and R.entry == "1" and R.exit == "ga"]
+        seed = cfg.i("RANDOM_SEED")
+        for vi, R in enumerate(base_res):
+            spc = specs[R.variant]
+            pool = E.candidate_pool(panel, ind, cfg, spc, covs[R.variant][1])
+            sig, score, score2 = sig_cache[(R.variant, flow0)]
+            vals = []
+            for i in range(random_n):
+                progress(f"무작위 비교 {R.variant} {i + 1}/{random_n}", 0.95)
+                rng = np.random.default_rng([seed, vi, i])
+                RR = E.simulate(panel, ind, cfg, R.variant, sig, score, "1", "ga", stop0, flow0, start_idx,
+                                random_pool=pool, rng=rng)
+                m = E.metrics(RR)
+                vals.append((m.get("cagr_pct"), m.get("mdd_pct")))
+            randoms[R.variant] = (E.metrics(R), vals)
     out_root = db_path.parent / "results"
     out = out_root / stamp(now)
     out.mkdir(parents=True, exist_ok=True)
-    _write_files(out, panel, cfg, cov, covs, results, skipped, now)
+    _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms, random_n)
     latest = out_root / "latest"
     if latest.exists():
         shutil.rmtree(latest)
@@ -86,17 +104,25 @@ def _idx_yearly(panel, mk):
     return E.yearly(s)
 
 
-def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
+def _pctile(x, arr):
+    arr = [a for a in arr if a is not None]
+    if x is None or not arr:
+        return None
+    return sum(1 for a in arr if a < x) / len(arr) * 100
+
+
+def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None, random_n=0):
     with (out / "trades.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["variant", "entry", "exit", "stop_pct", "flow_top_pct", "code", "name", "signal_date", "entry_date",
                     "entry_price", "shares", "exit_date", "exit_price", "reason", "pnl_krw", "ret_pct", "hold_days",
-                    "pre_ret20_pct"])
+                    "pre_ret20_pct", "index_ret_pct", "excess_pct"])
         for kind, R in results:
             for x in R.trades:
                 w.writerow([R.variant, R.entry, R.exit, R.stop_pct, R.flow_top, x["code"], x["name"], x["signal_date"],
                             x["entry_date"], x["entry_price"], x["shares"], x["exit_date"], x["exit_price"], x["reason"],
-                            x["pnl_krw"], x["ret_pct"], x["hold_days"], x.get("pre_ret20_pct")])
+                            x["pnl_krw"], x["ret_pct"], x["hold_days"], x.get("pre_ret20_pct"),
+                            x.get("index_ret_pct"), x.get("excess_pct")])
     with (out / "equity.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["date", "variant", "entry", "exit", "stop_pct", "flow_top_pct", "equity_krw"])
@@ -106,6 +132,14 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
     dev_end = cfg.s("DEV_END")
     L = [f"# 추세추종 백테스트 결과 {now.strftime('%Y-%m-%d %H:%M')}", "",
          f"프로그램 {__version__}. 계산만 했으며 주문·매매는 하지 않습니다. 비용·슬리피지를 넣은 가정치입니다.", ""]
+    from .data import universe_lines
+    backdrop = cfg.s("BACKDROP_INDEX_FILTER").strip().lower() == "on"
+    L += ["## 배경 설정", "",
+          f"- 시장 배경(BACKDROP_INDEX_FILTER): **{'on' if backdrop else 'off'}**"
+          + (" - 모든 변형에 지수 필터(해당 시장 지수 < 120일선이면 신규 매수 중단)를 똑같이 적용"
+             if backdrop else " - 지수 필터는 D·A3·A4(및 INDEX_FILTER_FOR_A=on)에만"),
+          "- 비교는 같은 배경 설정으로 낸 결과끼리만 하세요.",
+          "- " + universe_lines(panel.universe_note)[0], ""]
     L += ["## 계산 범위", ""]
     for v, (cv, _) in covs.items():
         ratio = cv.pairs / cv.listed_pairs * 100 if cv.listed_pairs else 0
@@ -119,8 +153,8 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
     for v, why in skipped.items():
         L.append(f"- 변형 {v}: 실행 안 함 ({why})")
     L += ["", "## 진입·청산 방식 비교 (손절·수급 기본값)", ""]
-    head = ["변형", "진입", "청산", "연환산%", "최대낙폭%", "승률%", "평균수익%", "평균손실%", "거래당기대값%", "거래",
-            "평균보유일", "지정가체결%", "놓친신호20일%"]
+    head = ["변형", "진입", "청산", "연환산%", "최대낙폭%", "승률%", "평균수익%", "평균손실%", "거래당기대값%",
+            "평균초과수익%", "초과수익승률%", "거래", "평균보유일", "지정가체결%", "놓친신호20일%"]
     L += ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for kind, R in results:
         if kind != "main":
@@ -128,7 +162,8 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
         m = E.metrics(R)
         L.append("| " + " | ".join([R.variant, E.ENTRY_METHODS[R.entry], E.EXIT_METHODS[R.exit], _f(m.get("cagr_pct")),
                                     _f(m.get("mdd_pct")), _f(m.get("win_rate_pct")), _f(m.get("avg_win_pct")),
-                                    _f(m.get("avg_loss_pct")), _f(m.get("expectancy_pct")), str(m["trades"]),
+                                    _f(m.get("avg_loss_pct")), _f(m.get("expectancy_pct")), _f(m.get("avg_excess_pct")),
+                                    _f(m.get("excess_win_pct")), str(m["trades"]),
                                     _f(m.get("avg_hold_days"), 1),
                                     _f(m.get("limit_fill_pct")), _f(m.get("missed_ret20_pct"))]) + " |")
     L += ["", f"## 기간 분할 (개발 ~{dev_end} / 검증 {int(dev_end[:4]) + 1}~), ① 다음 날 시가 + (가)", ""]
@@ -168,6 +203,18 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
         L += [f"| {x['code']} {x['name']} | {x['entry_date']} | {x['exit_date']} | {x['ret_pct']:.2f} | "
               f"{_f(x.get('pre_ret20_pct'))} | {x['reason']} |" for x in worst]
         L.append("")
+    if randoms:
+        L += ["", f"## 무작위 비교 (① + (가), {random_n}회, 시드 {cfg.s('RANDOM_SEED')})", "",
+              "같은 날 같은 후보군(거르기 통과 종목)에서 전략이 산 수만큼 무작위로 골라 같은 규칙으로 매매한 결과와 비교합니다. "
+              "백분위가 높을수록 무작위보다 낫습니다(낙폭은 덜 깊을수록 높음).", "",
+              "| 변형 | 전략 연환산% | 무작위 연환산 중앙값% | 백분위 | 전략 최대낙폭% | 무작위 낙폭 중앙값% | 백분위 |",
+              "|---|---|---|---|---|---|---|"]
+        for v, (m, vals) in randoms.items():
+            cg = sorted(a for a, _ in vals if a is not None)
+            md = sorted(b for _, b in vals if b is not None)
+            med = lambda a: a[len(a) // 2] if a else None
+            L.append(f"| {v} | {_f(m.get('cagr_pct'))} | {_f(med(cg))} | {_f(_pctile(m.get('cagr_pct'), cg), 0)} | "
+                     f"{_f(m.get('mdd_pct'))} | {_f(med(md))} | {_f(_pctile(m.get('mdd_pct'), md), 0)} |")
     L += ["", "## 민감도 (① + (가))", "", "| 변형 | 손절% | 수급 상위% | 연환산% | 최대낙폭% | 승률% | 거래 |",
           "|---|---|---|---|---|---|---|"]
     for kind, R in results:

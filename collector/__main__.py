@@ -340,7 +340,8 @@ def cmd_backfill(args) -> int:
 def cmd_backtest(args) -> int:
     from .bt.cli import main as bt_main
     sub = getattr(args, "sub", None)
-    return bt_main(sub, getattr(args, "variant", None), getattr(args, "db", None))
+    r = getattr(args, "random", None)
+    return bt_main(sub, getattr(args, "variant", None), getattr(args, "db", None), random_n=100 if r is None else r)
 
 
 def cmd_menu(args) -> int:
@@ -377,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("sub", nargs="?", help="세부 항목 (verify history / backfill krx|kis|dart|status)")
     parser.add_argument("variant", nargs="?", help="backtest run의 변형 A|B|C|D|all")
     parser.add_argument("--db", help="백테스트 DB 경로 (backtest 명령)")
+    parser.add_argument("--random", type=int, help="backtest run 무작위 비교 횟수 (기본 100, 0이면 생략)")
     parser.add_argument("--from", dest="date_from", help="기간 수집 시작일 YYYYMMDD")
     parser.add_argument("--to", dest="date_to", help="기간 수집 종료일 YYYYMMDD")
     parser.add_argument("--date", help="브리핑 기준일 YYYYMMDD (기본: 마지막 수집일)")

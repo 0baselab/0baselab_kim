@@ -42,6 +42,8 @@ def spec(name: str, cfg: Config) -> VariantSpec:
     base = name[0]
     on = lambda k: cfg.s(k).strip().lower() == "on"
     rank, heat, idx = cfg.s("RANK_BY"), on("OVERHEAT_FILTER"), on("INDEX_FILTER_FOR_A") if base == "A" else base == "D"
+    if on("BACKDROP_INDEX_FILTER"):  # 배경(시장 타이밍) 고정: 모든 변형에 같은 지수 필터
+        idx = True
     core = name.split("_")[0]
     if core in ("A1", "A4"):
         rank = "trend_quality"
@@ -173,6 +175,17 @@ def signals(p: Panel, ind: Indicators, cfg: Config, variant, ok: np.ndarray, flo
     return sig, score, score2
 
 
+def candidate_pool(p: Panel, ind: Indicators, cfg: Config, sp: "VariantSpec", ok: np.ndarray) -> np.ndarray:
+    """무작위 비교용 후보군: 거르기 통과 종목 (배경 지수 필터를 쓰면 그것도 똑같이 적용)."""
+    with np.errstate(invalid="ignore"):
+        pool = ok & (p.mktcap >= cfg.f("MIN_MKTCAP_KRW")) & (ind.val20 >= cfg.f("MIN_VALUE20_KRW"))
+        if sp.index_filter:
+            for mk in ("KOSPI", "KOSDAQ"):
+                col = p.market == mk
+                pool[:, col] &= ~(p.index_close[mk] < ind.idx_ma[mk])[:, None]
+    return pool
+
+
 @dataclass
 class Result:
     variant: str
@@ -191,7 +204,8 @@ class Result:
 
 def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarray, score: np.ndarray,
              entry: str, exit_: str, stop_pct: float, flow_top: float, start_idx: int,
-             score2: np.ndarray | None = None) -> Result:
+             score2: np.ndarray | None = None, random_pool: np.ndarray | None = None, rng=None) -> Result:
+    """random_pool·rng를 주면 무작위 비교: 그날 전략이 고를 수 있었던 종목 수만큼 후보군(random_pool)에서 무작위로 고른다."""
     T, N = p.close.shape
     R = Result(variant, entry, exit_, stop_pct, flow_top)
     cash = cfg.f("INITIAL_CASH_KRW")
@@ -204,7 +218,14 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
     last_close = np.full(N, np.nan)
     prev_equity = cash
 
-    def sell(j, t, px, reason):
+    def idx_ret(j, t0, t1):
+        """같은 보유 기간 해당 시장 지수 수익률(%). 지수 종가 t0 -> t1."""
+        arr = p.index_close.get(str(p.market[j]))
+        if arr is None or t0 < 0 or t1 >= len(arr) or np.isnan(arr[t0]) or np.isnan(arr[t1]) or arr[t0] <= 0:
+            return None
+        return round(float(arr[t1] / arr[t0] - 1) * 100, 3)
+
+    def sell(j, t, px, reason, at_open=False):
         nonlocal cash
         q = pos.pop(j)
         execp = px * (1 - slip)
@@ -217,6 +238,10 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                          "shares": q["shares"], "exit_date": p.dates[t], "exit_price": round(execp, 2),
                          "reason": reason, "pnl_krw": round(pnl), "ret_pct": round(pnl / q["cost"] * 100, 3),
                          "hold_days": t - q["entry_t"], "pre_ret20_pct": q.get("pre_ret20")})
+        # 지수 기간: 매수 시점 ~= 체결일 전날 종가(시가 체결) / 매도는 시가면 전날 종가, 장중·종가면 그날 종가
+        ir = idx_ret(j, q["entry_t"] - 1, t - 1 if at_open else t)
+        R.trades[-1]["index_ret_pct"] = ir
+        R.trades[-1]["excess_pct"] = None if ir is None else round(R.trades[-1]["ret_pct"] - ir, 3)
         sells.discard(j)
 
     def themes_of(j):
@@ -235,13 +260,13 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                     continue
                 sp = q["peak"] * (1 - stop)
                 if o[j] <= sp:
-                    sell(j, t, float(o[j]), "장중 손절(시가)")
+                    sell(j, t, float(o[j]), "장중 손절(시가)", at_open=True)
                 elif l[j] <= sp:
                     sell(j, t, sp, "장중 손절")
         # 3. 예약 매도 (시가)
         for j in list(sells):
             if j in pos and not np.isnan(o[j]):
-                sell(j, t, float(o[j]), pos[j].get("why", "종가 판단"))
+                sell(j, t, float(o[j]), pos[j].get("why", "종가 판단"), at_open=True)
         # 4. 매수 체결
         equity_ref = prev_equity
         for j in list(orders):
@@ -305,12 +330,17 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
         if len(cand) == 0:
             continue
         cand = [int(j) for j in cand if j not in pos and j not in orders]
+        if rng is not None and random_pool is not None:
+            pool = [int(j) for j in np.nonzero(random_pool[t])[0] if j not in pos and j not in orders]
+            k = min(len(cand), len(pool))
+            cand = [pool[x] for x in rng.choice(len(pool), size=k, replace=False)] if k else []
         def _k(arr, j):
             if arr is None:
                 return 0.0
             v = arr[t, j]
             return -v if not np.isnan(v) else 1e18
-        cand.sort(key=lambda j: (_k(score, j), _k(score2, j), p.codes[j]))
+        if rng is None:
+            cand.sort(key=lambda j: (_k(score, j), _k(score2, j), p.codes[j]))
         theme_cnt: dict[str, int] = {}
         for j in list(pos) + list(orders):
             for th in themes_of(j):
@@ -372,6 +402,9 @@ def metrics(R: Result, start: str | None = None, end: str | None = None) -> dict
     out["win_rate_pct"] = len(wins) / len(tr) * 100 if tr else None
     out["avg_win_pct"] = sum(wins) / len(wins) if wins else None
     out["avg_loss_pct"] = sum(losses) / len(losses) if losses else None
+    ex = [x["excess_pct"] for x in tr if x.get("excess_pct") is not None]
+    out["avg_excess_pct"] = sum(ex) / len(ex) if ex else None
+    out["excess_win_pct"] = sum(1 for x in ex if x > 0) / len(ex) * 100 if ex else None
     wr = out["win_rate_pct"]
     out["expectancy_pct"] = (wr / 100 * (out["avg_win_pct"] or 0) + (1 - wr / 100) * (out["avg_loss_pct"] or 0)) \
         if wr is not None else None  # 거래당 기대값 (비용 반영 후)

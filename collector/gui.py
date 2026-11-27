@@ -786,7 +786,9 @@ def _bt_build(self):
     b1.pack(side="left", padx=(10, 0))
     b2 = self._secondary(brow, "업로드용 내보내기", lambda: self._bt_sync(True), width=150)
     b2.pack(side="left", padx=(10, 0))
-    self._action_buttons += [b1, b2]
+    b3 = self._secondary(brow, "신호 분석", self._bt_signals, width=110)
+    b3.pack(side="left", padx=(10, 0))
+    self._action_buttons += [b1, b2, b3]
     self.bt_progress = ctk.CTkProgressBar(t, height=8, corner_radius=4, fg_color=SURFACE, progress_color=COBALT)
     self.bt_progress.set(0)
     self.bt_progress.pack(fill="x", pady=(14, 0))
@@ -849,6 +851,24 @@ def _bt_run(self):
     self._run_worker(work, done)
 
 
+def _bt_signals(self):
+    from .bt import config as C
+    from .bt.cli import themes_csv_for
+    from .bt.signals import run_signals
+    db_path = Path(self.bt_db.get())
+    self.bt_progress.set(0)
+
+    def work(put):
+        return run_signals(db_path, C.load(self.install), now_kst(), progress=lambda s, x: put(("bt", s, x)),
+                           themes_csv=themes_csv_for(db_path, load_settings(self.install)))
+
+    def done(out):
+        self.bt_progress.set(1)
+        self.bt_status.configure(text=f"신호 분석 완료: {out}", text_color=NAVY)
+        self._bt_set_result((out / "signals.md").read_text(encoding="utf-8"))
+    self._run_worker(work, done)
+
+
 def _bt_sync(self, export: bool):
     from . import paths as P
     from .bt.sync import export as do_export, sync
@@ -871,7 +891,7 @@ def _bt_sync(self, export: bool):
     self._run_worker(work, done)
 
 
-for _n in ("_bt_build", "_bt_refresh_cov", "_bt_pick_db", "_bt_set_result", "_bt_run", "_bt_sync"):
+for _n in ("_bt_build", "_bt_refresh_cov", "_bt_pick_db", "_bt_set_result", "_bt_run", "_bt_sync", "_bt_signals"):
     setattr(MainWindow, "_build_backtest" if _n == "_bt_build" else _n, globals()[_n])
 
 

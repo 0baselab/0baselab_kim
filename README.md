@@ -138,6 +138,8 @@ C:\주식데이터수집기\주식데이터수집기-명령.exe backfill auto --
 ```bat
 C:\주식데이터수집기\주식데이터수집기-명령.exe backtest coverage
 C:\주식데이터수집기\주식데이터수집기-명령.exe backtest run all
+C:\주식데이터수집기\주식데이터수집기-명령.exe backtest run all --random 100
+C:\주식데이터수집기\주식데이터수집기-명령.exe backtest signals
 C:\주식데이터수집기\주식데이터수집기-명령.exe backtest export
 ```
 
