@@ -324,3 +324,92 @@ def test_same_b_range_and_summary(tmp_path):
               "변형 A1", "변형 A4"):
         assert x in s, x
     assert "pre_ret20_pct" in (out / "trades.csv").read_text(encoding="utf-8-sig").splitlines()[0]
+
+
+# ----------------------------- 0.12.0 -----------------------------
+
+def test_universe_excludes_spac_reits_preferred(tmp_path):
+    from collector.bt.data import classify, universe_codes
+    assert classify("123450", {"하나머스트제2호기업인수목적"}, [], {""}) == (False, "spac")
+    assert classify("123450", {"하나머스트2호스팩"}, [], {""}) == (False, "spac")
+    assert classify("330590", {"롯데리츠"}, [], {""}) == (False, "reits")
+    assert classify("088980", {"맥쿼리인프라"}, [], {""}) == (False, "not_stock_name")
+    assert classify("005930", {"삼성전자"}, [], {""}) == (True, "종목명·코드 규칙")
+    assert classify("005930", {"삼성전자우"}, [], {""})[0] is False
+    assert classify("005935", {"삼성전자"}, [], {""}) == (False, "code_suffix")
+    base = [{"name": "가나", "secugrp": "주권", "kind": "종류주권", "sect_tp": ""}]
+    assert classify("000100", {"가나"}, base, {""}) == (False, "not_common")
+    con = make_db(tmp_path)
+    con.execute("INSERT INTO bt_stock VALUES('123450','하나머스트제2호기업인수목적','KOSDAQ','20150101','20160101',1,'t',2)")
+    con.execute("INSERT INTO bt_daily(date, code, market, name, close) VALUES('20150102','123450','KOSDAQ','하나머스트제2호기업인수목적',2000)")
+    con.commit()
+    keep, note = universe_codes(con)
+    assert "123450" not in [k[0] for k in keep]
+    assert note["before"] == 5 and note["after"] == 4 and note["excluded"] == {"spac": 1}
+    p = load_panel(con, "20150101")
+    assert "123450" not in p.codes
+
+
+def test_backdrop_filter_applies_to_all_variants():
+    c = cfg()
+    assert c.s("BACKDROP_INDEX_FILTER") == "on"
+    assert all(E.spec(v, c).index_filter for v in ("A", "A2", "B", "C"))
+    off = cfg(BACKDROP_INDEX_FILTER="off")
+    assert not E.spec("A", off).index_filter and not E.spec("B", off).index_filter and E.spec("D", off).index_filter
+    p = tiny_panel(o=[[100]], h=[[100]], l=[[100]], c=[[110]])
+    p.index_close = {"KOSPI": np.array([0.5]), "KOSDAQ": np.array([0.5])}
+    ind = _flat_ind(p)
+    ok = np.ones((1, 1), dtype=bool)
+    assert not E.signals(p, ind, c, "A", ok, 20)[0].any()       # 배경 on: A도 지수 아래면 신규 매수 안 함
+    assert E.signals(p, ind, off, "A", ok, 20)[0].all()
+
+
+def test_excess_return_per_trade():
+    p = tiny_panel(o=[[100], [100], [100], [120]], h=[[100], [101], [111], [121]], l=[[100], [99], [99], [119]],
+                   c=[[100], [100], [110], [120]])
+    p.index_close = {"KOSPI": np.array([1000.0, 1000.0, 1050.0, 1100.0]), "KOSDAQ": np.full(4, 1.0)}
+    R = E.simulate(p, _flat_ind(p, ma60=np.full((4, 1), 0.0)), cfg(MAX_POSITIONS="1"), "A",
+                   np.array([[True], [False], [False], [False]]), np.ones((4, 1)), "1", "ga", 15, 20, 0)
+    t = R.trades[0]  # t=1 시가 매수, 기간 끝(t=3 종가) 평가 청산
+    assert t["index_ret_pct"] == round((1100 / 1000 - 1) * 100, 3)
+    assert t["excess_pct"] == round(t["ret_pct"] - t["index_ret_pct"], 3)
+    m = E.metrics(R)
+    assert m["avg_excess_pct"] == t["excess_pct"] and m["excess_win_pct"] == (100.0 if t["excess_pct"] > 0 else 0.0)
+
+
+def test_signal_dedup_and_quintiles():
+    from collector.bt.signals import dedup, quintile_same_day
+    sig = np.zeros((50, 2), dtype=bool)
+    sig[[0, 5, 21, 22, 45], 0] = True
+    sig[[3], 1] = True
+    ev = dedup(sig, 20)
+    assert [e for e in ev if e[1] == 0] == [(0, 0), (21, 0), (45, 0)]  # 5, 22는 20거래일 안이라 제외
+    events = [(0, j) for j in range(10)]
+    q = quintile_same_day(events, {(0, j): float(j) for j in range(10)})
+    assert [q[(0, j)] for j in range(10)] == [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    q1 = quintile_same_day([(1, 0)], {(1, 0): 3.0})
+    assert q1[(1, 0)] == 3  # 그날 신호 1개면 가운데
+
+
+def test_signals_report(tmp_path):
+    from collector.bt.signals import run_signals
+    make_db(tmp_path).close()
+    out = run_signals(B.bt_path(tmp_path), cfg(), NOW)
+    s = (out / "signals.md").read_text(encoding="utf-8")
+    for x in ("### 과열", "### 거래대금 급증", "### 추세 품질", "### 수급", "### 재무", "### 시장 배경", "표본 부족", "최상위", "| 개발 |", "| 검증 |"):
+        assert x in s, x
+    assert (out / "signals.csv").read_text(encoding="utf-8-sig").startswith("date,code,name")
+
+
+def test_random_comparison_reproducible(tmp_path):
+    from collector.bt.run import run_backtest
+    make_db(tmp_path).close()
+    db_path = B.bt_path(tmp_path)
+    a = run_backtest(db_path, cfg(), ["A"], NOW, random_n=5)
+    s1 = (a / "summary.md").read_text(encoding="utf-8")
+    b = run_backtest(db_path, cfg(), ["A"], NOW.replace(minute=5), random_n=5)
+    s2 = (b / "summary.md").read_text(encoding="utf-8")
+    pick = lambda s: s[s.index("## 무작위 비교"):s.index("## 민감도")]
+    assert "## 무작위 비교" in s1 and pick(s1) == pick(s2)  # 같은 시드 = 같은 결과
+    c = run_backtest(db_path, cfg(RANDOM_SEED="7"), ["A"], NOW.replace(minute=6), random_n=5)
+    assert "## 배경 설정" in (c / "summary.md").read_text(encoding="utf-8")
