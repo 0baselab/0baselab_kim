@@ -52,6 +52,8 @@ def coverage(con) -> dict:
         mapped = con.execute("SELECT COUNT(DISTINCT c.stock_code) FROM dart_fs_quarter q JOIN dart_corp c ON c.corp_code=q.corp_code"
                              " WHERE c.stock_code IS NOT NULL").fetchone()[0]
         c["dart"] = {"from": r[0], "to": r[1], "corps": r[2] or 0, "rows": r[3] or 0, "codes": mapped}
+        c["dart"]["by_year"] = {y: (n, q) for y, n, q in con.execute(
+            "SELECT fiscal_year, COUNT(DISTINCT corp_code), COUNT(*) FROM dart_fs_quarter GROUP BY fiscal_year")}
     else:
         c["dart"] = {"from": None, "to": None, "corps": 0, "rows": 0, "codes": 0}
     r = con.execute("SELECT MIN(date), MAX(date) FROM bt_index WHERE index_name IN ('코스피','코스닥')").fetchone()
@@ -73,6 +75,27 @@ def runnable(c) -> dict[str, str | None]:
     return out
 
 
+def dart_year_lines(d) -> list[str]:
+    """DART 분기 재무가 실제로 있는 연도별 기업 수 (2016~2026). 많은 해의 절반 미만이면 백필 진행 중으로 표시."""
+    by = d.get("by_year") or {}
+    years = [str(y) for y in range(2016, 2027)]
+    peak = max([by.get(y, (0, 0))[0] for y in years] + [0])
+    parts, thin = [], []
+    for y in years:
+        n, q = by.get(y, (0, 0))
+        parts.append(f"{y} {n}개사({q}행)")
+        if peak and n < peak / 2 and y != "2026":
+            thin.append(y)
+    L = ["DART 분기 재무 연도별 기업 수: " + ", ".join(parts)]
+    if not peak:
+        L.append("  -> DART 분기 재무가 아직 없습니다 (backfill dart 전)")
+    elif thin:
+        L.append(f"  -> {', '.join(thin)}년은 가장 많은 해({peak}개사)의 절반 미만: DART 백필이 아직 진행 중이거나 빠진 것으로 보입니다")
+    else:
+        L.append("  -> 연도별 기업 수가 고르게 있습니다 (2026년은 진행 중인 해)")
+    return L
+
+
 def coverage_lines(c) -> list[str]:
     if "error" in c:
         return [c["error"]]
@@ -81,6 +104,7 @@ def coverage_lines(c) -> list[str]:
          f"KIS 수급: {s['from'] or '-'}~{s['to'] or '-'}, 종목 {s['codes']}개, 끝난 종목 {s['done']}/{c['common']}"
          f" (대형 {s['big_done']}/{c['big']})",
          f"DART 재무: {d['from'] or '-'}~{d['to'] or '-'}년, {d['corps']}개사 (종목 연결 {d['codes']}개)",
+         *dart_year_lines(d),
          f"KRX 지수(코스피·코스닥): {ix['from'] or '-'}~{ix['to'] or '-'}"]
     if c.get("universe"):
         L += universe_lines(c["universe"])
@@ -180,7 +204,7 @@ def universe_codes(con) -> tuple[list, dict]:
 def universe_lines(note: dict) -> list[str]:
     ex = ", ".join(f"{k} {v}" for k, v in sorted(note.get("excluded", {}).items())) or "없음"
     m = note.get("method", {})
-    return [f"대상 보통주: {note.get('after', 0)}개 (정정 전 {note.get('before', 0)}개) / 제외 사유: {ex} / "
+    return [f"대상 보통주: {note.get('after', 0)}개 (제외 전 {note.get('before', 0)}개) / 제외 사유: {ex} / "
             f"판별: 기본정보 {m.get('기본정보', 0)}, 종목명·코드 규칙 {m.get('종목명·코드 규칙', 0)}"]
 
 
