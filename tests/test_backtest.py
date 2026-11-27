@@ -226,3 +226,19 @@ def test_export_zip_only_db(tmp_path):
     names = zipfile.ZipFile(z).namelist()
     assert names == ["backtest.sqlite"]
     assert not any("key" in n or ".env" in n for n in names)
+
+
+def test_zero_price_is_no_trade(tmp_path):
+    # 거래정지일: KRX가 시가·고가·저가를 0으로 준다 -> 패널에서 NaN, 체결·나눗셈 오류 없음
+    con = make_db(tmp_path)
+    d = DAYS[200]
+    con.execute("UPDATE bt_daily SET open=0, high=0, low=0 WHERE date=? AND code='000010'", (d,))
+    con.commit()
+    p = load_panel(con, "20150101")
+    i, j = p.dates.index(d), p.codes.index("000010")
+    assert np.isnan(p.open[i, j]) and np.isnan(p.low[i, j]) and p.close[i, j] > 0
+    # 엔진에 0 시가가 직접 들어와도 ZeroDivisionError 없이 주문만 대기
+    p2 = tiny_panel(o=[[100], [0], [100]], h=[[100], [0], [101]], l=[[100], [0], [99]], c=[[100], [100], [100]])
+    R = E.simulate(p2, tiny_ind(p2, ma20=100.0), cfg(MAX_POSITIONS="1"), "A", np.array([[True], [False], [False]]),
+                   np.ones((3, 1)), "1", "ga", 15, 20, 0)
+    assert all(t["entry_date"] != p2.dates[1] for t in R.trades)

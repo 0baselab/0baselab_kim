@@ -126,7 +126,8 @@ def load_panel(con, start: str, themes_csv: Path | None = None) -> Panel:
         i = di[r["date"]]
         f = r["adj_factor"] or 1.0
         for arr, x in ((o, r["open"]), (h, r["high"]), (l, r["low"]), (c, r["close"])):
-            arr[i, j] = NAN if x is None else x * f
+            # 0 이하 가격 = 그날 거래 없음(거래정지 등). KRX가 시가·고가·저가를 0으로 주는 경우가 있다.
+            arr[i, j] = NAN if x is None or x <= 0 else x * f
         v[i, j] = NAN if r["value_krw"] is None else r["value_krw"]
         m[i, j] = NAN if r["mktcap_krw"] is None else r["mktcap_krw"]
     flow = _mat(T, N)

@@ -209,6 +209,8 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                     px = min(od["limit"], float(o[j]))
                 else:
                     px = None
+                if px is not None and not (px > 0):
+                    px = None  # 0 이하·NaN 가격으로는 체결하지 않는다
                 if px is not None:
                     unit = px * (1 + slip) * (1 + bfee)
                     shares = int(min(equity_ref / max_pos, cash) // unit)
