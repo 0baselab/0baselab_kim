@@ -21,7 +21,35 @@ from .data import Panel, atr, rolling_max, rolling_mean, rolling_min, rolling_su
 
 ENTRY_METHODS = {"1": "① 다음 날 시가", "2": "② 20일선 지정가", "3": "③ 전일 종가 - 0.5xATR 지정가", "4": "④ 250일 고가 지정가"}
 EXIT_METHODS = {"ga": "(가) 종가 판단 -> 다음 날 시가", "na": "(나) 장중 손절"}
-VARIANTS = {"A": "KRX 시세 추세", "B": "A + KIS 수급", "C": "B + DART 재무", "D": "C + 지수 필터"}
+VARIANTS = {"A": "KRX 시세 추세", "A1": "A + 추세 품질 순위", "A2": "A + 과열 제외", "A3": "A + 지수 필터",
+            "A4": "A + 추세 품질·과열 제외·지수 필터", "B": "A + KIS 수급", "C": "B + DART 재무", "D": "C + 지수 필터",
+            "A_sameB": "A 규칙을 B가 계산된 종목·날짜에만", "A4_sameB": "A4 규칙을 B가 계산된 종목·날짜에만"}
+ALL_VARIANTS = ["A", "A1", "A2", "A3", "A4", "B", "C", "D", "A_sameB", "A4_sameB"]
+
+
+@dataclass
+class VariantSpec:
+    name: str
+    base: str          # 신호 규칙의 기본 변형 A/B/C/D
+    mask_base: str     # 데이터 범위를 정하는 변형 (A_sameB는 B)
+    rank_by: str       # value_surge | trend_quality
+    overheat: bool
+    index_filter: bool
+    tiebreak: str
+
+
+def spec(name: str, cfg: Config) -> VariantSpec:
+    base = name[0]
+    on = lambda k: cfg.s(k).strip().lower() == "on"
+    rank, heat, idx = cfg.s("RANK_BY"), on("OVERHEAT_FILTER"), on("INDEX_FILTER_FOR_A") if base == "A" else base == "D"
+    core = name.split("_")[0]
+    if core in ("A1", "A4"):
+        rank = "trend_quality"
+    if core in ("A2", "A4"):
+        heat = True
+    if core in ("A3", "A4"):
+        idx = True
+    return VariantSpec(name, base, "B" if name.endswith("_sameB") else base, rank, heat, idx, cfg.s("RANK_TIEBREAK"))
 
 
 @dataclass
@@ -37,6 +65,8 @@ class Indicators:
     val_prev20: np.ndarray
     flow_sum: np.ndarray
     idx_ma: dict
+    ret20: np.ndarray = None
+    trend_quality: np.ndarray = None
 
 
 def indicators(p: Panel, cfg: Config) -> Indicators:
@@ -48,9 +78,16 @@ def indicators(p: Panel, cfg: Config) -> Indicators:
     ma60 = rolling_mean(c, 60)
     val20 = rolling_mean(p.value, 20)
     idx_ma = {k: rolling_mean(v.reshape(-1, 1), cfg.i("INDEX_MA_DAYS")).ravel() for k, v in p.index_close.items()}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ret20 = c / shift(c, 20) - 1
+        ret60 = c / shift(c, 60) - 1
+        r = c / shift(c, 1) - 1  # 일간 수익률
+        m1, m2 = rolling_mean(r, 60), rolling_mean(r * r, 60)
+        std60 = np.sqrt(np.maximum(m2 - m1 * m1, 0) * 60 / 59)  # 표본 표준편차
+        tq = np.where(std60 > 0, ret60 / (std60 * np.sqrt(60)), np.nan)
     return Indicators(rolling_mean(c, 20), ma60, rolling_mean(c, 120), shift(ma60, 20), pos.astype(c.dtype),
                       rolling_max(p.high, 250), atr(p.high, p.low, c, cfg.i("ATR_DAYS")), val20, shift(val20, 1),
-                      rolling_sum(p.flow_mil, cfg.i("FLOW_DAYS")), idx_ma)
+                      rolling_sum(p.flow_mil, cfg.i("FLOW_DAYS")), idx_ma, ret20, tq)
 
 
 @dataclass
@@ -64,7 +101,7 @@ class Coverage:
     big_only_warning: bool
 
 
-def need_masks(p: Panel, ind: Indicators, variant: str, start_idx: int):
+def need_masks(p: Panel, ind: Indicators, variant: str, start_idx: int, need_index: bool | None = None):
     """(사용 가능 여부, 빠진 이유별 마스크). 종목·날짜 단위로 필요한 데이터가 모두 있어야 사용."""
     T, N = p.close.shape
     listed = ~np.isnan(p.close)
@@ -81,7 +118,7 @@ def need_masks(p: Panel, ind: Indicators, variant: str, start_idx: int):
         fin_ok = ~np.isnan(p.fin_ok[:, :, 0]) & ~np.isnan(p.fin_ok[:, :, 1]) & ~np.isnan(p.fin_ok[:, :, 2])
         reasons["DART 재무 없음(4분기 연속 자료·공시 전)"] = ok & ~fin_ok
         ok &= fin_ok
-    if variant == "D":
+    if variant == "D" if need_index is None else need_index:
         idx_ok = np.zeros((T, N), dtype=bool)
         for mk in ("KOSPI", "KOSDAQ"):
             col = p.market == mk
@@ -97,19 +134,26 @@ def coverage_of(p: Panel, ok: np.ndarray, listed: np.ndarray, reasons: dict, var
     return Coverage(p.dates[rows[0]] if len(rows) else None, p.dates[rows[-1]] if len(rows) else None,
                     int(ok.any(axis=0).sum()), int(ok.sum()), int(listed.sum()),
                     {k: int(v.sum()) for k, v in reasons.items()},
-                    variant in "BCD" and not p.kis_complete)
+                    (variant[0] in "BCD" or variant.endswith("_sameB")) and not p.kis_complete)
 
 
-def signals(p: Panel, ind: Indicators, cfg: Config, variant: str, ok: np.ndarray, flow_top: float):
-    """장 마감 후 진입 신호 (T, N) bool과 순위 점수."""
+def signals(p: Panel, ind: Indicators, cfg: Config, variant, ok: np.ndarray, flow_top: float):
+    """장 마감 후 진입 신호 (T, N) bool과 순위 점수(1순위, 2순위). variant는 이름(str) 또는 VariantSpec."""
+    sp = variant if isinstance(variant, VariantSpec) else spec(variant, cfg)
+    base = sp.base
     c = p.close
     with np.errstate(invalid="ignore", divide="ignore"):
         filt = ok & (p.mktcap >= cfg.f("MIN_MKTCAP_KRW")) & (ind.val20 >= cfg.f("MIN_VALUE20_KRW"))
         trend = (c > ind.ma60) & (ind.ma60 > ind.ma120) & (ind.ma60 > ind.ma60_lag20) & (ind.pos250 >= cfg.f("POS250_MIN_PCT"))
         value_x = p.value / ind.val_prev20
+        tq = ind.trend_quality if ind.trend_quality is not None else np.full(c.shape, np.nan)
         sig = filt & trend
-        score = value_x.copy()
-        if variant in "BCD":
+        score = (tq if sp.rank_by == "trend_quality" else value_x).copy()
+        score2 = np.zeros(c.shape)
+        if sp.overheat:
+            hot = (ind.ret20 * 100 >= cfg.f("OVERHEAT_RET20_PCT")) | (c >= ind.ma20 * (1 + cfg.f("OVERHEAT_GAP20_PCT") / 100))
+            sig &= ~hot
+        if base in "BCD":
             flow_score = ind.flow_sum * 1e6 / p.mktcap
             fs = np.where(filt, flow_score, np.nan)
             thr = np.full(len(p.dates), np.nan)
@@ -117,15 +161,16 @@ def signals(p: Panel, ind: Indicators, cfg: Config, variant: str, ok: np.ndarray
             thr[has] = np.nanpercentile(fs[has], 100 - flow_top, axis=1)
             sig &= (flow_score >= thr[:, None]) & (value_x >= cfg.f("VALUE_SPIKE_X"))
             score = flow_score
-        if variant in "CD":
+            score2 = tq if sp.tiebreak == "trend_quality" else value_x
+        if base in "CD":
             ttm, li, eq = p.fin_ok[:, :, 0], p.fin_ok[:, :, 1], p.fin_ok[:, :, 2]
             sig &= (ttm > 0) & (eq > 0) & (li / eq * 100 < cfg.f("DEBT_RATIO_MAX_PCT"))
-        if variant == "D":
+        if sp.index_filter:
             for mk in ("KOSPI", "KOSDAQ"):
                 col = p.market == mk
                 down = p.index_close[mk] < ind.idx_ma[mk]
                 sig[:, col] &= ~down[:, None]
-    return sig, score
+    return sig, score, score2
 
 
 @dataclass
@@ -145,7 +190,8 @@ class Result:
 
 
 def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarray, score: np.ndarray,
-             entry: str, exit_: str, stop_pct: float, flow_top: float, start_idx: int) -> Result:
+             entry: str, exit_: str, stop_pct: float, flow_top: float, start_idx: int,
+             score2: np.ndarray | None = None) -> Result:
     T, N = p.close.shape
     R = Result(variant, entry, exit_, stop_pct, flow_top)
     cash = cfg.f("INITIAL_CASH_KRW")
@@ -170,7 +216,7 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                          "entry_date": p.dates[q["entry_t"]], "entry_price": round(q["entry_px"], 2),
                          "shares": q["shares"], "exit_date": p.dates[t], "exit_price": round(execp, 2),
                          "reason": reason, "pnl_krw": round(pnl), "ret_pct": round(pnl / q["cost"] * 100, 3),
-                         "hold_days": t - q["entry_t"]})
+                         "hold_days": t - q["entry_t"], "pre_ret20_pct": q.get("pre_ret20")})
         sells.discard(j)
 
     def themes_of(j):
@@ -220,7 +266,8 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                         cost = shares * px * (1 + slip) * (1 + bfee)
                         cash -= cost
                         pos[j] = {"shares": shares, "cost": cost, "entry_t": t, "peak": float(c[j]) if not np.isnan(c[j]) else px,
-                                  "last_close": px, "signal_t": od["signal_t"], "entry_px": px * (1 + slip)}
+                                  "last_close": px, "signal_t": od["signal_t"], "entry_px": px * (1 + slip),
+                                  "pre_ret20": _pre_ret20(ind, od["signal_t"], j)}
                         if entry != "1":
                             R.limit_fills += 1
                     del orders[j]
@@ -258,7 +305,12 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
         if len(cand) == 0:
             continue
         cand = [int(j) for j in cand if j not in pos and j not in orders]
-        cand.sort(key=lambda j: (-(score[t, j] if not np.isnan(score[t, j]) else -1e18), p.codes[j]))
+        def _k(arr, j):
+            if arr is None:
+                return 0.0
+            v = arr[t, j]
+            return -v if not np.isnan(v) else 1e18
+        cand.sort(key=lambda j: (_k(score, j), _k(score2, j), p.codes[j]))
         theme_cnt: dict[str, int] = {}
         for j in list(pos) + list(orders):
             for th in themes_of(j):
@@ -292,6 +344,14 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
     return R
 
 
+def _pre_ret20(ind, t, j):
+    """진입 신호일 기준 직전 20일 수익률(%)."""
+    if ind.ret20 is None:
+        return None
+    v = ind.ret20[t, j]
+    return None if np.isnan(v) else round(float(v) * 100, 2)
+
+
 # ------------------------------------------------------------------ 지표
 def metrics(R: Result, start: str | None = None, end: str | None = None) -> dict:
     eq = [(d, v) for d, v in R.equity if (start is None or d >= start) and (end is None or d <= end)]
@@ -312,6 +372,9 @@ def metrics(R: Result, start: str | None = None, end: str | None = None) -> dict
     out["win_rate_pct"] = len(wins) / len(tr) * 100 if tr else None
     out["avg_win_pct"] = sum(wins) / len(wins) if wins else None
     out["avg_loss_pct"] = sum(losses) / len(losses) if losses else None
+    wr = out["win_rate_pct"]
+    out["expectancy_pct"] = (wr / 100 * (out["avg_win_pct"] or 0) + (1 - wr / 100) * (out["avg_loss_pct"] or 0)) \
+        if wr is not None else None  # 거래당 기대값 (비용 반영 후)
     out["avg_hold_days"] = sum(x["hold_days"] for x in tr) / len(tr) if tr else None
     out["limit_fill_pct"] = R.limit_fills / R.limit_orders * 100 if R.limit_orders else None
     out["missed_ret20_pct"] = sum(R.missed_ret20) / len(R.missed_ret20) * 100 if R.missed_ret20 else None

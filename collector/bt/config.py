@@ -27,6 +27,12 @@ DEFAULTS: list[tuple[str, str, str]] = [
     ("SELL_FEE_PCT", "0.015", "매도 수수료(%) (거래세 별도)"),
     ("SLIPPAGE_PCT", "0.1", "슬리피지 편도(%)"),
     ("DEV_END", "20221231", "개발 구간 끝 (이후는 검증 구간)"),
+    ("RANK_BY", "value_surge", "A의 신호가 넘칠 때 고르는 순서: value_surge(거래대금 급증 순) | trend_quality(60일 수익률 / 변동성)"),
+    ("RANK_TIEBREAK", "value_surge", "B·C·D에서 수급 점수가 같을 때 보조 순서: value_surge | trend_quality"),
+    ("OVERHEAT_FILTER", "off", "과열 제외: on이면 최근 20일 수익률 또는 20일선 이격이 기준 이상인 신호 제외"),
+    ("OVERHEAT_RET20_PCT", "40", "과열 기준: 최근 20일 수익률(%)"),
+    ("OVERHEAT_GAP20_PCT", "25", "과열 기준: 종가가 20일선보다 이만큼(%) 이상 높음"),
+    ("INDEX_FILTER_FOR_A", "off", "on이면 A에도 지수 필터(해당 시장 지수 < 120일선이면 신규 매수 중단) 적용"),
     ("SENS_STOP_PCTS", "10,15,20", "민감도: 손절 %"),
     ("SENS_FLOW_TOP_PCTS", "10,20,30", "민감도: 수급 상위 %"),
 ]

@@ -773,7 +773,7 @@ def _bt_build(self):
     vrow.pack(fill="x", pady=(14, 0))
     ctk.CTkLabel(vrow, text="변형", font=F(13, "bold"), text_color=NAVY, width=40, anchor="w").pack(side="left")
     self.bt_var = tk.StringVar(value="all")
-    for val, lbl in (("A", "A 시세"), ("B", "B +수급"), ("C", "C +재무"), ("D", "D +지수"), ("all", "전체")):
+    for val, lbl in (("A", "A"), ("A4", "A4 개선"), ("B", "B +수급"), ("C", "C +재무"), ("D", "D +지수"), ("all", "전체")):
         ctk.CTkRadioButton(vrow, text=lbl, value=val, variable=self.bt_var, font=F(13), text_color=NAVY, fg_color=COBALT,
                            hover_color=COBALT_DARK, border_color=GRAY, radiobutton_width=18,
                            radiobutton_height=18).pack(side="left", padx=(0, 18))
@@ -831,7 +831,8 @@ def _bt_run(self):
     from .bt.cli import themes_csv_for
     from .bt.run import run_backtest
     v = self.bt_var.get()
-    variants = ["A", "B", "C", "D"] if v == "all" else [v]
+    from .bt.engine import ALL_VARIANTS
+    variants = list(ALL_VARIANTS) if v == "all" else [v]
     db_path = Path(self.bt_db.get())
     self.bt_progress.set(0)
 
