@@ -184,11 +184,11 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None
     for y in years:
         L.append(f"| {y} | " + " | ".join(_f(x.get(y)) for x in yb) + f" | {_f(ky.get(y))} | {_f(qy.get(y))} |")
     # 공정 비교: A와 B의 차이가 수급 효과인지 종목 범위 효과인지
-    fair = [R for R in base if R.variant in ("A", "A_sameB", "B", "A4", "A4_sameB")]
+    fair = [R for R in base if R.variant in ("A", "A_sameB", "B", "B2", "A4", "A4_sameB")]
     if fair:
         L += ["", "## 공정 비교 (① + (가)): 같은 종목·날짜 범위에서 비교", "",
               "A_sameB·A4_sameB는 A·A4 규칙을 B가 실제로 계산된 종목·날짜에만 적용한 결과입니다. "
-              "A_sameB와 B의 차이는 수급 효과, A와 A_sameB의 차이는 종목 범위 효과입니다.", "",
+              "A_sameB와 B의 차이는 수급 효과, A와 A_sameB의 차이는 종목 범위 효과입니다. B2는 B에서 거래대금 급증 조건만 뺀 것으로 이미 B와 같은 범위라 B2_sameB = B2입니다. A_sameB와 B2의 차이는 수급 조건만의 효과, B2와 B의 차이는 거래대금 급증 조건의 효과입니다.", "",
               "| 변형 | 연환산% | 최대낙폭% | 승률% | 거래당기대값% | 거래 |", "|---|---|---|---|---|---|"]
         for R in sorted(fair, key=lambda r: E.ALL_VARIANTS.index(r.variant)):
             m = E.metrics(R)
