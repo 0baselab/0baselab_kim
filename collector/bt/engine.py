@@ -20,11 +20,14 @@ from .config import Config, tax_pct
 from .data import Panel, atr, rolling_max, rolling_mean, rolling_min, rolling_sum, shift
 
 ENTRY_METHODS = {"1": "① 다음 날 시가", "2": "② 20일선 지정가", "3": "③ 전일 종가 - 0.5xATR 지정가", "4": "④ 250일 고가 지정가"}
-EXIT_METHODS = {"ga": "(가) 종가 판단 -> 다음 날 시가", "na": "(나) 장중 손절"}
+EXIT_METHODS = {"ga": "(가) 종가 판단 -> 다음 날 시가", "na": "(나) 장중 손절",
+                "gap": "(가+) (가) + 장중 비상 손절"}
 VARIANTS = {"A": "KRX 시세 추세", "A1": "A + 추세 품질 순위", "A2": "A + 과열 제외", "A3": "A + 지수 필터",
             "A4": "A + 추세 품질·과열 제외·지수 필터", "B": "A + KIS 수급", "B2": "B - 거래대금 급증 조건 (수급만)", "C": "B + DART 재무", "D": "C + 지수 필터",
+            "A2-dd1": "A2 + 평가손 -10%면 신규 매수 중단", "A2-dd2": "A2, 지수 필터를 60일선으로 (배경 필터 대신)",
+            "A2-cap": "A2 + 같은 테마 최대 2종목",
             "A_sameB": "A 규칙을 B가 계산된 종목·날짜에만", "A4_sameB": "A4 규칙을 B가 계산된 종목·날짜에만"}
-ALL_VARIANTS = ["A", "A1", "A2", "A3", "A4", "B", "B2", "C", "D", "A_sameB", "A4_sameB"]
+ALL_VARIANTS = ["A", "A1", "A2", "A3", "A4", "B", "B2", "C", "D", "A2-dd1", "A2-dd2", "A2-cap", "A_sameB", "A4_sameB"]
 
 
 @dataclass
@@ -37,6 +40,9 @@ class VariantSpec:
     index_filter: bool
     tiebreak: str
     spike: bool = True  # B의 거래대금 급증 조건 사용 여부 (B2는 끔)
+    index60: bool = False   # 지수 60일선 필터 (A2-dd2)
+    dd_pause: bool = False  # 평가손 기준 신규 매수 중단 (A2-dd1)
+    max_theme: int | None = None  # 같은 테마 최대 종목 수 덮어쓰기 (A2-cap)
 
 
 def spec(name: str, cfg: Config) -> VariantSpec:
@@ -46,13 +52,18 @@ def spec(name: str, cfg: Config) -> VariantSpec:
     if on("BACKDROP_INDEX_FILTER"):  # 배경(시장 타이밍) 고정: 모든 변형에 같은 지수 필터
         idx = True
     core = name.split("_")[0]
+    extra = core.split("-")[1] if "-" in core else ""
+    core = core.split("-")[0]
     if core in ("A1", "A4"):
         rank = "trend_quality"
     if core in ("A2", "A4"):
         heat = True
     if core in ("A3", "A4"):
         idx = True
-    return VariantSpec(name, base, "B" if name.endswith("_sameB") else base, rank, heat, idx, cfg.s("RANK_TIEBREAK"), core != "B2")
+    if extra == "dd2":
+        idx = False
+    return VariantSpec(name, base, "B" if name.endswith("_sameB") else base, rank, heat, idx, cfg.s("RANK_TIEBREAK"),
+                       core != "B2", extra == "dd2", extra == "dd1", cfg.i("CAP_PER_THEME") if extra == "cap" else None)
 
 
 @dataclass
@@ -68,6 +79,7 @@ class Indicators:
     val_prev20: np.ndarray
     flow_sum: np.ndarray
     idx_ma: dict
+    idx_ma60: dict = None
     ret20: np.ndarray = None
     trend_quality: np.ndarray = None
 
@@ -90,7 +102,9 @@ def indicators(p: Panel, cfg: Config) -> Indicators:
         tq = np.where(std60 > 0, ret60 / (std60 * np.sqrt(60)), np.nan)
     return Indicators(rolling_mean(c, 20), ma60, rolling_mean(c, 120), shift(ma60, 20), pos.astype(c.dtype),
                       rolling_max(p.high, 250), atr(p.high, p.low, c, cfg.i("ATR_DAYS")), val20, shift(val20, 1),
-                      rolling_sum(p.flow_mil, cfg.i("FLOW_DAYS")), idx_ma, ret20, tq)
+                      rolling_sum(p.flow_mil, cfg.i("FLOW_DAYS")), idx_ma,
+                      {k: rolling_mean(v.reshape(-1, 1), cfg.i("INDEX_MA2_DAYS")).ravel() for k, v in p.index_close.items()},
+                      ret20, tq)
 
 
 @dataclass
@@ -175,6 +189,10 @@ def signals(p: Panel, ind: Indicators, cfg: Config, variant, ok: np.ndarray, flo
                 col = p.market == mk
                 down = p.index_close[mk] < ind.idx_ma[mk]
                 sig[:, col] &= ~down[:, None]
+        if sp.index60:
+            for mk in ("KOSPI", "KOSDAQ"):
+                col = p.market == mk
+                sig[:, col] &= ~(p.index_close[mk] < ind.idx_ma60[mk])[:, None]
     return sig, score, score2
 
 
@@ -186,6 +204,10 @@ def candidate_pool(p: Panel, ind: Indicators, cfg: Config, sp: "VariantSpec", ok
             for mk in ("KOSPI", "KOSDAQ"):
                 col = p.market == mk
                 pool[:, col] &= ~(p.index_close[mk] < ind.idx_ma[mk])[:, None]
+        if sp.index60:
+            for mk in ("KOSPI", "KOSDAQ"):
+                col = p.market == mk
+                pool[:, col] &= ~(p.index_close[mk] < ind.idx_ma60[mk])[:, None]
     return pool
 
 
@@ -203,6 +225,7 @@ class Result:
     missed_ret20: list = field(default_factory=list)
     skipped_cash: int = 0
     skipped_theme: int = 0
+    paused_days: int = 0
 
 
 def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarray, score: np.ndarray,
@@ -215,6 +238,11 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
     slip, bfee, sfee = cfg.f("SLIPPAGE_PCT") / 100, cfg.f("BUY_FEE_PCT") / 100, cfg.f("SELL_FEE_PCT") / 100
     stop = stop_pct / 100
     max_pos, max_theme, wait = cfg.i("MAX_POSITIONS"), cfg.i("MAX_PER_THEME"), cfg.i("LIMIT_WAIT_DAYS")
+    sp_ = spec(variant, cfg)
+    if sp_.max_theme is not None:
+        max_theme = sp_.max_theme
+    emer = cfg.f("EMERGENCY_STOP_PCT") / 100
+    dd_limit = cfg.f("DD_PAUSE_PCT") / 100
     pos: dict[int, dict] = {}       # j -> {shares, cost, entry_t, peak, last_close, signal_t}
     orders: dict[int, dict] = {}    # j -> {signal_t, limit, left}
     sells: set[int] = set()         # 다음 날 시가 매도 예약
@@ -266,6 +294,17 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
                     sell(j, t, float(o[j]), "장중 손절(시가)", at_open=True)
                 elif l[j] <= sp:
                     sell(j, t, sp, "장중 손절")
+        # 2-1. 비상 손절 (가+): (가)에 더해 장중 최고 종가 대비 -EMERGENCY_STOP_PCT% 도달 시 즉시 매도
+        if exit_ == "gap":
+            for j in list(pos):
+                q = pos[j]
+                if q["entry_t"] >= t or np.isnan(o[j]) or j in sells:
+                    continue
+                ep = q["peak"] * (1 - emer)
+                if o[j] <= ep:
+                    sell(j, t, float(o[j]), "비상 손절(시가)", at_open=True)
+                elif l[j] <= ep:
+                    sell(j, t, ep, "비상 손절")
         # 3. 예약 매도 (시가)
         for j in list(sells):
             if j in pos and not np.isnan(o[j]):
@@ -319,13 +358,19 @@ def simulate(p: Panel, ind: Indicators, cfg: Config, variant: str, sig: np.ndarr
         for j, q in pos.items():
             if np.isnan(c[j]):
                 continue
-            if exit_ == "ga" and c[j] <= q["peak"] * (1 - stop):
+            if exit_ in ("ga", "gap") and c[j] <= q["peak"] * (1 - stop):
                 q["why"] = f"최고 종가 대비 -{stop_pct:g}%"
                 sells.add(j)
             elif not np.isnan(ind.ma60[t, j]) and c[j] < ind.ma60[t, j]:
                 q["why"] = "종가 < 60일선"
                 sells.add(j)
         # 7. 진입 판단
+        if sp_.dd_pause and equity > 0:
+            unreal = sum(q["shares"] * q["last_close"] - q["cost"] for q in pos.values())
+            paused = unreal / equity <= -dd_limit
+            if paused:
+                R.paused_days += 1
+                continue
         free = max_pos - len(pos) - len(orders)
         if free <= 0:
             continue

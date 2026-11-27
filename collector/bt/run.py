@@ -87,15 +87,68 @@ def run_backtest(db_path: Path, cfg: Config, variants: list[str], now: datetime,
                 m = E.metrics(RR)
                 vals.append((m.get("cagr_pct"), m.get("mdd_pct")))
             randoms[R.variant] = (E.metrics(R), vals)
+    a2sens = _a2_sensitivity(panel, ind, cfg, covs, start_idx, progress) if "A2" in covs else []
     out_root = db_path.parent / "results"
     out = out_root / stamp(now)
     out.mkdir(parents=True, exist_ok=True)
-    _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms, random_n)
+    _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms, random_n, a2sens)
     latest = out_root / "latest"
     if latest.exists():
         shutil.rmtree(latest)
     shutil.copytree(out, latest)
     progress("완료", 1.0)
+    return out
+
+
+def _random_pctile(panel, ind, cfg, spc, ok, sig, score, entry, stop, start_idx, n, seed_key, R):
+    """같은 후보군·같은 규칙에서 무작위로 고른 n회 대비 전략 연환산의 백분위."""
+    if n <= 0:
+        return None
+    pool = E.candidate_pool(panel, ind, cfg, spc, ok)
+    vals = []
+    for i in range(n):
+        rng = np.random.default_rng([cfg.i("RANDOM_SEED"), *seed_key, i])
+        RR = E.simulate(panel, ind, cfg, R.variant, sig, score, entry, "ga", stop, cfg.f("FLOW_TOP_PCT"), start_idx,
+                        random_pool=pool, rng=rng)
+        vals.append(E.metrics(RR).get("cagr_pct"))
+    return _pctile(E.metrics(R).get("cagr_pct"), vals)
+
+
+def a2_grid(cfg) -> list[dict]:
+    """A2 민감도 조합: 진입별로 기본값 하나 + 항목 하나씩만 바꾼 조합 (청산 (가) 고정)."""
+    base = {"stop": cfg.f("STOP_PCT"), "pos": cfg.i("MAX_POSITIONS"),
+            "ret": cfg.f("OVERHEAT_RET20_PCT"), "gap": cfg.f("OVERHEAT_GAP20_PCT")}
+    axes = (("stop", cfg.ints("A2_SENS_STOPS")), ("pos", cfg.ints("A2_SENS_POSITIONS")),
+            ("ret", cfg.ints("A2_SENS_RET20")), ("gap", cfg.ints("A2_SENS_GAP20")))
+    out = []
+    for en in [str(x) for x in cfg.ints("A2_SENS_ENTRIES")]:
+        out.append(dict(base, entry=en, changed="기본"))
+        for k, vals in axes:
+            for v in vals:
+                if float(v) != float(base[k]):
+                    out.append(dict(base, entry=en, changed=k, **{k: type(base[k])(v)}))
+    return out
+
+
+def _a2_sensitivity(panel, ind, cfg, covs, start_idx, progress):
+    grid = a2_grid(cfg)
+    ok = covs["A2"][1]
+    dev_end = cfg.s("DEV_END")
+    n_rand = cfg.i("SENS_RANDOM_N")
+    out, sig_cache = [], {}
+    for k, g in enumerate(grid):
+        progress(f"A2 민감도 {k + 1}/{len(grid)}", 0.96)
+        c2 = cfg.copy(MAX_POSITIONS=str(g["pos"]), OVERHEAT_RET20_PCT=f"{g['ret']:g}", OVERHEAT_GAP20_PCT=f"{g['gap']:g}")
+        spc = E.spec("A2", c2)
+        key = (g["ret"], g["gap"])
+        if key not in sig_cache:
+            sig_cache[key] = E.signals(panel, ind, c2, spc, ok, cfg.f("FLOW_TOP_PCT"))
+        sig, score, score2 = sig_cache[key]
+        R = E.simulate(panel, ind, c2, "A2", sig, score, g["entry"], "ga", g["stop"], cfg.f("FLOW_TOP_PCT"), start_idx,
+                       score2=score2)
+        m, md, mv = E.metrics(R), E.metrics(R, None, dev_end), E.metrics(R, str(int(dev_end) + 1), None)
+        pct = _random_pctile(panel, ind, c2, spc, ok, sig, score, g["entry"], g["stop"], start_idx, n_rand, (900, k), R)
+        out.append((g, m, md, mv, pct))
     return out
 
 
@@ -111,7 +164,7 @@ def _pctile(x, arr):
     return sum(1 for a in arr if a < x) / len(arr) * 100
 
 
-def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None, random_n=0):
+def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None, random_n=0, a2sens=()):
     with (out / "trades.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["variant", "entry", "exit", "stop_pct", "flow_top_pct", "code", "name", "signal_date", "entry_date",
@@ -132,6 +185,11 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None
     dev_end = cfg.s("DEV_END")
     L = [f"# 추세추종 백테스트 결과 {now.strftime('%Y-%m-%d %H:%M')}", "",
          f"프로그램 {__version__}. 계산만 했으며 주문·매매는 하지 않습니다. 비용·슬리피지를 넣은 가정치입니다.", ""]
+    n_tested = len(results) + len(a2sens)
+    L += ["## 다중 비교 주의", "",
+          f"- 이번에 시험한 조합: **{n_tested}개** (변형·진입·청산·민감도 조합 합계, 무작위 비교 제외)",
+          "- 조합을 많이 시험할수록 그중 최고 결과는 우연히 좋게 나온 몫이 섞여 **과대평가**됩니다. "
+          "최고 조합 하나를 고르기보다, 개발·검증 두 기간과 이웃 설정(민감도)에서 함께 좋은지, 무작위 비교 백분위가 높은지를 보세요.", ""]
     from .data import universe_lines
     backdrop = cfg.s("BACKDROP_INDEX_FILTER").strip().lower() == "on"
     L += ["## 배경 설정", "",
@@ -166,14 +224,26 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None
                                     _f(m.get("excess_win_pct")), str(m["trades"]),
                                     _f(m.get("avg_hold_days"), 1),
                                     _f(m.get("limit_fill_pct")), _f(m.get("missed_ret20_pct"))]) + " |")
-    L += ["", f"## 기간 분할 (개발 ~{dev_end} / 검증 {int(dev_end[:4]) + 1}~), ① 다음 날 시가 + (가)", ""]
-    L += ["| 변형 | 구간 | 연환산% | 최대낙폭% | 승률% | 거래 |", "|---|---|---|---|---|---|"]
-    for kind, R in results:
-        if kind == "main" and R.entry == "1" and R.exit == "ga":
-            for label, s, e in (("개발", None, dev_end), ("검증", str(int(dev_end) + 1), None)):
-                m = E.metrics(R, s, e)
-                L.append(f"| {R.variant} | {label} | {_f(m.get('cagr_pct'))} | {_f(m.get('mdd_pct'))} | "
-                         f"{_f(m.get('win_rate_pct'))} | {m['trades']} |")
+    L += ["", f"## 기간 분할 (개발 ~{dev_end} / 검증 {int(dev_end[:4]) + 1}~), 진입 x 청산 전체 조합", ""]
+    L += ["| 변형 | 진입 | 청산 | 개발 연환산% | 개발 낙폭% | 개발 거래 | 검증 연환산% | 검증 낙폭% | 검증 거래 |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    mains = [R for kind, R in results if kind == "main"]
+    for R in mains:
+        md, mv = E.metrics(R, None, dev_end), E.metrics(R, str(int(dev_end) + 1), None)
+        L.append(f"| {R.variant} | {E.ENTRY_METHODS[R.entry]} | {E.EXIT_METHODS[R.exit]} | {_f(md.get('cagr_pct'))} | "
+                 f"{_f(md.get('mdd_pct'))} | {md['trades']} | {_f(mv.get('cagr_pct'))} | {_f(mv.get('mdd_pct'))} | {mv['trades']} |")
+    ky0, qy0 = _idx_yearly(panel, "KOSPI"), _idx_yearly(panel, "KOSDAQ")
+    L += ["", "## 변형별 상위 3개 조합 연도별 수익률 (%) (전체 기간 연환산 기준 상위)", ""]
+    for v in dict.fromkeys(R.variant for R in mains):
+        top3 = sorted([R for R in mains if R.variant == v], key=lambda R: -(E.metrics(R).get("cagr_pct") or -1e9))[:3]
+        if not top3:
+            continue
+        ys = [E.yearly(R.equity) for R in top3]
+        yrs = sorted({y for x in ys for y in x})
+        names = [f"{E.ENTRY_METHODS[R.entry][0]}{E.EXIT_METHODS[R.exit].split(' ')[0]}" for R in top3]
+        L += [f"**{v}**", "", "| 연도 | " + " | ".join(names) + " | 코스피 | 코스닥 |", "|---|" + "---|" * (len(top3) + 2)]
+        L += [f"| {y} | " + " | ".join(_f(x.get(y)) for x in ys) + f" | {_f(ky0.get(y))} | {_f(qy0.get(y))} |" for y in yrs]
+        L.append("")
     L += ["", "## 연도별 수익률 (%), ① + (가), 같은 기간 지수 비교", ""]
     base = [R for k, R in results if k == "main" and R.entry == "1" and R.exit == "ga"]
     years = sorted({d[:4] for R in base for d, _ in R.equity})
@@ -223,6 +293,16 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None
             ft = f"{R.flow_top:g}" if R.variant[0] in "BCD" else "-"
             L.append(f"| {R.variant} | {R.stop_pct:g} | {ft} | "
                      f"{_f(m.get('cagr_pct'))} | {_f(m.get('mdd_pct'))} | {_f(m.get('win_rate_pct'))} | {m['trades']} |")
+    if a2sens:
+        L += ["", "## A2 민감도 (청산 (가) 고정, 기본값에서 한 항목씩만 바꿈)", "",
+              f"무작위 백분위는 조합마다 {cfg.s('SENS_RANDOM_N')}회 무작위 비교 대비 연환산 백분위입니다.", "",
+              "| 진입 | 바꾼 항목 | 손절% | 최대 종목 | 과열 20일% | 과열 20일선% | 연환산% | 최대낙폭% | 개발 연환산% | 검증 연환산% | 무작위 백분위 |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
+        lab = {"기본": "기본", "stop": "손절", "pos": "종목 수", "ret": "과열 20일", "gap": "과열 20일선"}
+        for g, m, md, mv, pct in a2sens:
+            L.append(f"| {E.ENTRY_METHODS[g['entry']]} | {lab[g['changed']]} | {g['stop']:g} | {g['pos']} | {g['ret']:g} | "
+                     f"{g['gap']:g} | {_f(m.get('cagr_pct'))} | {_f(m.get('mdd_pct'))} | {_f(md.get('cagr_pct'))} | "
+                     f"{_f(mv.get('cagr_pct'))} | {_f(pct, 0)} |")
     L += ["", "## 규칙과 가정", "",
           f"- 기간 {cfg.s('START')}~마지막 데이터일, 수정계수 적용 가격, 날짜별로 그날 상장된 보통주만(상장폐지 포함)",
           f"- 거르기: 시총 {cfg.f('MIN_MKTCAP_KRW') / 1e8:,.0f}억 원 이상, 20일 평균 거래대금 {cfg.f('MIN_VALUE20_KRW') / 1e8:,.0f}억 원 이상",
@@ -237,5 +317,10 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now, randoms=None
           f"- 비용: 매수 {cfg.s('BUY_FEE_PCT')}%, 매도 {cfg.s('SELL_FEE_PCT')}% + 거래세, 슬리피지 편도 {cfg.s('SLIPPAGE_PCT')}%",
           "- 거래세(코스피 농특세 포함 합계): " + ", ".join(f"{d[:4]}.{d[4:6]}~ {r}%" for d, r in TAX_TABLE)
           + " (2019년 이전 세율은 간접 확인, 확인 필요)",
-          f"- 초기 자금 {cfg.f('INITIAL_CASH_KRW'):,.0f}원"]
+          f"- 초기 자금 {cfg.f('INITIAL_CASH_KRW'):,.0f}원",
+          f"- (가+): (가)에 더해 장중 저가가 최고 종가 대비 -{cfg.s('EMERGENCY_STOP_PCT')}%에 닿으면 그 가격(시가가 더 낮으면 시가)에 즉시 매도",
+          f"- A2-dd1: 보유 종목 평가손익 합 / 총자산 <= -{cfg.s('DD_PAUSE_PCT')}%인 날은 신규 매수 판단을 하지 않음(회복하면 재개)",
+          f"- A2-dd2: 배경 지수 필터({cfg.s('INDEX_MA_DAYS')}일선) 대신 지수 {cfg.s('INDEX_MA2_DAYS')}일선 필터",
+          f"- A2-cap: 같은 테마 최대 {cfg.s('CAP_PER_THEME')}종목"
+          + ("" if panel.themes else " - **테마 파일 없음: 제한이 적용되지 않아 A2와 같은 결과**")]
     (out / "summary.md").write_text("\n".join(L) + "\n", encoding="utf-8")
