@@ -33,30 +33,41 @@ def run_backtest(db_path: Path, cfg: Config, variants: list[str], now: datetime,
     progress("지표 계산 중", 0.10)
     ind = E.indicators(panel, cfg)
     stop0, flow0 = cfg.f("STOP_PCT"), cfg.f("FLOW_TOP_PCT")
-    todo = [v for v in variants if cov.get("variants", {}).get(v) is None]
-    skipped = {v: cov.get("variants", {}).get(v, "확인 불가") for v in variants if v not in todo}
+    specs = {v: E.spec(v, cfg) for v in variants}
+    can = cov.get("variants", {})
+
+    def why_not(v):
+        sp = specs[v]
+        need = can.get(sp.mask_base, "확인 불가")
+        if need is None and sp.index_filter and not cov.get("index", {}).get("to"):
+            return "KRX 지수 없음"
+        return need
+
+    todo = [v for v in variants if why_not(v) is None]
+    skipped = {v: why_not(v) for v in variants if v not in todo}
     jobs = []
     for v in todo:
         for en in E.ENTRY_METHODS:
             for ex in E.EXIT_METHODS:
                 jobs.append((v, en, ex, stop0, flow0, "main"))
-        for s in cfg.ints("SENS_STOP_PCTS"):
+        for s in cfg.ints("SENS_STOP_PCTS") if not v.endswith("_sameB") else []:
             if s != stop0:
                 jobs.append((v, "1", "ga", float(s), flow0, "sens"))
-        if v in "BCD":
+        if specs[v].base in "BCD":
             for ft in cfg.ints("SENS_FLOW_TOP_PCTS"):
                 if ft != flow0:
                     jobs.append((v, "1", "ga", stop0, float(ft), "sens"))
     results, covs, sig_cache = [], {}, {}
     for k, (v, en, ex, sp, ft, kind) in enumerate(jobs):
         progress(f"변형 {v} 진입{en} 청산{ex} 손절{sp:g}% 수급{ft:g}%", 0.15 + 0.8 * k / max(len(jobs), 1))
+        spc = specs[v]
         if v not in covs:
-            listed, ok, reasons = E.need_masks(panel, ind, v, start_idx)
+            listed, ok, reasons = E.need_masks(panel, ind, spc.mask_base, start_idx, need_index=spc.index_filter)
             covs[v] = (E.coverage_of(panel, ok, listed, reasons, v), ok)
         if (v, ft) not in sig_cache:
-            sig_cache[(v, ft)] = E.signals(panel, ind, cfg, v, covs[v][1], ft)
-        sig, score = sig_cache[(v, ft)]
-        R = E.simulate(panel, ind, cfg, v, sig, score, en, ex, sp, ft, start_idx)
+            sig_cache[(v, ft)] = E.signals(panel, ind, cfg, spc, covs[v][1], ft)
+        sig, score, score2 = sig_cache[(v, ft)]
+        R = E.simulate(panel, ind, cfg, v, sig, score, en, ex, sp, ft, start_idx, score2=score2)
         results.append((kind, R))
     out_root = db_path.parent / "results"
     out = out_root / stamp(now)
@@ -79,12 +90,13 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
     with (out / "trades.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["variant", "entry", "exit", "stop_pct", "flow_top_pct", "code", "name", "signal_date", "entry_date",
-                    "entry_price", "shares", "exit_date", "exit_price", "reason", "pnl_krw", "ret_pct", "hold_days"])
+                    "entry_price", "shares", "exit_date", "exit_price", "reason", "pnl_krw", "ret_pct", "hold_days",
+                    "pre_ret20_pct"])
         for kind, R in results:
             for x in R.trades:
                 w.writerow([R.variant, R.entry, R.exit, R.stop_pct, R.flow_top, x["code"], x["name"], x["signal_date"],
                             x["entry_date"], x["entry_price"], x["shares"], x["exit_date"], x["exit_price"], x["reason"],
-                            x["pnl_krw"], x["ret_pct"], x["hold_days"]])
+                            x["pnl_krw"], x["ret_pct"], x["hold_days"], x.get("pre_ret20_pct")])
     with (out / "equity.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["date", "variant", "entry", "exit", "stop_pct", "flow_top_pct", "equity_krw"])
@@ -107,8 +119,8 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
     for v, why in skipped.items():
         L.append(f"- 변형 {v}: 실행 안 함 ({why})")
     L += ["", "## 진입·청산 방식 비교 (손절·수급 기본값)", ""]
-    head = ["변형", "진입", "청산", "연환산%", "최대낙폭%", "승률%", "평균수익%", "평균손실%", "거래", "평균보유일",
-            "지정가체결%", "놓친신호20일%"]
+    head = ["변형", "진입", "청산", "연환산%", "최대낙폭%", "승률%", "평균수익%", "평균손실%", "거래당기대값%", "거래",
+            "평균보유일", "지정가체결%", "놓친신호20일%"]
     L += ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for kind, R in results:
         if kind != "main":
@@ -116,7 +128,8 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
         m = E.metrics(R)
         L.append("| " + " | ".join([R.variant, E.ENTRY_METHODS[R.entry], E.EXIT_METHODS[R.exit], _f(m.get("cagr_pct")),
                                     _f(m.get("mdd_pct")), _f(m.get("win_rate_pct")), _f(m.get("avg_win_pct")),
-                                    _f(m.get("avg_loss_pct")), str(m["trades"]), _f(m.get("avg_hold_days"), 1),
+                                    _f(m.get("avg_loss_pct")), _f(m.get("expectancy_pct")), str(m["trades"]),
+                                    _f(m.get("avg_hold_days"), 1),
                                     _f(m.get("limit_fill_pct")), _f(m.get("missed_ret20_pct"))]) + " |")
     L += ["", f"## 기간 분할 (개발 ~{dev_end} / 검증 {int(dev_end[:4]) + 1}~), ① 다음 날 시가 + (가)", ""]
     L += ["| 변형 | 구간 | 연환산% | 최대낙폭% | 승률% | 거래 |", "|---|---|---|---|---|---|"]
@@ -135,12 +148,32 @@ def _write_files(out, panel, cfg, cov, covs, results, skipped, now):
     yb = [E.yearly(R.equity) for R in base]
     for y in years:
         L.append(f"| {y} | " + " | ".join(_f(x.get(y)) for x in yb) + f" | {_f(ky.get(y))} | {_f(qy.get(y))} |")
+    # 공정 비교: A와 B의 차이가 수급 효과인지 종목 범위 효과인지
+    fair = [R for R in base if R.variant in ("A", "A_sameB", "B", "A4", "A4_sameB")]
+    if fair:
+        L += ["", "## 공정 비교 (① + (가)): 같은 종목·날짜 범위에서 비교", "",
+              "A_sameB·A4_sameB는 A·A4 규칙을 B가 실제로 계산된 종목·날짜에만 적용한 결과입니다. "
+              "A_sameB와 B의 차이는 수급 효과, A와 A_sameB의 차이는 종목 범위 효과입니다.", "",
+              "| 변형 | 연환산% | 최대낙폭% | 승률% | 거래당기대값% | 거래 |", "|---|---|---|---|---|---|"]
+        for R in sorted(fair, key=lambda r: E.ALL_VARIANTS.index(r.variant)):
+            m = E.metrics(R)
+            L.append(f"| {R.variant} | {_f(m.get('cagr_pct'))} | {_f(m.get('mdd_pct'))} | {_f(m.get('win_rate_pct'))} | "
+                     f"{_f(m.get('expectancy_pct'))} | {m['trades']} |")
+    L += ["", "## 손실 상위 10건 (변형별, ① + (가))", ""]
+    for R in base:
+        worst = sorted(R.trades, key=lambda x: x["ret_pct"])[:10]
+        if not worst:
+            continue
+        L += [f"**{R.variant}**", "", "| 종목 | 진입일 | 청산일 | 수익률% | 진입 직전 20일 수익률% | 청산 이유 |", "|---|---|---|---|---|---|"]
+        L += [f"| {x['code']} {x['name']} | {x['entry_date']} | {x['exit_date']} | {x['ret_pct']:.2f} | "
+              f"{_f(x.get('pre_ret20_pct'))} | {x['reason']} |" for x in worst]
+        L.append("")
     L += ["", "## 민감도 (① + (가))", "", "| 변형 | 손절% | 수급 상위% | 연환산% | 최대낙폭% | 승률% | 거래 |",
           "|---|---|---|---|---|---|---|"]
     for kind, R in results:
         if (kind == "sens") or (kind == "main" and R.entry == "1" and R.exit == "ga"):
             m = E.metrics(R)
-            ft = f"{R.flow_top:g}" if R.variant in "BCD" else "-"
+            ft = f"{R.flow_top:g}" if R.variant[0] in "BCD" else "-"
             L.append(f"| {R.variant} | {R.stop_pct:g} | {ft} | "
                      f"{_f(m.get('cagr_pct'))} | {_f(m.get('mdd_pct'))} | {_f(m.get('win_rate_pct'))} | {m['trades']} |")
     L += ["", "## 규칙과 가정", "",

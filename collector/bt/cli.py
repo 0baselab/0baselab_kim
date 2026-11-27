@@ -1,4 +1,4 @@
-"""backtest coverage | run [A|B|C|D|all] | sync | export  (--db <경로>). API 키가 필요 없고 잠금 파일을 잡지 않는다."""
+"""backtest coverage | run [A|A1..A4|B|C|D|A_sameB|A4_sameB|all] | sync | export  (--db <경로>). API 키가 필요 없고 잠금 파일을 잡지 않는다."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -59,10 +59,12 @@ def main(sub: str | None, variant: str | None, db_arg: str | None, out=print) ->
     if sub == "coverage":
         return 0
     from .run import run_backtest
-    v = (variant or "all").upper()
-    variants = ["A", "B", "C", "D"] if v == "ALL" else [x for x in v.split(",") if x in "ABCD" and x]
+    from .engine import ALL_VARIANTS
+    v = (variant or "all").strip()
+    names = {x.upper(): x for x in ALL_VARIANTS}
+    variants = list(ALL_VARIANTS) if v.lower() == "all" else [names[x.upper()] for x in v.split(",") if x.upper() in names]
     if not variants:
-        out("변형은 A, B, C, D, all 중 하나입니다.")
+        out("변형은 " + ", ".join(ALL_VARIANTS) + ", all 중에서 고르세요 (여러 개는 쉼표로).")
         return 1
     cfg = C.load(install)
     res = run_backtest(db, cfg, variants, now_kst(), progress=lambda s, x: out(f"  [{x * 100:3.0f}%] {s}"),

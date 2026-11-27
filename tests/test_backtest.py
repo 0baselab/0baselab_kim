@@ -242,3 +242,85 @@ def test_zero_price_is_no_trade(tmp_path):
     R = E.simulate(p2, tiny_ind(p2, ma20=100.0), cfg(MAX_POSITIONS="1"), "A", np.array([[True], [False], [False]]),
                    np.ones((3, 1)), "1", "ga", 15, 20, 0)
     assert all(t["entry_date"] != p2.dates[1] for t in R.trades)
+
+
+# ----------------------------- 0.11.0: A1~A4, 공정 비교 -----------------------------
+
+def test_trend_quality_value():
+    # 일간 수익률이 번갈아 +2%, 0% -> 60일 수익률 / (표준편차 x sqrt(60))
+    c = [100.0]
+    for i in range(80):
+        c.append(c[-1] * (1.02 if i % 2 == 0 else 1.0))
+    p = tiny_panel(o=[[x] for x in c], h=[[x] for x in c], l=[[x] for x in c], c=[[x] for x in c])
+    ind = E.indicators(p, cfg())
+    t = 80
+    r = np.array([c[i] / c[i - 1] - 1 for i in range(t - 59, t + 1)])
+    expect = (c[t] / c[t - 60] - 1) / (r.std(ddof=1) * np.sqrt(60))
+    assert math.isclose(ind.trend_quality[t, 0], expect, rel_tol=1e-6)
+    assert np.isnan(ind.trend_quality[30, 0])  # 60일 안 됨
+
+
+def _flat_ind(p, **kw):
+    T, N = p.close.shape
+    base = dict(ma20=np.full((T, N), 100.0), ma60=np.full((T, N), 90.0), ma120=np.full((T, N), 80.0),
+                ma60_lag20=np.full((T, N), 85.0), pos250=np.full((T, N), 95.0), hi250=np.full((T, N), 1e9),
+                atr=np.full((T, N), 1.0), val20=np.full((T, N), 1e10), val_prev20=np.full((T, N), 1e10),
+                flow_sum=np.full((T, N), np.nan), idx_ma={"KOSPI": np.full(T, 1.0), "KOSDAQ": np.full(T, 1.0)},
+                ret20=np.full((T, N), 0.05), trend_quality=np.full((T, N), 1.0))
+    base.update(kw)
+    return E.Indicators(**base)
+
+
+def test_overheat_filter_and_index_filter_for_a():
+    p = tiny_panel(o=[[100, 100, 100]], h=[[100, 100, 100]], l=[[100, 100, 100]], c=[[110, 130, 110]])
+    ind = _flat_ind(p, ret20=np.array([[0.05, 0.05, 0.45]]))
+    ok = np.ones((1, 3), dtype=bool)
+    sig, *_ = E.signals(p, ind, cfg(), "A", ok, 20)
+    assert sig.tolist() == [[True, True, True]]
+    sig2, *_ = E.signals(p, ind, cfg(), "A2", ok, 20)
+    # 종가 130 >= 20일선 100 x 1.25 -> 제외, 20일 수익률 45% >= 40 -> 제외
+    assert sig2.tolist() == [[True, False, False]]
+    # A3: 지수 < 120일선이면 신규 매수 중단
+    p.index_close = {"KOSPI": np.array([0.5]), "KOSDAQ": np.array([2.0])}
+    sig3, *_ = E.signals(p, ind, cfg(), "A3", ok, 20)
+    assert sig3.tolist() == [[False, False, False]]
+    p.market = np.array(["KOSPI", "KOSDAQ", "KOSDAQ"])
+    sig3, *_ = E.signals(p, ind, cfg(), "A3", ok, 20)
+    assert sig3.tolist() == [[False, True, True]]
+    # 설정으로 A에도 지수 필터
+    sigA, *_ = E.signals(p, ind, cfg(INDEX_FILTER_FOR_A="on"), "A", ok, 20)
+    assert sigA.tolist() == sig3.tolist()
+
+
+def test_rank_by_trend_quality():
+    p = tiny_panel(o=[[100, 100]] * 2, h=[[100, 100]] * 2, l=[[100, 100]] * 2, c=[[110, 110]] * 2,
+                   value=[[1e10, 5e10]] * 2)
+    ind = _flat_ind(p, trend_quality=np.array([[3.0, 1.0]] * 2), val_prev20=np.full((2, 2), 1e10))
+    ok = np.ones((2, 2), dtype=bool)
+    _, sA, _ = E.signals(p, ind, cfg(), "A", ok, 20)
+    _, sA1, _ = E.signals(p, ind, cfg(), "A1", ok, 20)
+    assert sA[0].tolist() == [1.0, 5.0] and sA1[0].tolist() == [3.0, 1.0]
+    sig = np.array([[True, True], [False, False]])
+    R = E.simulate(p, ind, cfg(MAX_POSITIONS="1"), "A1", sig, sA1, "1", "ga", 15, 20, 0)
+    assert R.trades[0]["code"] == p.codes[0]  # 추세 품질이 높은 종목
+    R = E.simulate(p, ind, cfg(MAX_POSITIONS="1"), "A", sig, sA, "1", "ga", 15, 20, 0)
+    assert R.trades[0]["code"] == p.codes[1]  # 거래대금 급증 순
+
+
+def test_same_b_range_and_summary(tmp_path):
+    from collector.bt.run import run_backtest
+    make_db(tmp_path, investor_codes=("000010",)).close()
+    con = open_ro(B.bt_path(tmp_path))
+    p = load_panel(con, "20150101")
+    ind = E.indicators(p, cfg())
+    _, okA, _ = E.need_masks(p, ind, "A", 0)
+    _, okB, _ = E.need_masks(p, ind, E.spec("A_sameB", cfg()).mask_base, 0)
+    assert okB.any(axis=0).sum() == 1 and okA.any(axis=0).sum() > 1  # A_sameB는 수급 있는 종목만
+    sig, *_ = E.signals(p, ind, cfg(), "A_sameB", okB, 20)
+    assert not sig[:, [j for j, c in enumerate(p.codes) if c != "000010"]].any()
+    out = run_backtest(B.bt_path(tmp_path), cfg(), list(E.ALL_VARIANTS), NOW)
+    s = (out / "summary.md").read_text(encoding="utf-8")
+    for x in ("거래당기대값%", "## 공정 비교", "| A_sameB |", "| A4_sameB |", "## 손실 상위 10건", "진입 직전 20일 수익률%",
+              "변형 A1", "변형 A4"):
+        assert x in s, x
+    assert "pre_ret20_pct" in (out / "trades.csv").read_text(encoding="utf-8-sig").splitlines()[0]
