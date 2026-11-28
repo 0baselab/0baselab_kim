@@ -312,3 +312,50 @@ def test_cli_auto_shutdown_flag(tmp_path, monkeypatch, flag):
     monkeypatch.setattr(B, "shutdown_countdown", lambda *a, **k: called.append(True))
     assert M.main(["backfill", "auto"] + (["--shutdown"] if flag else [])) == 0
     assert called == ([True] if flag else [])
+
+
+# ---------------- 0.13.1: KIS 수급 조회 가능 시간 실측 / --ignore-window ----------------
+
+class FakeBlock(Fake):
+    """KIS 투자자매매동향이 OPSQ2001(시간 차단)을 돌려주는 가짜 서버."""
+    def handler(self, req):
+        if req.url.path.endswith("investor-trade-by-stock-daily"):
+            self.kis_calls += 1
+            return httpx.Response(200, json={"rt_cd": "1", "msg_cd": "OPSQ2001", "msg1": "TIME LIMIT"})
+        return super().handler(req)
+
+
+def test_kis_window_ok_and_blocked(tmp_path):
+    from collector.verify.kis_window import run_kis_window
+    sat = NOW.replace(day=28, hour=10)  # 토요일 낮
+    f = Fake()
+    path, verdict, _ = run_kis_window(kis(f, tmp_path, sat), sat, tmp_path / "v")
+    assert verdict == "지금 조회 가능" and f.kis_calls == 3
+    s = path.read_text(encoding="utf-8")
+    assert "토요일" in s and "FHPTJ04160001" in s and "005930" in s and "MCA00000" in s
+    assert "KISAPPKEY0001" not in s and "KISSECRET00001" not in s and not list((tmp_path / "v").glob("*token*"))
+    fb = FakeBlock()
+    _, verdict, _ = run_kis_window(kis(fb, tmp_path, sat), sat, tmp_path / "v")
+    assert verdict == "차단됨(OPSQ2001)"
+
+
+def test_ignore_window_stops_immediately_on_opsq2001(tmp_path):
+    f = Fake()
+    con, _ = krx_run(tmp_path, f)
+    fb = FakeBlock()
+    day = lambda: NOW.replace(hour=10)
+    rep = B.kis_backfill(con, kis(fb, tmp_path, NOW), day, lambda *_: None, ignore_window=True)
+    assert "지금 시간대를 막고 있음" in rep.stopped
+    first = fb.kis_calls
+    assert first <= 1 + B.DELISTED_PROBE  # 폐지 종목 확인 + 첫 호출에서 멈춤, 같은 오류로 반복 호출 없음
+    assert con.execute("SELECT COUNT(*) FROM bt_job WHERE kind='kis' AND status='failed'").fetchone()[0] == 0
+
+
+def test_ignore_window_runs_in_daytime_and_default_keeps_limit(tmp_path):
+    f = Fake()
+    con, _ = krx_run(tmp_path, f)
+    day = lambda: NOW.replace(hour=10)
+    rep = B.kis_backfill(con, kis(f, tmp_path, NOW), day, lambda *_: None)
+    assert f.kis_calls == 0 and "15:40" in rep.stopped          # 옵션 없으면 기존 제한 그대로
+    rep = B.kis_backfill(con, kis(f, tmp_path, NOW), day, lambda *_: None, ignore_window=True)
+    assert rep.stopped is None and B.kis_remaining_calls(con) == 0

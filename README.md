@@ -133,6 +133,15 @@ C:\주식데이터수집기\주식데이터수집기-명령.exe backfill auto --
 - 저장 위치: `주식데이터수집\backtest\backtest.sqlite` (정기 수집 DB와 별도). 순서는 krx → kis(15:40~23:59) → dart(며칠). 자세한 내용은 명세서 16장.
 - 끊겨도 다시 실행하면 이어받습니다. 정기 수집과 동시에는 돌지 않습니다.
 
+### KIS 수급 조회 가능 시간 실측 (`verify kis-window`)
+
+```
+C:\주식데이터수집기\주식데이터수집기-명령.exe verify kis-window
+```
+- 005930 한 종목으로 3번만 호출(30일 전·1년 전·5년 전)해 지금 시각에 KIS 종목별 투자자매매동향이 조회되는지 확인합니다. DB에 쓰지 않습니다.
+- 보고서: `system\verify\kis_window_<시각>.md` (데이터 폴더가 없으면 설치 폴더 `verify_history\`)
+- `backfill kis --ignore-window`, `backfill auto --ignore-window`: 15:40~23:59 제한 없이 시작합니다. KIS가 막으면(OPSQ2001) 받은 것을 저장하고 바로 멈춥니다.
+
 ### 백테스트 (`backtest`, GUI [백테스트] 탭)
 
 ```bat

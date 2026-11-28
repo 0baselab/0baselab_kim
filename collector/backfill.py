@@ -400,9 +400,15 @@ def _kis_call(kis, code, d):
     return body, rows
 
 
-def kis_backfill(con, kis: KisClient, now_fn, out) -> Report:
+BLOCKED_MSG = "KIS가 지금 시간대를 막고 있음(OPSQ2001 TIME LIMIT). 받은 것은 저장했고, 15:40~23:59에 다시 실행하면 이어받습니다."
+
+
+def kis_backfill(con, kis: KisClient, now_fn, out, ignore_window: bool = False) -> Report:
+    """ignore_window=True면 15:40~23:59 시간 제한 없이 시작한다. OPSQ2001이 오면 즉시 저장하고 멈춘다(재시도 없음)."""
     rep = Report("kis", now_fn())
-    if not investor_window_ok(now_fn()):
+    if ignore_window:
+        rep.add(f"--ignore-window: 시간 제한 없이 시작 ({now_fn().strftime('%H:%M')})")
+    if not ignore_window and not investor_window_ok(now_fn()):
         rep.stopped = (f"실행 시각 {now_fn().strftime('%H:%M')}: KIS 투자자매매동향은 00:00~15:40에 막힙니다(OPSQ2001). "
                        "15:40~23:59에 실행하세요.")
         rep.add(rep.stopped)
@@ -425,7 +431,7 @@ def kis_backfill(con, kis: KisClient, now_fn, out) -> Report:
             lo = max(s["first_date"], START)
             q = cursor or s["last_date"]
             while True:
-                if not investor_window_ok(now_fn()):
+                if not ignore_window and not investor_window_ok(now_fn()):
                     raise BackfillStop(f"{now_fn().strftime('%H:%M')} 조회 가능 시각(15:40~23:59)을 벗어나 멈춤. 다음 실행 때 이어받기")
                 if q < lo:
                     with db.Tx(con):
@@ -445,7 +451,7 @@ def kis_backfill(con, kis: KisClient, now_fn, out) -> Report:
                 ts = now_fn().isoformat(timespec="seconds")
                 if not is_ok(body):
                     if body.get("msg_cd") == "OPSQ2001":
-                        raise BackfillStop("KIS OPSQ2001 TIME LIMIT — 15:40 이후에 다시 실행하세요")
+                        raise BackfillStop(BLOCKED_MSG if ignore_window else "KIS OPSQ2001 TIME LIMIT — 15:40 이후에 다시 실행하세요")
                     with db.Tx(con):
                         set_job(con, "kis", code, "failed", ts, cursor=q, error=f"{body.get('msg_cd')} {body.get('msg1')}")
                     rep.failures.append(f"{code} {q}: {body.get('msg_cd')} {body.get('msg1')}")
@@ -638,7 +644,7 @@ class AutoResult:
 
 
 def run_auto(con, root, collect_con, settings, now_fn, out, make_krx, make_kis, make_dart,
-             report_dir: Path) -> AutoResult:
+             report_dir: Path, ignore_window: bool = False) -> AutoResult:
     """KRX(남았으면) -> KIS(15:40~23:59이고 남았으면, 23:59까지) -> DART(예비 한도 남김).
     한 단계가 오류로 멈춰도 다음 단계를 진행하고 실패 단계를 기록한다."""
     res = AutoResult()
@@ -665,12 +671,12 @@ def run_auto(con, root, collect_con, settings, now_fn, out, make_krx, make_kis, 
         res.stages.append(("KRX", "이미 끝남 (건너뜀)"))
     else:
         stage("KRX", lambda: krx_backfill(con, make_krx(), settings, now_fn, out))
-    if not investor_window_ok(now_fn()):
+    if not ignore_window and not investor_window_ok(now_fn()):
         res.stages.append(("KIS", f"{now_fn().strftime('%H:%M')}: 15:40~23:59가 아니어서 건너뜀"))
     elif kis_targets(con) and kis_remaining_calls(con) == 0:
         res.stages.append(("KIS", "이미 끝남 (건너뜀)"))
     else:
-        stage("KIS", lambda: kis_backfill(con, make_kis(), now_fn, out))
+        stage("KIS", lambda: kis_backfill(con, make_kis(), now_fn, out, ignore_window=ignore_window))
     stage("DART", lambda: dart_backfill(con, make_dart(), root, collect_con, settings, now_fn, out, reserve=reserve))
     return res
 
