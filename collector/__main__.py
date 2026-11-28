@@ -1,5 +1,6 @@
 """진입점: `python -m collector [명령]`, exe도 같은 인자를 받는다 (명세서 2.2)."""
 from __future__ import annotations
+from pathlib import Path
 
 import argparse
 import sys
@@ -223,11 +224,41 @@ def cmd_verify_history() -> int:
     return 0
 
 
+def cmd_verify_kis_window() -> int:
+    """KIS 수급 조회 가능 시간 실측. 3번만 호출, DB에 쓰지 않음, 키·토큰 기록 안 함."""
+    from .http import ApiClient
+    from .kis import KisClient
+    from .verify.kis_window import run_kis_window
+
+    install = paths.install_dir()
+    settings = load_settings(install)
+    root = paths.data_dir(settings)
+    out_dir = root / "system" / "verify" if root.exists() else install / "verify_history"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    now = now_kst()
+    log_path = setup_logging(out_dir, "kis_window_" + stamp(now))
+    keys = ensure_keys(install)
+    print(f"주식데이터수집기 {__version__} / KIS 수급 조회 가능 시간 실측")
+    # 토큰: 데이터 폴더가 있으면 기존 토큰 파일을 같이 쓰고, 없으면 임시 폴더에 두었다가 끝나면 지운다.
+    # (보고서 폴더에는 토큰을 두지 않는다. 내용은 출력하지 않는다.)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        token = (root / "system" / "kis_token.json") if (root / "system").exists() else Path(tmp) / "kis_token.json"
+        kis = KisClient(ApiClient("KIS", float(settings.get("KIS_CALLS_PER_SEC") or 10)), settings["KIS_BASE_URL"],
+                        keys["KIS_APP_KEY"], keys["KIS_APP_SECRET"], token)
+        path, verdict, lines = run_kis_window(kis, now, out_dir, root / "db" / "market.sqlite")
+    print("\n".join(lines[2:]))
+    print(f"\n보고서: {path}\n로그: {log_path}")
+    return 0
+
+
 def cmd_verify(args=None) -> int:
     from .verify.runner import run_verify
 
     if args is not None and getattr(args, "sub", None) == "history":
         return cmd_verify_history()
+    if args is not None and getattr(args, "sub", None) == "kis-window":
+        return cmd_verify_kis_window()
 
     install = paths.install_dir()
     settings = load_settings(install)
@@ -258,7 +289,7 @@ def cmd_backfill(args) -> int:
 
     sub = getattr(args, "sub", None)
     if sub not in ("krx", "kis", "dart", "status", "auto"):
-        print("사용법: backfill krx | kis | dart | status | auto [--shutdown]")
+        print("사용법: backfill krx | kis | dart | status | auto [--shutdown] [--ignore-window]")
         return 1
     install = paths.install_dir()
     settings = load_settings(install)
@@ -294,7 +325,7 @@ def cmd_backfill(args) -> int:
             import time
             try:
                 res = B.run_auto(con, root, collect_con, settings, now_kst, print, make_krx, make_kis, make_dart,
-                                 root / "system" / "verify")
+                                 root / "system" / "verify", ignore_window=getattr(args, "ignore_window", False))
             except KeyboardInterrupt:
                 print("\n사용자가 중단했습니다. 받은 것은 저장되었고 다음 실행 때 이어받습니다.")
                 return 130
@@ -318,7 +349,7 @@ def cmd_backfill(args) -> int:
         elif sub == "kis":
             kis = KisClient(ApiClient("KIS", float(settings.get("KIS_CALLS_PER_SEC") or 10)), settings["KIS_BASE_URL"],
                             keys["KIS_APP_KEY"], keys["KIS_APP_SECRET"], root / "system" / "kis_token.json")
-            rep = B.kis_backfill(con, kis, now_kst, print)
+            rep = B.kis_backfill(con, kis, now_kst, print, ignore_window=getattr(args, "ignore_window", False))
         else:
             dart = DartClient(ApiClient("DART", float(settings.get("DART_CALLS_PER_SEC") or 5)),
                               settings["DART_BASE_URL"], keys["DART_API_KEY"])
@@ -375,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=sorted(COMMANDS),
                         help="daily(당일 수집) / range(기간 수집) / briefing(브리핑 패키지) / status(상태 점검) / "
                              "unclassified(미분류 반복 등장 CSV) / dart(DART 수집) / dart-export(구글 시트용 CSV) / verify(실측 검증)")
-    parser.add_argument("sub", nargs="?", help="세부 항목 (verify history / backfill krx|kis|dart|status)")
+    parser.add_argument("sub", nargs="?", help="세부 항목 (verify history|kis-window / backfill krx|kis|dart|status)")
     parser.add_argument("variant", nargs="?", help="backtest run의 변형 A|B|C|D|all")
     parser.add_argument("--db", help="백테스트 DB 경로 (backtest 명령)")
     parser.add_argument("--random", type=int, help="backtest run 무작위 비교 횟수 (기본 100, 0이면 생략)")
@@ -386,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--days", type=int, help="미분류 반복 등장 집계 거래일 수 (기본 20)")
     parser.add_argument("--force", action="store_true", help="이미 성공한 단위도 다시 받기")
     parser.add_argument("--shutdown", action="store_true", help="backfill auto가 끝나면 60초 뒤 Windows 종료")
+    parser.add_argument("--ignore-window", action="store_true",
+                        help="backfill kis/auto: 15:40~23:59 시간 제한 없이 시작 (KIS가 막으면 즉시 저장하고 멈춤)")
     parser.add_argument("--yes", action="store_true", help="확인 질문을 모두 '예'로 처리")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
